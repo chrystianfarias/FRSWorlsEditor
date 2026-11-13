@@ -140,7 +140,7 @@ const Route* Graph::Find(u16 id) const {
 
 u16 Graph::FreeRouteId(u16 start) const {
     for (int id = start; id <= kMaxRouteId; ++id)
-        if (!Find((u16)id)) return (u16)id;
+        if (!Find((u16)id) && std::find(reserved_.begin(), reserved_.end(), (u16)id) == reserved_.end()) return (u16)id;
     return 0;
 }
 

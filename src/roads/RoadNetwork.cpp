@@ -727,6 +727,22 @@ void BuildGameJunction(const GameJunction& j, float mouthHalf, float branchWalk,
         piece.areas.push_back(std::move(area));
     }
 
+    // Pedestrian crossings across the game's road, either side of the junction:
+    // the game's stripes, laid a hair over the junction surface.
+    if (j.crosswalks) {
+        MeshGroup& g = piece.Group(kCrosswalkTexture);
+        const float depth = std::min(kCrosswalkDepth, L - mouthHalf - 0.5f);
+        for (int s = -1; s <= 1; s += 2) {
+            if (depth < 1.0f) break;
+            const float a0 = s * (L - depth), a1 = s * L;
+            const Vec3 p00 = P(a0, -half, 0.03f), p01 = P(a0, half, 0.03f);
+            const Vec3 p11 = P(a1, half, 0.03f), p10 = P(a1, -half, 0.03f);
+            const float u0 = -half / kCrosswalkTile, u1 = half / kCrosswalkTile;
+            AddQuad(g, Vertex(p00, up, u0, 0, color), Vertex(p01, up, u1, 0, color), Vertex(p11, up, u1, 1, color),
+                    Vertex(p10, up, u0, 1, color), up);
+        }
+    }
+
     // The far sidewalk, straight on, and its kerb.
     if (wf > 0.01f && !j.walkTextureFar.empty()) {
         MeshGroup& g = piece.Group(j.walkTextureFar);
@@ -1249,6 +1265,7 @@ std::vector<MeshPiece> Network::BuildMesh(std::vector<Pole>* polesOut) const {
         // Crossings at the ends that meet a junction which asks for them.
         const auto crosses = [&](u32 nodeId) {
             const Node* n = FindNode(nodeId);
+            if (const GameJunction* gj = FindGameJunction(nodeId)) return gj->crosswalks;   // across the mouth
             return n && n->crosswalks && junctions.count(nodeId);
         };
         const float reach = std::min(kCrosswalkDepth, total * 0.4f);

@@ -24,6 +24,10 @@ struct RouteReport {
 
 // Adds the network's routes and links to `graph`, which holds the game's own
 // graph as shipped. False when the result breaks one of the game's limits.
-bool AddRoutes(const Network& network, nfs::routes::Graph& graph, RouteReport& report);
+// `race`: the graph of one race (Routes<n>F/B.bin), which holds only the
+// routes of the race's area -- the roads go in for traffic only, so the
+// racers keep to the race, and a road whose ends meet nothing of the race's
+// is simply left unjoined.
+bool AddRoutes(const Network& network, nfs::routes::Graph& graph, RouteReport& report, bool race = false);
 
 } // namespace roads

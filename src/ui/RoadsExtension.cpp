@@ -37,6 +37,7 @@
 #include <cmath>
 #include <cstdarg>
 #include <cwchar>
+#include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <map>
@@ -248,6 +249,11 @@ public:
         bool fitGround = true;
         u64 stamp = 0;
         std::wstring label;
+        // A bake or its removal: the world's models folder as it was before,
+        // and how it looked right after, to tell whether anything else wrote
+        // there since.
+        std::wstring filesBackup;
+        u64 filesAfter = 0;
     };
 
     UndoState Capture() const {
@@ -267,11 +273,111 @@ public:
         before.stamp = undo::NextStamp();
         before.label = label;
         undo_.push_back(std::move(before));
-        if (undo_.size() > 100) undo_.erase(undo_.begin());
+        if (undo_.size() > 100) {
+            DropBackup(undo_.front());
+            undo_.erase(undo_.begin());
+        }
         settled_ = Capture();
     }
 
+    // ---- what a bake changes on disk, for taking it back
+
+    // The world's own files: <game>\\models without the other worlds.
+    static bool WorldFile(const std::filesystem::path& relative) {
+        const std::wstring first = relative.begin() == relative.end() ? L"" : relative.begin()->wstring();
+        return _wcsicmp(first.c_str(), L"worlds") != 0;
+    }
+
+    u64 ModelsSignature() const {
+        namespace fs = std::filesystem;
+        std::error_code ec;
+        u64 hash = 1469598103934665603ull;
+        const fs::path root = app_.ModelsFolder();
+        for (fs::recursive_directory_iterator it(root, ec), end; it != end; it.increment(ec)) {
+            if (ec) break;
+            const fs::path relative = fs::relative(it->path(), root, ec);
+            if (!WorldFile(relative)) { if (it->is_directory(ec)) it.disable_recursion_pending(); continue; }
+            if (!it->is_regular_file(ec)) continue;
+            const std::wstring name = relative.wstring();
+            for (wchar_t c : name) hash = (hash ^ (u64)c) * 1099511628211ull;
+            hash = (hash ^ (u64)it->file_size(ec)) * 1099511628211ull;
+            hash = (hash ^ (u64)it->last_write_time(ec).time_since_epoch().count()) * 1099511628211ull;
+        }
+        return hash;
+    }
+
+    // A copy of the world's files, under %LOCALAPPDATA%\\FRSWorldEditor\\undo.
+    std::wstring BackupModels() const {
+        namespace fs = std::filesystem;
+        wchar_t localAppData[MAX_PATH] = {};
+        if (FAILED(::SHGetFolderPathW(nullptr, CSIDL_LOCAL_APPDATA, nullptr, 0, localAppData))) return {};
+        SYSTEMTIME now{};
+        ::GetLocalTime(&now);
+        const fs::path backup = fs::path(localAppData) / L"FRSWorldEditor" / L"undo" /
+                                Fmt(L"bake-%04u%02u%02u-%02u%02u%02u-%03u", now.wYear, now.wMonth, now.wDay, now.wHour,
+                                    now.wMinute, now.wSecond, now.wMilliseconds);
+        std::error_code ec;
+        const fs::path root = app_.ModelsFolder();
+        fs::create_directories(backup, ec);
+        for (fs::recursive_directory_iterator it(root, ec), end; it != end; it.increment(ec)) {
+            if (ec) return {};
+            const fs::path relative = fs::relative(it->path(), root, ec);
+            if (!WorldFile(relative)) { if (it->is_directory(ec)) it.disable_recursion_pending(); continue; }
+            if (it->is_directory(ec)) fs::create_directories(backup / relative, ec);
+            else if (it->is_regular_file(ec)) fs::copy_file(it->path(), backup / relative, fs::copy_options::overwrite_existing, ec);
+            if (ec) {
+                LOG_WARN("undo: %S could not be copied", it->path().c_str());
+                return {};
+            }
+        }
+        return backup.wstring();
+    }
+
+    // Puts the world's files back as the copy has them.
+    bool RestoreModels(const std::wstring& from) {
+        namespace fs = std::filesystem;
+        std::error_code ec;
+        const fs::path root = app_.ModelsFolder();
+        if (!fs::exists(from, ec)) return false;
+        for (const auto& entry : fs::directory_iterator(root, ec)) {
+            const fs::path relative = entry.path().filename();
+            if (!WorldFile(relative)) continue;
+            fs::remove_all(entry.path(), ec);
+        }
+        fs::copy(from, root, fs::copy_options::recursive | fs::copy_options::overwrite_existing, ec);
+        if (ec) LOG_WARN("undo: the world's files could not all be put back: %s", ec.message().c_str());
+        return !ec;
+    }
+
+    void DropBackup(const UndoState& state) {
+        if (state.filesBackup.empty()) return;
+        std::error_code ec;
+        std::filesystem::remove_all(state.filesBackup, ec);
+    }
+
+    // A bake or a removal as one step: what the roads were, and the files.
+    struct DiskStep {
+        RoadsExtension* self;
+        UndoState before;
+        bool armed = false;
+        explicit DiskStep(RoadsExtension* owner, const wchar_t* label) : self(owner) {
+            before = self->Capture();
+            before.label = label;
+            before.filesBackup = self->BackupModels();
+            armed = !before.filesBackup.empty();
+            if (!armed) LOG_WARN("undo: no copy of the world's files could be made; this step cannot be undone");
+        }
+        ~DiskStep() {
+            if (!armed) return;
+            before.stamp = undo::NextStamp();
+            before.filesAfter = self->ModelsSignature();
+            self->undo_.push_back(std::move(before));
+            self->settled_ = self->Capture();
+        }
+    };
+
     void ResetHistory() {
+        for (const UndoState& state : undo_) DropBackup(state);
         undo_.clear();
         settled_ = Capture();
         historyReady_ = true;
@@ -281,8 +387,24 @@ public:
 
     bool UndoLatest() override {
         if (undo_.empty()) return false;
+        if (!undo_.back().filesBackup.empty()) {
+            // A bake: its files go back first, then the region is read again.
+            const UndoState& step = undo_.back();
+            if (ModelsSignature() != step.filesAfter &&
+                ::MessageBoxW(app_.Window(),
+                              (L"Undo \"" + step.label + L"\"?\n\nThe world's files changed after it (something else was "
+                               L"written since). Undoing puts all of them back as they were before it.").c_str(),
+                              L"FRS World Editor - Roads", MB_ICONQUESTION | MB_OKCANCEL) != IDOK)
+                return true;
+            if (!RestoreModels(step.filesBackup)) {
+                app_.Message(L"The world's files could not all be put back; the log has why.", MB_ICONWARNING);
+                return true;
+            }
+            app_.ReopenRegionKeepingView();
+        }
         UndoState state = std::move(undo_.back());
         undo_.pop_back();
+        DropBackup(state);
         const std::wstring label = state.label;
         network_ = std::move(state.network);
         terrain_ = std::move(state.terrain);
@@ -2211,7 +2333,59 @@ private:
         summary = Fmt(L"%zu roads in the game's road graph (%zu links among them, %zu into the game's roads)",
                       report.routes, report.links, report.gameLinks);
         if (!report.problems.empty()) summary += L"; " + report.problems;
+        summary += WriteRaceRoutes(region, graph);
         return true;
+    }
+
+    // The graphs the races load instead (Routes<n>F/B.bin): each holds only
+    // its race's area. The roads go into every one where they meet a road of
+    // that race -- for traffic only -- with the ids they have in free roam;
+    // the others are left to the game's own file.
+    std::wstring WriteRaceRoutes(const std::wstring& region, const nfs::routes::Graph& freeRoam) {
+        namespace fs = std::filesystem;
+        const fs::path shippedFolder = fs::path(app_.GameFolder()) / L"TRACKS" / (L"ROUTES" + region);
+        const fs::path servedFolder = fs::path(app_.ModelsFolder()) / L"files" / L"TRACKS" / (L"ROUTES" + region);
+        std::error_code ec;
+        // What earlier bakes wrote for races goes first.
+        if (fs::exists(servedFolder, ec))
+            for (const auto& entry : fs::directory_iterator(servedFolder, ec)) {
+                const std::wstring name = entry.path().filename().wstring();
+                if (name.rfind(L"Routes", 0) == 0 && name != L"RoutesFreeRoam.bin") fs::remove(entry.path(), ec);
+            }
+        if (network_.Segments().empty()) return L"";
+        // The ids of the game's own free-roam routes: a race keeps links to
+        // the ones it leaves out, and no new route may take them.
+        std::vector<u16> shippedIds;
+        {
+            std::ifstream in((shippedFolder / L"RoutesFreeRoam.bin").wstring(), std::ios::binary);
+            std::vector<u8> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+            nfs::routes::Graph shipped;
+            std::wstring error;
+            if (shipped.Parse(bytes, error))
+                for (const auto& r : shipped.Routes()) shippedIds.push_back(r.header.id);
+        }
+        (void)freeRoam;
+        size_t written = 0, races = 0;
+        for (const auto& entry : fs::directory_iterator(shippedFolder, ec)) {
+            const std::wstring name = entry.path().filename().wstring();
+            if (name.rfind(L"Routes", 0) != 0 || name == L"RoutesFreeRoam.bin") continue;
+            ++races;
+            std::ifstream in(entry.path().wstring(), std::ios::binary);
+            std::vector<u8> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+            nfs::routes::Graph graph;
+            std::wstring error;
+            if (!graph.Parse(bytes, error)) continue;
+            for (u16 id : shippedIds) graph.Reserve(id);
+            roads::RouteReport report;
+            if (!roads::AddRoutes(network_, graph, report, true) || !report.gameLinks) continue;
+            fs::create_directories(servedFolder, ec);
+            const std::vector<u8> out = graph.Write();
+            std::ofstream file((servedFolder / name).wstring(), std::ios::binary | std::ios::trunc);
+            file.write((const char*)out.data(), (std::streamsize)out.size());
+            if (file) ++written;
+        }
+        LOG_INFO("routes: the roads went into %zu of %zu race graphs", written, races);
+        return Fmt(L"; traffic in %zu of %zu race graphs", written, races);
     }
 
     // ---- the road graph view: what the game will be handed, the game's own
@@ -2552,7 +2726,11 @@ bool RoadsExtension::FillProperties(PropertiesPanel::View& view) {
                L"Degrees the roads run through the node in (0 = +X). auto follows the neighbouring nodes; "
                L"R in the viewport turns it.",
                kNodeHeading);
-        if (count >= 3)
+        if (const roads::GameJunction* gj = network_.FindGameJunction(node->id))
+            AddRow(view, L"Junction", L"Pedestrian crossings", gj->crosswalks ? L"yes" : L"no",
+                   L"Crossing stripes (RDP_INTERSECT_AA_WH) across the game's road either side of the junction "
+                   L"and across the mouth of the new road.", kNodeCrosswalks, { L"yes", L"no" });
+        else if (count >= 3)
             AddRow(view, L"Junction", L"Pedestrian crossings", node->crosswalks ? L"yes" : L"no",
                    L"Crossing stripes (RDP_INTERSECT_AA_WH) across the end of every road at this junction.",
                    kNodeCrosswalks, { L"yes", L"no" });
@@ -2753,8 +2931,11 @@ bool RoadsExtension::ApplyProperties() {
                 node->heading = heading;
             }
         }
-        if (properties.ReadText(kNodeCrosswalks, text))
-            node->crosswalks = !text.empty() && (text[0] == L'y' || text[0] == L'Y');
+        if (properties.ReadText(kNodeCrosswalks, text)) {
+            const bool on = !text.empty() && (text[0] == L'y' || text[0] == L'Y');
+            if (roads::GameJunction* gj = network_.FindGameJunction(node->id)) gj->crosswalks = on;
+            else node->crosswalks = on;
+        }
         Changed(true);
         return true;
     }
@@ -3695,6 +3876,7 @@ bool RoadsExtension::BakeCollision(const std::vector<roads::MeshPiece>& pieces, 
 void RoadsExtension::Unbake() {
     if (!app_.World()) return;
     if (!app_.ConfirmUnsaved()) return;
+    DiskStep step(this, L"remove the baked roads");
     size_t collisionAdded = 0, collisionRemoved = 0, polesAdded = 0, polesRemoved = 0;
     if (!BakePoles({}, polesAdded, polesRemoved) ||
         (app_.Collision() && !BakeCollision({}, collisionAdded, collisionRemoved)) || !app_.SaveEdits()) {
@@ -3707,8 +3889,7 @@ void RoadsExtension::Unbake() {
         return;
     }
     app_.Status(Fmt(L"%zu baked road pieces and %zu collision polygons removed from the game; the road network "
-                    L"is kept in the editor", removed, collisionRemoved));
-    ResetHistory();
+                    L"is kept in the editor (Ctrl+Z puts them back)", removed, collisionRemoved));
 }
 
 void RoadsExtension::Bake() {
@@ -3720,6 +3901,8 @@ void RoadsExtension::Bake() {
     if (!app_.ConfirmUnsaved()) return;
     SaveNetwork();
     const std::wstring region = world->Region();
+    // Ctrl+Z takes the whole bake back: the world's files as they are now.
+    DiskStep step(this, L"bake the roads");
 
     SaveTerrain();
     std::wstring routes;
@@ -3829,9 +4012,6 @@ void RoadsExtension::Bake() {
                     baked, pieces.size(), removed, collisionAdded, collisionRemoved, polesAdded, groundMeshes,
                     groundPolygons, routes.c_str()));
     LOG_INFO("roads: baked %zu of %zu pieces from %S", baked, pieces.size(), obj.c_str());
-    // What was baked is in the game's files now: the history starts again
-    // from here (Region Edits or Remove Baked Roads take a bake back).
-    ResetHistory();
     if (baked < pieces.size())
         app_.Message(Fmt(L"%zu of %zu road pieces could not be made into models (the log has why: usually a "
                          L"section with no object of its own to build from).",

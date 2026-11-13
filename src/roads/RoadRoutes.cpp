@@ -51,7 +51,7 @@ i8 LaneByte(float offset, float maxHalf) {
 
 } // namespace
 
-bool AddRoutes(const Network& network, Graph& graph, RouteReport& report) {
+bool AddRoutes(const Network& network, Graph& graph, RouteReport& report, bool race) {
     // ---- the roads that count, and their ends by node --------------------------
     // A node that follows another (a split highway's carriageway start) stands
     // for it: the roads meet there.
@@ -198,7 +198,7 @@ bool AddRoutes(const Network& network, Graph& graph, RouteReport& report) {
             for (size_t k = 0; k < backward.size() && k < 4; ++k) n.lanes[4 + k] = LaneByte(backward[k], half);
             u32 flags = route.header.id | nfs::routes::kBit12 | nfs::routes::kNoIntersection << 19;
             const bool fw = !forward.empty(), bw = !backward.empty();
-            if (p.gps) {
+            if (p.gps && !race) {
                 if (fw) flags |= nfs::routes::kGpsForward | nfs::routes::kRacersForward;
                 if (bw) flags |= nfs::routes::kGpsBackward | nfs::routes::kRacersBackward;
             }
@@ -297,7 +297,7 @@ bool AddRoutes(const Network& network, Graph& graph, RouteReport& report) {
             if (graph.Project(r, m.centre.x, m.centre.y, k, t, d) && d < bestDistance) { bestDistance = d; best = &r; }
         }
         if (!best) {
-            report.problems += L"A junction into the game's road found no route of the game's under it.\n";
+            if (!race) report.problems += L"A junction into the game's road found no route of the game's under it.\n";
             continue;
         }
         const u16 gameRoute = best->header.id;

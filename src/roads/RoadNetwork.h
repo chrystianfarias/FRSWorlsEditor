@@ -268,6 +268,17 @@ public:
 
     // Junctions made into the game's own roads.
     const std::vector<GameJunction>& GameJunctions() const { return gameJunctions_; }
+    // The junction whose mouth `node` is, or null.
+    const GameJunction* FindGameJunction(u32 node) const {
+        for (const GameJunction& j : gameJunctions_)
+            if (j.node == node) return &j;
+        return nullptr;
+    }
+    GameJunction* FindGameJunction(u32 node) {
+        for (GameJunction& j : gameJunctions_)
+            if (j.node == node) return &j;
+        return nullptr;
+    }
     void AddGameJunction(const GameJunction& junction) { gameJunctions_.push_back(junction); SetDirty(); }
     // The new road's width at a junction: (half kerb to kerb, sidewalk).
     void MouthOf(const GameJunction& junction, float& half, float& walk) const;

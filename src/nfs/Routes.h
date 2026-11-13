@@ -106,6 +106,9 @@ public:
     const Route* Find(u16 id) const;
 
     u16  FreeRouteId(u16 start = 101) const;
+    // Ids FreeRouteId never hands out: a race's graph keeps links to routes of
+    // the free-roam graph it leaves out, and a new route must not answer them.
+    void Reserve(u16 id) { reserved_.push_back(id); }
     void AddRoute(Route route);                 // kept sorted by id
     // Lengths, directions, slopes, header length, count, box and lane flags,
     // from the nodes' positions, heights, widths and lanes.
@@ -135,6 +138,7 @@ private:
     std::vector<Signpost> signposts_;
     std::vector<Intersection> intersections_;
     std::vector<u32> order_;                    // chunk ids as they came
+    std::vector<u16> reserved_;
     u32 signHeader_ = 0;
     std::unordered_map<u32, std::vector<u8>> extra_;
 };
