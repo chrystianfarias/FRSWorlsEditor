@@ -29,7 +29,7 @@ bool Viewport::Create(HWND parent, int controlId) {
     if (!registered) {
         WNDCLASSEXW wc{};
         wc.cbSize        = sizeof(wc);
-        wc.style         = CS_OWNDC;   // the device keeps a private DC for presenting
+        wc.style         = CS_OWNDC | CS_DBLCLKS;   // the device keeps a private DC for presenting
         wc.lpfnWndProc   = &Viewport::WndProc;
         wc.hInstance     = ::GetModuleHandleW(nullptr);
         wc.hCursor       = ::LoadCursorW(nullptr, IDC_ARROW);
@@ -60,10 +60,16 @@ bool Viewport::Create(HWND parent, int controlId) {
     }
 
     renderer_.SetContext(&context_);
+
+    // The panels draw in this device; its default-pool objects go round a reset.
+    ui_.Init(window_, context_.Device());
+    context_.beforeReset = [this] { ui_.DeviceLost(); };
+    context_.afterReset = [this] { ui_.DeviceReset(); };
     return true;
 }
 
 void Viewport::Destroy() {
+    ui_.Shutdown();
     renderer_.Clear();
     context_.Destroy();
     if (window_) {
@@ -92,6 +98,30 @@ LRESULT CALLBACK Viewport::WndProc(HWND window, UINT message, WPARAM wParam, LPA
 }
 
 LRESULT Viewport::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
+    // The panels see everything first. Over a panel -- or typing into one --
+    // the view itself does not react, unless it is in the middle of a drag of
+    // its own (looking round, moving something).
+    ui_.HandleMessage(window_, message, wParam, lParam);
+    if (message == WM_SETCURSOR && LOWORD(lParam) == HTCLIENT && ui_.WantsMouse()) return TRUE;
+    const bool busy = looking_ || Transforming() || GizmoDragging();
+    if (!busy && ui_.WantsMouse()) {
+        switch (message) {
+            case WM_LBUTTONDOWN: case WM_LBUTTONDBLCLK: case WM_RBUTTONDOWN: case WM_MBUTTONDOWN:
+                // The keys follow the click into a panel's fields.
+                ::SetFocus(window_);
+                return 0;
+            case WM_LBUTTONUP: case WM_MOUSEWHEEL:
+                return 0;
+            case WM_MOUSEMOVE:
+                gizmoHot_ = kGizmoNone;
+                return 0;
+            default:
+                break;
+        }
+    }
+    if (ui_.WantsKeyboard() && (message == WM_KEYDOWN || message == WM_SYSKEYDOWN || message == WM_CHAR))
+        return 0;
+
     switch (message) {
         case WM_SIZE:
             context_.Resize((u32)LOWORD(lParam), (u32)HIWORD(lParam));
@@ -127,6 +157,8 @@ LRESULT Viewport::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
                 UpdateTransform(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
                 return 0;
             }
+            if (!looking_)
+                for (ViewportTool* tool : tools_) tool->MouseMove(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
             if (!looking_) {
                 // Which handle the pointer is over, to light it up.
                 u32 section = 0;
@@ -154,6 +186,8 @@ LRESULT Viewport::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
 
         case WM_MOUSEWHEEL: {
             const int notches = GET_WHEEL_DELTA_WPARAM(wParam) / WHEEL_DELTA;
+            for (ViewportTool* tool : tools_)
+                if (tool->MouseWheel(notches, wParam)) return 0;
             // While moving an object the wheel raises and lowers it, by a
             // quarter unit a notch, or a twentieth with Shift held.
             if (transform_ == TransformMode::Move) {
@@ -170,9 +204,25 @@ LRESULT Viewport::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
             return 0;
         }
 
+        case WM_LBUTTONDBLCLK:
+            for (ViewportTool* tool : tools_)
+                if (tool->MouseDoubleClick(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam), wParam)) return 0;
+            [[fallthrough]];
         case WM_LBUTTONDOWN:
             ::SetFocus(window_);
             if (Transforming()) { EndTransform(true); return 0; }
+            {
+                // A tool's own selection is moved by the gizmo before the tool
+                // sees the click as a pick.
+                u32 section = 0;
+                int placement = -1;
+                Mat4 transform;
+                if (GizmoTarget(section, placement, transform) && placement == kGizmoTool &&
+                    BeginGizmoDrag(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)))
+                    return 0;
+            }
+            for (ViewportTool* tool : tools_)
+                if (tool->MouseDown(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam), wParam)) return 0;
             if (BeginGizmoDrag(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam))) return 0;
             PickAt(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam),
                    (wParam & MK_CONTROL) != 0, (wParam & MK_SHIFT) != 0);
@@ -190,6 +240,12 @@ LRESULT Viewport::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         case WM_SYSKEYDOWN:
             if (wParam == VK_ESCAPE && GizmoDragging()) { EndGizmoDrag(false); return 0; }
             if (wParam == VK_ESCAPE && Transforming()) { EndTransform(false); return 0; }
+            if (!looking_ && !Transforming() && !GizmoDragging()) {
+                bool used = false;
+                for (ViewportTool* tool : tools_)
+                    if (!used) used = tool->KeyDown(wParam, (lParam & (1 << 30)) != 0);
+                if (used) return 0;
+            }
             if (!looking_ && !Transforming() && (lParam & (1 << 30)) == 0) {
                 if (wParam == 'G') { BeginTransform(TransformMode::Move);   return 0; }
                 if (wParam == 'R') { BeginTransform(TransformMode::Rotate); return 0; }
@@ -313,9 +369,30 @@ void Viewport::Tick(float deltaSeconds) {
                            gizmoActive_ != kGizmoNone ? gizmoActive_ : gizmoHot_);
     }
 
+    // A dialog opened from inside a frame would paint the view again while
+    // the panels are half laid out.
+    if (inFrame_) return;
     if (!context_.BeginFrame(kClearColor)) return;
+    inFrame_ = true;
+    const bool panels = ui_.Ready();
+    if (panels) {
+        ui_.BeginFrame(uiBars_);
+        if (uiDraw_) uiDraw_();
+    }
     renderer_.Render(camera_);
+    if (panels) ui_.Render();
+    if (!captured_ && world_) {
+        captureClock_ += deltaSeconds;
+        wchar_t path[MAX_PATH] = {};
+        if (captureClock_ > 6.0f && ::GetEnvironmentVariableW(L"FRS_CAPTURE", path, MAX_PATH)) {
+            captured_ = true;
+            context_.Device()->EndScene();
+            LOG_INFO("capture %S: %s", path, context_.SaveBackBuffer(path) ? "saved" : "failed");
+            context_.Device()->BeginScene();
+        }
+    }
     context_.EndFrame();
+    inFrame_ = false;
 }
 
 void Viewport::PickAt(int x, int y, bool add, bool wholePack) {
@@ -470,6 +547,66 @@ Ray Viewport::RayAt(int x, int y) const {
     return ray;
 }
 
+size_t Viewport::DetachNatives(bool remember) {
+    if (!world_) return 0;
+    std::vector<std::pair<u32, int>> select;
+    size_t converted = 0;
+    for (const PickResult& picked : renderer_.Selection()) {
+        if (picked.IsPlacement()) { select.push_back({ picked.loadedSection, picked.placement }); continue; }
+        if (!picked.IsNative()) continue;
+        nfs::LoadedSection* section = world_->MutableLoaded(picked.loadedSection);
+        if (!section || (size_t)picked.native >= section->scenery.instances.size()) continue;
+        const nfs::Scenery& scenery = section->scenery;
+        const nfs::SceneryInstance& instance = scenery.instances[(size_t)picked.native];
+        if (instance.infoIndex >= scenery.infos.size()) continue;
+        const std::pair<u32, u32> key{ instance.sceneryNumber, instance.record };
+        if (std::find(section->removedNatives.begin(), section->removedNatives.end(), key) !=
+            section->removedNatives.end())
+            continue;
+
+        nfs::PlacedInstance placed;
+        placed.modelHash = scenery.ModelHash(instance);
+        placed.modelName = scenery.infos[instance.infoIndex].name;
+        placed.transform = instance.transform;
+        placed.flags = (u16)instance.flags;
+        placed.infoTemplate = scenery.infos[instance.infoIndex].raw;
+        if (const nfs::SolidObject* model = world_->FindModel(placed.modelHash)) {
+            placed.modelBounds = model->bounds;
+            placed.triangles = model->TriangleCount();
+        }
+        const bool wasChanged = section->placementsChanged;
+        section->removedNatives.push_back(key);
+        section->placements.push_back({ instance.sceneryNumber, placed });
+        section->placementsChanged = true;
+        const size_t index = section->placements.size() - 1;
+        select.push_back({ picked.loadedSection, (int)index });
+        if (remember) detached_.push_back({ picked.loadedSection, key, index, wasChanged });
+        ++converted;
+    }
+    if (converted) {
+        renderer_.RebuildInstances(*world_);
+        renderer_.SelectPlacements(select);
+        LOG_INFO("%zu of the map's own objects became placements, to be moved", converted);
+    }
+    return converted;
+}
+
+void Viewport::CancelDetach() {
+    if (!world_ || detached_.empty()) return;
+    for (auto it = detached_.rbegin(); it != detached_.rend(); ++it) {
+        nfs::LoadedSection* section = world_->MutableLoaded(it->section);
+        if (!section) continue;
+        if (it->placement < section->placements.size())
+            section->placements.erase(section->placements.begin() + (ptrdiff_t)it->placement);
+        auto& removed = section->removedNatives;
+        removed.erase(std::remove(removed.begin(), removed.end(), it->record), removed.end());
+        section->placementsChanged = it->wasChanged;
+    }
+    detached_.clear();
+    renderer_.ClearSelection();
+    renderer_.RebuildInstances(*world_);
+}
+
 bool Viewport::SelectedPlacement(u32& loadedSection, int& placement) const {
     const auto& selection = renderer_.Selection();
     if (selection.size() != 1 || !selection.front().IsPlacement()) return false;
@@ -512,6 +649,8 @@ bool Viewport::BeginTransform(TransformMode mode) {
     if (!world_) return false;
     moving_.clear();
     movingPoint_ = false;
+    detached_.clear();
+    if (!renderer_.HasExtensionSelection()) DetachNatives(true);
     Vec3 sum{};
     Vec3 point;
     float heading = 0.0f;
@@ -529,12 +668,13 @@ bool Viewport::BeginTransform(TransformMode mode) {
         sum += Vec3{ start.m[3][0], start.m[3][1], start.m[3][2] };
     }
     if (moving_.empty() && !movingPoint_) {
+        CancelDetach();
         LOG_INFO("move/rotate: select objects placed with Objects > Place Object or pasted first, "
                  "or a point an extension edits");
         return false;
     }
     if (!movingPoint_ && moving_.size() < renderer_.Selection().size())
-        LOG_INFO("move/rotate: only placed objects move; the map's own ones in the selection stay");
+        LOG_INFO("move/rotate: objects of the model library (no scenery record) stay where they are");
 
     transform_ = mode;
     transformPivot_ = movingPoint_ ? pointStart_ : sum * (1.0f / (float)moving_.size());
@@ -639,6 +779,10 @@ void Viewport::EndTransform(bool keep) {
         std::vector<std::pair<u32, int>> moved;
         for (const Moving& one : moving_) moved.push_back({ one.section, one.placement });
         RehomePlacements(moved);
+        detached_.clear();
+    } else {
+        // Cancelled: the map's own objects it took over go back to being theirs.
+        CancelDetach();
     }
     moving_.clear();
 }
@@ -701,7 +845,43 @@ void Viewport::RehomePlacements(std::vector<std::pair<u32, int>> placements) {
 
 bool Viewport::GizmoTarget(u32& section, int& placement, Mat4& transform) const {
     // One placed object at a time, and not while G or R is already moving it.
-    if (!world_ || Transforming() || !SelectedPlacement(section, placement)) return false;
+    if (!world_ || Transforming()) return false;
+    // A tool's own selection, when it has one.
+    for (size_t i = 0; i < tools_.size(); ++i) {
+        Vec3 pivot;
+        if (!tools_[i]->GizmoPivot(pivot)) continue;
+        transform = Mat4::Identity();
+        transform.m[3][0] = pivot.x;
+        transform.m[3][1] = pivot.y;
+        transform.m[3][2] = pivot.z;
+        section = (u32)i;
+        placement = kGizmoTool;
+        return true;
+    }
+    // An extension's point -- a road node -- takes the gizmo the same way:
+    // its position, turned by its heading. kGizmoPoint marks it.
+    if (renderer_.HasExtensionSelection() && pointGet_) {
+        Vec3 position;
+        float heading = 0.0f;
+        if (!pointGet_(position, heading)) return false;
+        transform = AxisRotation({ 0.0f, 0.0f, 1.0f }, Radians(heading));
+        transform.m[3][0] = position.x;
+        transform.m[3][1] = position.y;
+        transform.m[3][2] = position.z;
+        section = 0;
+        placement = kGizmoPoint;
+        return true;
+    }
+    if (!SelectedPlacement(section, placement)) {
+        // One of the map's own objects: the gizmo stands on it, and the
+        // first drag makes it a placement.
+        const auto& selection = renderer_.Selection();
+        if (selection.size() != 1 || !selection.front().IsNative()) return false;
+        transform = selection.front().transform;
+        section = selection.front().loadedSection;
+        placement = kGizmoNative;
+        return true;
+    }
     const nfs::LoadedSection* loaded = world_->Loaded()[section].get();
     if (placement < 0 || (size_t)placement >= loaded->placements.size()) return false;
     transform = loaded->placements[(size_t)placement].instance.transform;
@@ -749,6 +929,17 @@ bool Viewport::BeginGizmoDrag(int x, int y) {
     const Vec3 origin{ transform.m[3][0], transform.m[3][1], transform.m[3][2] };
     const int handle = GizmoHit(gizmoMode_, origin, CurrentGizmoView(), (float)x, (float)y);
     if (handle == kGizmoNone) return false;
+    // A point only turns about the vertical and has no size.
+    if (placement == kGizmoPoint &&
+        (gizmoMode_ == GizmoMode::Scale || (gizmoMode_ == GizmoMode::Rotate && handle != 2)))
+        return false;
+
+    if (placement == kGizmoNative) {
+        // Grabbed: it becomes a placement now, which is what gets dragged.
+        detached_.clear();
+        if (!DetachNatives(true) || !SelectedPlacement(section, placement)) return false;
+        transform = world_->Loaded()[section]->placements[(size_t)placement].instance.transform;
+    }
 
     const Ray ray = RayAt(x, y);
     gizmoAxisStart_ = 0.0f;
@@ -761,6 +952,7 @@ bool Viewport::BeginGizmoDrag(int x, int y) {
     gizmoSection_ = section;
     gizmoPlacement_ = placement;
     gizmoStart_ = transform;
+    gizmoNow_ = transform;
     gizmoMouseStart_ = { (float)x, (float)y };
     ::SetCapture(window_);
     return true;
@@ -781,7 +973,7 @@ void Viewport::UpdateGizmoDrag(int x, int y) {
             position = origin + (point - gizmoPlaneStart_);
             position.z = origin.z;
             float ground = 0.0f;
-            if (GroundBelow({ position.x, position.y, position.z + 200.0f }, gizmoSection_, gizmoPlacement_, ground))
+            if (gizmoPlacement_ != kGizmoTool && GroundBelow({ position.x, position.y, position.z + 200.0f }, gizmoSection_, gizmoPlacement_, ground))
                 position.z = ground;
         } else {
             float t = 0.0f;
@@ -827,7 +1019,23 @@ void Viewport::UpdateGizmoDrag(int x, int y) {
                                            r.z * change.m[2][column];
         }
     }
+    if (gizmoPlacement_ == kGizmoPoint) {
+        if (pointSet_) pointSet_({ transform.m[3][0], transform.m[3][1], transform.m[3][2] },
+                                 PointHeading(transform), false);
+        gizmoNow_ = transform;
+        return;
+    }
+    if (gizmoPlacement_ == kGizmoTool) {
+        if (gizmoSection_ < tools_.size()) tools_[gizmoSection_]->GizmoChanged(transform, false, true);
+        gizmoNow_ = transform;
+        return;
+    }
     SetPlacementTransform(gizmoSection_, gizmoPlacement_, transform);
+}
+
+float Viewport::PointHeading(const Mat4& transform) {
+    const float degrees = Degrees(std::atan2(transform.m[0][1], transform.m[0][0]));
+    return std::fmod(degrees + 360.0f, 360.0f);
 }
 
 void Viewport::EndGizmoDrag(bool keep) {
@@ -835,10 +1043,22 @@ void Viewport::EndGizmoDrag(bool keep) {
     const int handle = gizmoActive_;
     gizmoActive_ = kGizmoNone;          // first: releasing the capture comes back here
     if (::GetCapture() == window_) ::ReleaseCapture();
-    if (!keep) {
-        SetPlacementTransform(gizmoSection_, gizmoPlacement_, gizmoStart_);
+    if (gizmoPlacement_ == kGizmoTool) {
+        if (gizmoSection_ < tools_.size())
+            tools_[gizmoSection_]->GizmoChanged(keep ? gizmoNow_ : gizmoStart_, true, keep);
         return;
     }
+    if (gizmoPlacement_ == kGizmoPoint) {
+        const Mat4& at = keep ? gizmoNow_ : gizmoStart_;
+        if (pointSet_) pointSet_({ at.m[3][0], at.m[3][1], at.m[3][2] }, PointHeading(at), keep);
+        return;
+    }
+    if (!keep) {
+        SetPlacementTransform(gizmoSection_, gizmoPlacement_, gizmoStart_);
+        CancelDetach();
+        return;
+    }
+    detached_.clear();
     // Moved onto another section's ground: it changes hands there.
     if (gizmoMode_ == GizmoMode::Move) RehomePlacement(gizmoSection_, gizmoPlacement_);
     (void)handle;

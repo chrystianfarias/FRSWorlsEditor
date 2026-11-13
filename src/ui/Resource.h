@@ -144,6 +144,7 @@
 #define IDC_PROP_CATEGORIZED   2613
 #define IDC_PROP_ALPHABETICAL  2614
 #define IDC_PROP_BLENDER       2615
+#define IDC_PROP_COLLISION     2616
 
 // Setup wizard
 #define IDD_SETUP_FOLDER       260

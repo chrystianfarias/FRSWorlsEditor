@@ -1,13 +1,17 @@
 #include "ui/PropertiesPanel.h"
 
+#include "core/Types.h"
 #include "nfs/SceneryEdit.h"
+#include "ui/ImGuiLayer.h"
 #include "ui/Resource.h"
 
-#include "../../third_party/propertygrid/propertyGrid.h"
+#include "imgui.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <cwchar>
+#include <map>
 
 namespace {
 
@@ -23,35 +27,103 @@ const wchar_t* kFieldHelp[8] = {
     L"Uniform scale, 0.01 to 3.9: the file keeps the matrix in fixed point.",
 };
 
+constexpr size_t kBufferSize = 256;
+constexpr int kListPicture = 32;       // beside a choice
+constexpr int kPreviewPicture = 72;    // under the rows
+
+PropertiesPanel::ImageProvider g_images;
+unsigned g_imagesGeneration = 0;   // counts SetImageProvider calls
+
 bool SameRows(const std::vector<PropertiesPanel::Row>& a, const std::vector<PropertiesPanel::Row>& b,
               bool ignoreFields) {
     if (a.size() != b.size()) return false;
     for (size_t i = 0; i < a.size(); ++i) {
         if (a[i].group != b[i].group || a[i].name != b[i].name || a[i].editable != b[i].editable ||
-            a[i].field != b[i].field || a[i].choices != b[i].choices)
+            a[i].field != b[i].field || a[i].choices != b[i].choices || a[i].preview != b[i].preview)
             return false;
         if ((!ignoreFields || a[i].field == 0) && a[i].value != b[i].value) return false;
     }
     return true;
 }
 
-// The grid's form of a list: each string followed by its null, and one more.
-std::wstring ChoiceList(const std::vector<std::wstring>& choices) {
-    std::wstring list;
-    for (const std::wstring& choice : choices) {
-        list += choice;
-        list += wchar_t(0);
-    }
-    list += wchar_t(0);
-    return list;
+std::string Utf8(const std::wstring& text) {
+    if (text.empty()) return {};
+    const int size = ::WideCharToMultiByte(CP_UTF8, 0, text.c_str(), (int)text.size(), nullptr, 0, nullptr, nullptr);
+    std::string out((size_t)size, '\0');
+    ::WideCharToMultiByte(CP_UTF8, 0, text.c_str(), (int)text.size(), out.data(), size, nullptr, nullptr);
+    return out;
 }
 
-int ItemType(const PropertiesPanel::Row& row) {
-    if (!row.editable) return PIT_STATIC;
-    return row.choices.empty() ? PIT_EDIT : PIT_COMBO;
+std::wstring Wide(const char* text) {
+    const int size = ::MultiByteToWideChar(CP_UTF8, 0, text, -1, nullptr, 0);
+    if (size <= 1) return {};
+    std::wstring out((size_t)size - 1, L'\0');
+    ::MultiByteToWideChar(CP_UTF8, 0, text, -1, out.data(), size);
+    return out;
+}
+
+bool ParseNumber(const std::wstring& value, float& out) {
+    std::wstring text = value;
+    for (wchar_t& c : text) if (c == L',') c = L'.';
+    wchar_t* end = nullptr;
+    out = std::wcstof(text.c_str(), &end);
+    return end != text.c_str() && text.find_first_not_of(L" 0123456789.+-eE") == std::wstring::npos;
+}
+
+void Fill(std::string& buffer, const std::wstring& value) {
+    const std::string text = Utf8(value);
+    buffer.assign(kBufferSize, '\0');
+    std::memcpy(buffer.data(), text.data(), std::min(text.size(), kBufferSize - 1));
+}
+
+// The provider's DIB, as a texture ImGui can draw.
+IDirect3DTexture9* MakeTexture(IDirect3DDevice9* device, HBITMAP bitmap) {
+    BITMAP info{};
+    if (!device || !bitmap || !::GetObjectW(bitmap, sizeof(info), &info) || info.bmWidth <= 0 || info.bmHeight == 0)
+        return nullptr;
+    const int width = info.bmWidth, height = std::abs(info.bmHeight);
+    std::vector<u32> pixels((size_t)width * height);
+    BITMAPINFO bi{};
+    bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
+    bi.bmiHeader.biWidth = width;
+    bi.bmiHeader.biHeight = -height;   // top-down
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    HDC dc = ::GetDC(nullptr);
+    const int lines = ::GetDIBits(dc, bitmap, 0, (UINT)height, pixels.data(), &bi, DIB_RGB_COLORS);
+    ::ReleaseDC(nullptr, dc);
+    if (lines <= 0) return nullptr;
+
+    IDirect3DTexture9* texture = nullptr;
+    if (FAILED(device->CreateTexture((UINT)width, (UINT)height, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &texture,
+                                     nullptr)))
+        return nullptr;
+    D3DLOCKED_RECT locked{};
+    if (FAILED(texture->LockRect(0, &locked, nullptr, 0))) {
+        texture->Release();
+        return nullptr;
+    }
+    for (int y = 0; y < height; ++y) {
+        u32* row = (u32*)((u8*)locked.pBits + (size_t)y * locked.Pitch);
+        for (int x = 0; x < width; ++x) row[x] = pixels[(size_t)y * width + x] | 0xFF000000u;
+    }
+    texture->UnlockRect(0);
+    return texture;
 }
 
 } // namespace
+
+void PropertiesPanel::SetImageProvider(ImageProvider provider) {
+    g_images = std::move(provider);
+    ++g_imagesGeneration;
+}
+
+void PropertiesPanel::ForgetPictures() {
+    for (auto& [bitmap, texture] : textures_)
+        if (texture) texture->Release();
+    textures_.clear();
+}
 
 void PropertiesPanel::AddTransformRows(View& view, bool editable) {
     Vec3 position;
@@ -73,177 +145,431 @@ void PropertiesPanel::AddTransformRows(View& view, bool editable) {
 }
 
 void PropertiesPanel::Create(HWND parent, HINSTANCE instance, HFONT font) {
-    title_ = ::CreateWindowExW(0, L"STATIC", L"Nothing selected", WS_CHILD | WS_VISIBLE | SS_LEFT |
-                               SS_ENDELLIPSIS, 0, 0, 10, 10, parent, (HMENU)IDC_PROP_TITLE, instance, nullptr);
-    byGroup_ = ::CreateWindowExW(0, L"BUTTON", L"Categorized", WS_CHILD | WS_VISIBLE | WS_TABSTOP |
-                                 BS_AUTORADIOBUTTON | BS_PUSHLIKE | WS_GROUP,
-                                 0, 0, 10, 10, parent, (HMENU)IDC_PROP_CATEGORIZED, instance, nullptr);
-    alphabetical_ = ::CreateWindowExW(0, L"BUTTON", L"Alphabetical", WS_CHILD | WS_VISIBLE | WS_TABSTOP |
-                                      BS_AUTORADIOBUTTON | BS_PUSHLIKE,
-                                      0, 0, 10, 10, parent, (HMENU)IDC_PROP_ALPHABETICAL, instance, nullptr);
-    grid_ = New_PropertyGrid(parent, IDC_PROP_GRID);
-    snap_ = ::CreateWindowExW(0, L"BUTTON", L"Snap to ground", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                              0, 0, 10, 10, parent, (HMENU)IDC_PROP_SNAP, instance, nullptr);
-    remove_ = ::CreateWindowExW(0, L"BUTTON", L"Delete", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                                0, 0, 10, 10, parent, (HMENU)IDC_PROP_REMOVE, instance, nullptr);
-    blender_ = ::CreateWindowExW(0, L"BUTTON", L"Edit in Blender", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                                 0, 0, 10, 10, parent, (HMENU)IDC_PROP_BLENDER, instance, nullptr);
-
-    for (HWND control : { title_, byGroup_, alphabetical_, grid_, snap_, remove_, blender_ })
-        if (control) ::SendMessageW(control, WM_SETFONT, (WPARAM)font, TRUE);
-    ::SendMessageW(byGroup_, BM_SETCHECK, BST_CHECKED, 0);
-    if (grid_) {
-        PropGrid_ShowToolTips(grid_, TRUE);
-        PropGrid_ShowPropertyDescriptions(grid_, TRUE);
-        PropGrid_SetFlatStyleChecks(grid_, TRUE);
-    }
+    (void)instance;
+    (void)font;
+    parent_ = parent;
     Show(View{});
 }
 
-void PropertiesPanel::Layout(int x, int y, int width, int height) {
-    const int pad = 6, gap = 4;
-    const int inner = width - 2 * pad;
-    int at = y + pad;
-    ::MoveWindow(title_, x + pad, at, inner, 18, TRUE);
-    at += 22;
-    const int half = (inner - gap) / 2;
-    ::MoveWindow(byGroup_, x + pad, at, half, 24, TRUE);
-    ::MoveWindow(alphabetical_, x + pad + half + gap, at, inner - half - gap, 24, TRUE);
-    at += 28;
-    const int buttons = 3 * 26 + 3 * gap + pad;
-    const int gridHeight = std::max(80, height - (at - y) - buttons);
-    if (grid_) ::MoveWindow(grid_, x + pad, at, inner, gridHeight, TRUE);
-    at += gridHeight + gap;
-    ::MoveWindow(snap_, x + pad, at, inner, 26, TRUE);
-    at += 26 + gap;
-    ::MoveWindow(remove_, x + pad, at, inner, 26, TRUE);
-    at += 26 + gap;
-    ::MoveWindow(blender_, x + pad, at, inner, 26, TRUE);
-}
-
-void PropertiesPanel::Rebuild() {
-    if (!grid_) return;
-    ::SendMessageW(grid_, WM_SETREDRAW, FALSE, 0);
-    PropGrid_ResetContent(grid_);
-
-    std::vector<Row> rows = shown_.rows;
-    if (sorted_) {
-        // One group, names in order, as Visual Studio's alphabetical view.
-        std::stable_sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) {
-            return ::_wcsicmp(a.name.c_str(), b.name.c_str()) < 0;
-        });
-        for (Row& row : rows) row.group = L"Properties";
-    }
-
-    for (Row& row : rows) {
-        PROPGRIDITEM item;
-        PropGrid_ItemInit(item);
-        item.lpszCatalog = const_cast<LPTSTR>(row.group.c_str());
-        item.lpszPropName = const_cast<LPTSTR>(row.name.c_str());
-        item.lpszPropDesc = const_cast<LPTSTR>(row.description.c_str());
-        item.lpCurValue = (LPARAM)row.value.c_str();
-        item.lpUserData = (LPVOID)(INT_PTR)row.field;
-        item.iItemType = ItemType(row);
-        const std::wstring choices = ChoiceList(row.choices);
-        if (item.iItemType == PIT_COMBO) item.lpszzCmbItems = const_cast<LPTSTR>(choices.c_str());
-        PropGrid_AddItem(grid_, &item);
-    }
-    PropGrid_ExpandAllCatalogs(grid_);
-    ::SendMessageW(grid_, WM_SETREDRAW, TRUE, 0);
-    ::InvalidateRect(grid_, nullptr, TRUE);
-}
-
-int PropertiesPanel::FindField(int field) const {
-    if (!grid_) return -1;
-    const int count = PropGrid_GetCount(grid_);
-    for (int i = 0; i < count; ++i) {
-        const LPPROPGRIDITEM item = PropGrid_GetItemData(grid_, i);
-        if (item && item != (LPPROPGRIDITEM)LB_ERR && (int)(INT_PTR)item->lpUserData == field) return i;
-    }
-    return -1;
+void PropertiesPanel::Post(int id) const {
+    if (parent_) ::PostMessageW(parent_, WM_COMMAND, MAKEWPARAM(id, 0), 0);
 }
 
 void PropertiesPanel::Show(const View& view) {
     const bool sameObject = haveShown_ && view.mode == shown_.mode && view.title == shown_.title &&
                             view.removed == shown_.removed;
-
     if (sameObject && SameRows(view.rows, shown_.rows, false)) return;
 
     if (sameObject && SameRows(view.rows, shown_.rows, true)) {
         // Only the transform moved: the values change in place, except in a
         // row someone is typing into.
-        const HWND focus = ::GetFocus();
-        const bool typing = grid_ && focus && ::IsChild(grid_, focus);
-        if (!typing) {
-            for (size_t i = 0; i < view.rows.size(); ++i) {
-                const Row& row = view.rows[i];
-                if (row.field == 0 || row.value == shown_.rows[i].value) continue;
-                const int index = FindField(row.field);
-                if (index < 0) continue;
-                PROPGRIDITEM item;
-                PropGrid_ItemInit(item);
-                item.lpszCatalog = const_cast<LPTSTR>(row.group.c_str());
-                item.lpszPropName = const_cast<LPTSTR>(row.name.c_str());
-                item.lpszPropDesc = const_cast<LPTSTR>(row.description.c_str());
-                item.lpCurValue = (LPARAM)row.value.c_str();
-                item.lpUserData = (LPVOID)(INT_PTR)row.field;
-                item.iItemType = ItemType(row);
-                const std::wstring choices = ChoiceList(row.choices);
-                if (item.iItemType == PIT_COMBO) item.lpszzCmbItems = const_cast<LPTSTR>(choices.c_str());
-                PropGrid_SetItemData(grid_, index, &item);
-            }
-            shown_ = view;
+        for (size_t i = 0; i < view.rows.size(); ++i) {
+            if ((int)i == activeRow_) continue;
+            values_[i] = view.rows[i].value;
+            Fill(buffers_[i], values_[i]);
         }
+        const std::wstring typing = activeRow_ >= 0 ? values_[(size_t)activeRow_] : std::wstring();
+        shown_ = view;
+        if (activeRow_ >= 0) shown_.rows[(size_t)activeRow_].value = typing;
         return;
     }
 
     shown_ = view;
     haveShown_ = true;
-    ::SetWindowTextW(title_, view.title.empty() ? L"Nothing selected" : view.title.c_str());
-    Rebuild();
-
-    // An extension's object names its own two actions; an empty label is no action.
-    const bool extension = view.mode == Mode::Extension;
-    ::EnableWindow(snap_, view.mode == Mode::Placement || (extension && !view.moveLabel.empty()));
-    ::SetWindowTextW(snap_, extension && !view.moveLabel.empty() ? view.moveLabel.c_str() : L"Snap to ground");
-    const bool canRemove = view.mode == Mode::Placement || view.mode == Mode::Native ||
-                           view.mode == Mode::Several || (extension && !view.removeLabel.empty());
-    ::EnableWindow(remove_, canRemove && !view.removed);
-    // Any mesh can go to Blender: a placed one, one of the map's own, several.
-    ::EnableWindow(blender_, view.mode == Mode::Placement || view.mode == Mode::Native ||
-                             view.mode == Mode::Library || view.mode == Mode::Several);
-    ::SetWindowTextW(remove_, view.mode == Mode::Native ? L"Remove from the world"
-                              : extension && !view.removeLabel.empty() ? view.removeLabel.c_str()
-                                                                        : L"Delete");
+    activeRow_ = -1;
+    values_.resize(view.rows.size());
+    buffers_.resize(view.rows.size());
+    for (size_t i = 0; i < view.rows.size(); ++i) {
+        values_[i] = view.rows[i].value;
+        Fill(buffers_[i], values_[i]);
+    }
 }
 
-bool PropertiesPanel::Read(Mat4& transform) const {
-    float values[8] = {};
-    for (int field = 1; field <= 7; ++field) {
-        const int index = FindField(field);
-        if (index < 0) return false;
-        const LPPROPGRIDITEM item = PropGrid_GetItemData(grid_, index);
-        if (!item || item == (LPPROPGRIDITEM)LB_ERR || !item->lpCurValue) return false;
-        wchar_t text[64] = {};
-        ::wcsncpy_s(text, (const wchar_t*)item->lpCurValue, _TRUNCATE);
-        for (wchar_t& c : text) if (c == L',') c = L'.';
-        wchar_t* end = nullptr;
-        values[field] = std::wcstof(text, &end);
-        if (end == text) return false;
+void PropertiesPanel::Commit(size_t row) {
+    changed_ = true;
+    shown_.rows[row].value = values_[row];
+    Post(IDC_PROP_GRID);
+}
+
+bool PropertiesPanel::OnCommand(int id) {
+    if (id != IDC_PROP_GRID) return false;
+    if (changed_) {
+        changed_ = false;
+        if (onChange_) onChange_();
     }
-    if (values[7] <= 0.01f || values[7] > 3.9f) return false;
-    transform = nfs::ComposePlacement({ values[1], values[2], values[3] }, values[4], values[5],
-                                      values[6], values[7]);
     return true;
+}
+
+void* PropertiesPanel::Picture(IDirect3DDevice9* device, const std::wstring& name, int size) {
+    if (!g_images || name.empty()) return nullptr;
+    if (picturesGeneration_ != g_imagesGeneration) {
+        ForgetPictures();
+        picturesGeneration_ = g_imagesGeneration;
+    }
+    HBITMAP bitmap = g_images(name, size);
+    if (!bitmap) return nullptr;
+    auto found = textures_.find(bitmap);
+    if (found != textures_.end()) return found->second;
+    IDirect3DTexture9* texture = MakeTexture(device, bitmap);
+    // A miss is remembered too, so a bad picture is not retried every frame.
+    textures_[bitmap] = texture;
+    if (textures_.size() > 512) {
+        for (auto& [handle, cached] : textures_)
+            if (cached && cached != texture) cached->Release();
+        textures_.clear();
+        textures_[bitmap] = texture;
+    }
+    return texture;
+}
+
+void PropertiesPanel::DrawRow(size_t index, IDirect3DDevice9* device) {
+    const Row& row = shown_.rows[index];
+    ImGui::PushID((int)index);
+    ImGui::TableNextRow();
+    ImGui::TableSetColumnIndex(0);
+    float number = 0.0f;
+    const bool numeric = row.editable && row.choices.empty() && ParseNumber(values_[index], number);
+    if (numeric) {
+        // Drag the name to change the number.
+        const float speed = row.field == 7 ? 0.005f : std::fabs(number) < 2.0f ? 0.01f : 0.05f;
+        DragLabel("##name", Utf8(row.name).c_str(), 0, ImGui::GetContentRegionAvail().x, index, speed, true);
+    } else {
+        ImGui::AlignTextToFramePadding();
+        if (row.editable) ImGui::TextUnformatted(Utf8(row.name).c_str());
+        else ImGui::TextDisabled("%s", Utf8(row.name).c_str());
+    }
+    if (ImGui::IsItemHovered()) hoverHelp_ = row.description;
+
+    ImGui::TableSetColumnIndex(1);
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    const std::string value = Utf8(values_[index]);
+
+    if (row.editable && !row.choices.empty()) {
+        if (ImGui::BeginCombo("##value", value.c_str(), ImGuiComboFlags_HeightLarge)) {
+            for (size_t c = 0; c < row.choices.size(); ++c) {
+                const std::string choice = Utf8(row.choices[c]);
+                const bool selected = row.choices[c] == values_[index];
+                ImGui::PushID((int)c);
+                bool picked = false;
+                if (row.preview) {
+                    const float side = (float)kListPicture;
+                    if (void* picture = Picture(device, row.choices[c], kListPicture)) {
+                        const ImVec2 at = ImGui::GetCursorPos();
+                        picked = ImGui::Selectable("##choice", selected, 0, ImVec2(0, side));
+                        ImGui::SetCursorPos(at);
+                        ImGui::Image((ImTextureID)picture, ImVec2(side, side));
+                        ImGui::SameLine();
+                        ImGui::SetCursorPosY(at.y + (side - ImGui::GetTextLineHeight()) * 0.5f);
+                        ImGui::TextUnformatted(choice.c_str());
+                    } else {
+                        picked = ImGui::Selectable(choice.c_str(), selected);
+                    }
+                } else {
+                    picked = ImGui::Selectable(choice.c_str(), selected);
+                }
+                if (selected) ImGui::SetItemDefaultFocus();
+                ImGui::PopID();
+                if (picked && !selected) {
+                    values_[index] = row.choices[c];
+                    Fill(buffers_[index], values_[index]);
+                    Commit(index);
+                }
+            }
+            ImGui::EndCombo();
+        }
+    } else if (row.editable) {
+        ValueInput(index, numeric || (row.field >= 1 && row.field <= 7));
+    } else {
+        if (row.preview)
+            if (void* picture = Picture(device, values_[index], kListPicture)) {
+                const float side = ImGui::GetFrameHeight();
+                ImGui::Image((ImTextureID)picture, ImVec2(side, side));
+                ImGui::SameLine();
+            }
+        ImGui::TextWrapped("%s", value.c_str());
+    }
+    if (ImGui::IsItemHovered()) hoverHelp_ = row.description;
+    ImGui::PopID();
+}
+
+void PropertiesPanel::ValueInput(size_t row, bool numeric) {
+    ImGui::InputText("##value", buffers_[row].data(), kBufferSize,
+                     numeric ? ImGuiInputTextFlags_CharsScientific : 0);
+    if (ImGui::IsItemActive()) activeRow_ = (int)row;
+    else if (activeRow_ == (int)row && !dragging_) activeRow_ = -1;
+    if (ImGui::IsItemDeactivatedAfterEdit()) {
+        values_[row] = Wide(buffers_[row].c_str());
+        Commit(row);
+    }
+}
+
+void PropertiesPanel::DragLabel(const char* id, const char* text, unsigned badge, float width, size_t row,
+                                float speed, bool live) {
+    const ImGuiIO& io = ImGui::GetIO();
+    const float height = ImGui::GetFrameHeight();
+    const ImVec2 at = ImGui::GetCursorScreenPos();
+    ImGui::InvisibleButton(id, ImVec2(std::max(1.0f, width), height));
+    const bool hovered = ImGui::IsItemHovered(), active = ImGui::IsItemActive();
+    if (hovered || active) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    const ImVec2 textSize = ImGui::CalcTextSize(text);
+    if (badge) {
+        // A coloured tag, brighter under the pointer.
+        ImVec4 colour = ImGui::ColorConvertU32ToFloat4(badge);
+        if (hovered || active) { colour.x = std::min(1.0f, colour.x * 1.25f); colour.y = std::min(1.0f, colour.y * 1.25f); colour.z = std::min(1.0f, colour.z * 1.25f); }
+        draw->AddRectFilled(at, ImVec2(at.x + width, at.y + height), ImGui::ColorConvertFloat4ToU32(colour),
+                            ImGui::GetStyle().FrameRounding, ImDrawFlags_RoundCornersLeft);
+        draw->AddText(ImVec2(at.x + (width - textSize.x) * 0.5f, at.y + (height - textSize.y) * 0.5f),
+                      IM_COL32(255, 255, 255, 235), text);
+    } else {
+        const ImU32 colour = ImGui::GetColorU32(hovered || active ? ImGuiCol_Text : ImGuiCol_Text, hovered || active ? 1.0f : 0.92f);
+        draw->PushClipRect(at, ImVec2(at.x + width, at.y + height), true);
+        draw->AddText(ImVec2(at.x, at.y + (height - textSize.y) * 0.5f), colour, text);
+        draw->PopClipRect();
+    }
+
+    if (active && ImGui::IsMouseDragging(ImGuiMouseButton_Left, 0.0f) && io.MouseDelta.x != 0.0f) {
+        float value = 0.0f;
+        if (ParseNumber(values_[row], value)) {
+            const float factor = io.KeyShift ? 10.0f : io.KeyCtrl ? 0.1f : 1.0f;
+            value += io.MouseDelta.x * speed * factor;
+            if (shown_.rows[row].field == 7) value = std::clamp(value, 0.02f, 3.9f);
+            wchar_t text2[32];
+            ::swprintf_s(text2, L"%.3f", value);
+            values_[row] = text2;
+            Fill(buffers_[row], values_[row]);
+            shown_.rows[row].value = values_[row];
+            activeRow_ = (int)row;
+            dragging_ = true;
+            // While dragging, the view follows -- a few times a second for
+            // anything but the transform, whose apply is cheap.
+            const double now = ImGui::GetTime();
+            if (live && now - lastLiveCommit_ > (shown_.rows[row].field ? 0.0 : 0.1)) {
+                lastLiveCommit_ = now;
+                Commit(row);
+            }
+        }
+    }
+    if (ImGui::IsItemDeactivated() && dragging_) {
+        dragging_ = false;
+        Commit(row);
+        activeRow_ = -1;
+    }
+}
+
+void PropertiesPanel::DrawVector(const char* label, const size_t rows[3], const char* const axes[3],
+                                 const unsigned colours[3], float speed) {
+    ImGui::PushID(label);
+    ImGui::TableNextRow();
+    ImGui::TableSetColumnIndex(0);
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted(label);
+    if (ImGui::IsItemHovered())
+        hoverHelp_ = L"Drag a coloured tag to change that value (Shift faster, Ctrl finer), or type it.";
+    ImGui::TableSetColumnIndex(1);
+    const float spacing = 3.0f;
+    const float width = (ImGui::GetContentRegionAvail().x - spacing * 2) / 3.0f;
+    const float tag = ImGui::GetFrameHeight() * 0.72f;
+    for (int k = 0; k < 3; ++k) {
+        const size_t row = rows[k];
+        ImGui::PushID(k);
+        DragLabel("##tag", axes[k], colours[k], tag, row, speed, true);
+        if (ImGui::IsItemHovered()) hoverHelp_ = shown_.rows[row].description;
+        ImGui::SameLine(0.0f, 0.0f);
+        ImGui::SetNextItemWidth(std::max(10.0f, width - tag));
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(3.0f, ImGui::GetStyle().FramePadding.y));
+        ValueInput(row, true);
+        ImGui::PopStyleVar();
+        if (ImGui::IsItemHovered()) hoverHelp_ = shown_.rows[row].description;
+        ImGui::PopID();
+        if (k < 2) ImGui::SameLine(0.0f, spacing);
+    }
+    ImGui::PopID();
+}
+
+void PropertiesPanel::Draw(IDirect3DDevice9* device) {
+    const std::string title = std::string(ImGuiLayer::kIconSliders) + "  Properties###Properties";
+    if (!ImGui::Begin(title.c_str())) {
+        ImGui::End();
+        return;
+    }
+    const ImGuiStyle& style = ImGui::GetStyle();
+    hoverHelp_.clear();
+
+    // --- heading and the grouping switch -------------------------------------
+    ImGui::PushFont(ImGuiLayer::BoldFont());
+    const std::string heading = shown_.title.empty() ? std::string("Nothing selected") : Utf8(shown_.title);
+    const float switches = ImGui::GetFrameHeight() * 2 + style.ItemSpacing.x;
+    ImGui::PushTextWrapPos(ImGui::GetContentRegionAvail().x - switches - style.ItemSpacing.x);
+    ImGui::TextUnformatted(heading.c_str());
+    ImGui::PopTextWrapPos();
+    ImGui::PopFont();
+    ImGui::SameLine(ImGui::GetContentRegionMax().x - switches);
+    const auto toggle = [&](const char* icon, bool on, const char* tip) {
+        if (on) ImGui::PushStyleColor(ImGuiCol_Button, style.Colors[ImGuiCol_HeaderActive]);
+        const bool clicked = ImGui::Button(icon, ImVec2(ImGui::GetFrameHeight(), ImGui::GetFrameHeight()));
+        if (on) ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tip);
+        return clicked;
+    };
+    if (toggle(ImGuiLayer::kIconList, !sorted_, "By group")) sorted_ = false;
+    ImGui::SameLine();
+    if (toggle(ImGuiLayer::kIconSort, sorted_, "By name")) sorted_ = true;
+    ImGui::Separator();
+
+    // --- the footer's room: description, pictures, buttons ---------------------
+    const bool anyPreview = g_images && std::any_of(shown_.rows.begin(), shown_.rows.end(),
+                                                    [](const Row& row) { return row.preview; });
+    const float buttonHeight = ImGui::GetFrameHeight();
+    const float helpHeight = ImGui::GetTextLineHeightWithSpacing() * 3.2f;
+    const float previewHeight = anyPreview ? kPreviewPicture + ImGui::GetTextLineHeightWithSpacing() * 2 + 8 : 0.0f;
+    const float footer = helpHeight + previewHeight + 4 * (buttonHeight + style.ItemSpacing.y) + style.ItemSpacing.y * 3;
+
+    // --- the rows ------------------------------------------------------------------
+    if (ImGui::BeginChild("##rows", ImVec2(0, std::max(80.0f, ImGui::GetContentRegionAvail().y - footer)))) {
+        const ImGuiTableFlags tableFlags = ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV |
+                                           ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchProp;
+        // Where the transform rows are: they draw as Position and Rotation
+        // lines of three, and Scale on its own.
+        size_t fieldRow[8];
+        bool haveField[8] = {};
+        for (size_t i = 0; i < shown_.rows.size(); ++i) {
+            const int field = shown_.rows[i].field;
+            if (field >= 1 && field <= 7) { fieldRow[field] = i; haveField[field] = true; }
+        }
+        const bool position = haveField[1] && haveField[2] && haveField[3];
+        const bool rotation = haveField[4] && haveField[5] && haveField[6];
+        static const char* const kXyz[3] = { "X", "Y", "Z" };
+        static const char* const kTurn[3] = { "H", "P", "R" };   // heading (about Z), pitch (Y), roll (X)
+        static const unsigned kXyzColours[3] = { IM_COL32(196, 64, 64, 255), IM_COL32(72, 160, 72, 255),
+                                                  IM_COL32(64, 112, 210, 255) };
+        static const unsigned kTurnColours[3] = { IM_COL32(64, 112, 210, 255), IM_COL32(72, 160, 72, 255),
+                                                  IM_COL32(196, 64, 64, 255) };
+
+        const auto table = [&](const char* id, const std::vector<size_t>& rows) {
+            if (!ImGui::BeginTable(id, 2, tableFlags)) return;
+            ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch, 0.27f);
+            ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch, 0.73f);
+            for (size_t index : rows) {
+                const int field = shown_.rows[index].field;
+                if (position && field >= 1 && field <= 3) {
+                    if (field == 1) {
+                        const size_t three[3] = { fieldRow[1], fieldRow[2], fieldRow[3] };
+                        DrawVector("Position", three, kXyz, kXyzColours, 0.05f);
+                    }
+                    continue;
+                }
+                if (rotation && field >= 4 && field <= 6) {
+                    if (field == 4) {
+                        const size_t three[3] = { fieldRow[4], fieldRow[5], fieldRow[6] };
+                        DrawVector("Rotation", three, kTurn, kTurnColours, 0.5f);
+                    }
+                    continue;
+                }
+                DrawRow(index, device);
+            }
+            ImGui::EndTable();
+        };
+        if (shown_.rows.empty()) {
+            ImGui::TextDisabled("Select something in the view.");
+        } else if (sorted_) {
+            std::vector<size_t> order(shown_.rows.size());
+            for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+            // The transform keeps its own order, first.
+            std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+                const int fa = shown_.rows[a].field, fb = shown_.rows[b].field;
+                const bool ta = fa >= 1 && fa <= 7, tb = fb >= 1 && fb <= 7;
+                if (ta || tb) return ta && tb ? fa < fb : ta;
+                return ::_wcsicmp(shown_.rows[a].name.c_str(), shown_.rows[b].name.c_str()) < 0;
+            });
+            table("##sorted", order);
+        } else {
+            std::vector<std::wstring> groups;
+            std::map<std::wstring, std::vector<size_t>> members;
+            for (size_t i = 0; i < shown_.rows.size(); ++i) {
+                const std::wstring& group = shown_.rows[i].group;
+                if (!members.count(group)) groups.push_back(group);
+                members[group].push_back(i);
+            }
+            for (const std::wstring& group : groups) {
+                const std::string label = Utf8(group.empty() ? std::wstring(L"Properties") : group);
+                if (ImGui::CollapsingHeader(label.c_str(), ImGuiTreeNodeFlags_DefaultOpen))
+                    table(("##" + label).c_str(), members[group]);
+            }
+        }
+    }
+    ImGui::EndChild();
+
+    // --- what the row under the pointer means ------------------------------------
+    if (ImGui::BeginChild("##help", ImVec2(0, helpHeight), ImGuiChildFlags_None)) {
+        ImGui::PushStyleColor(ImGuiCol_Text, style.Colors[ImGuiCol_TextDisabled]);
+        ImGui::TextWrapped("%s", Utf8(hoverHelp_).c_str());
+        ImGui::PopStyleColor();
+    }
+    ImGui::EndChild();
+
+    // --- pictures of the preview rows ------------------------------------------------
+    if (anyPreview) {
+        const float cell = kPreviewPicture + 12.0f;
+        float x = 0.0f;
+        const float width = ImGui::GetContentRegionAvail().x;
+        ImGui::BeginGroup();
+        for (size_t i = 0; i < shown_.rows.size(); ++i) {
+            const Row& row = shown_.rows[i];
+            if (!row.preview) continue;
+            if (x > 0.0f && x + cell > width) break;
+            if (x > 0.0f) ImGui::SameLine();
+            ImGui::BeginGroup();
+            ImGui::PushID((int)i);
+            if (void* picture = Picture(device, values_[i], kPreviewPicture))
+                ImGui::Image((ImTextureID)picture, ImVec2((float)kPreviewPicture, (float)kPreviewPicture));
+            else
+                ImGui::Dummy(ImVec2((float)kPreviewPicture, (float)kPreviewPicture));
+            ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + kPreviewPicture);
+            ImGui::TextDisabled("%s", Utf8(row.name).c_str());
+            ImGui::TextUnformatted(Utf8(values_[i]).c_str());
+            ImGui::PopTextWrapPos();
+            ImGui::PopID();
+            ImGui::EndGroup();
+            x += cell;
+        }
+        ImGui::EndGroup();
+    }
+
+    // --- actions ---------------------------------------------------------------------
+    const Mode mode = shown_.mode;
+    const bool extension = mode == Mode::Extension;
+    const bool mesh = mode == Mode::Placement || mode == Mode::Native || mode == Mode::Library || mode == Mode::Several;
+    const auto action = [&](const char* icon, const std::string& label, bool enabled, int id) {
+        ImGui::BeginDisabled(!enabled);
+        const std::string text = std::string(icon) + "  " + label;
+        if (ImGui::Button(text.c_str(), ImVec2(-FLT_MIN, buttonHeight))) Post(id);
+        ImGui::EndDisabled();
+    };
+    ImGui::Spacing();
+    action(ImGuiLayer::kIconDown,
+           extension && !shown_.moveLabel.empty() ? Utf8(shown_.moveLabel) : std::string("Snap to ground"),
+           mode == Mode::Placement || (extension && !shown_.moveLabel.empty()), IDC_PROP_SNAP);
+    const bool canRemove = mode == Mode::Placement || mode == Mode::Native || mode == Mode::Several ||
+                           (extension && !shown_.removeLabel.empty());
+    action(ImGuiLayer::kIconDelete,
+           mode == Mode::Native ? std::string("Remove from the world")
+           : extension && !shown_.removeLabel.empty() ? Utf8(shown_.removeLabel) : std::string("Delete"),
+           canRemove && !shown_.removed, IDC_PROP_REMOVE);
+    action(ImGuiLayer::kIconEdit, "Edit in Blender", mesh, IDC_PROP_BLENDER);
+    action(ImGuiLayer::kIconShield, "Make collision", mesh, IDC_PROP_COLLISION);
+
+    ImGui::End();
 }
 
 bool PropertiesPanel::ReadText(int field, std::wstring& text) const {
-    const int index = FindField(field);
-    if (index < 0) return false;
-    const LPPROPGRIDITEM item = PropGrid_GetItemData(grid_, index);
-    if (!item || item == (LPPROPGRIDITEM)LB_ERR || !item->lpCurValue) return false;
-    text = (const wchar_t*)item->lpCurValue;
-    return true;
+    for (size_t i = 0; i < shown_.rows.size(); ++i)
+        if (shown_.rows[i].field == field) {
+            text = values_[i];
+            return true;
+        }
+    return false;
 }
 
 bool PropertiesPanel::ReadNumber(int field, float& value) const {
@@ -255,18 +581,12 @@ bool PropertiesPanel::ReadNumber(int field, float& value) const {
     return end != text.c_str();
 }
 
-bool PropertiesPanel::OnNotify(const NMHDR* header) {
-    if (!grid_ || header->hwndFrom != grid_ || header->code != PGN_PROPERTYCHANGE) return false;
-    changed_ = true;
-    return true;
-}
-
-bool PropertiesPanel::OnCommand(int id) {
-    if (id != IDC_PROP_CATEGORIZED && id != IDC_PROP_ALPHABETICAL) return false;
-    const bool sorted = id == IDC_PROP_ALPHABETICAL;
-    if (sorted != sorted_) {
-        sorted_ = sorted;
-        Rebuild();
-    }
+bool PropertiesPanel::Read(Mat4& transform) const {
+    float values[8] = {};
+    for (int field = 1; field <= 7; ++field)
+        if (!ReadNumber(field, values[field])) return false;
+    if (values[7] <= 0.01f || values[7] > 3.9f) return false;
+    transform = nfs::ComposePlacement({ values[1], values[2], values[3] }, values[4], values[5],
+                                      values[6], values[7]);
     return true;
 }

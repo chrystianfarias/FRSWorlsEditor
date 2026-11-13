@@ -111,6 +111,7 @@ void D3D9Context::Resize(u32 width, u32 height) {
 bool D3D9Context::Reset() {
     if (!device_) return false;
 
+    if (beforeReset) beforeReset();
     const HRESULT hr = device_->Reset(&present_);
     if (FAILED(hr)) {
         LOG_WARN("device reset failed (hr 0x%08lX)", (unsigned long)hr);
@@ -118,6 +119,7 @@ bool D3D9Context::Reset() {
     }
 
     needsReset_ = false;
+    if (afterReset) afterReset();
     return true;
 }
 

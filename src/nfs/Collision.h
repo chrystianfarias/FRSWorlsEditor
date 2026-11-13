@@ -26,12 +26,33 @@ struct CollisionPolygon {
     // A vertical wall along corners[0] -> corners[2], unbounded in height.
     // Its z values are left at zero; a viewer has to pick its own height.
     bool barrier = false;
-    u8   surface = 0;   // byte 1: groups polygons by material, 121 values in L4RA
-    u8   flags   = 0;   // byte 3: 0x10 quad, 0x16 barrier, others not yet known
-    // Bytes 0 to 3 of the record as stored. Only two of them are understood,
-    // so an export carries all four and an import puts them back unchanged.
+    u8   surface = 0;   // byte 2: index into the game's surface table (SurfaceName)
+    u8   raceGroup = 0; // byte 0: race barrier group, 0 = always there (see World)
+    u8   flags   = 0;   // byte 3: 0x10 quad, 0x02 vertical, 0x16 barrier
+    // Bytes 0 to 3 of the record as stored. These are what the encoder
+    // writes; the named fields above are read from them (SyncFromAttributes).
+    // Byte 1 is recomputed on every encode.
     u8   attributes[4] = {};
+
+    void SyncFromAttributes() {
+        raceGroup = attributes[0];
+        surface   = attributes[2];
+        flags     = attributes[3];
+    }
+    // A wall with real height: flags 0x02 without the barrier's 0x04.
+    bool Vertical() const { return !barrier && (flags & 0x02) != 0; }
 };
+
+// The game's surface table (SPEED2.EXE 0x800EE0, 0x98 bytes an entry):
+// what byte 2 of a polygon selects -- grip, sound, skid marks, sparks.
+constexpr u8 kSurfaceCount     = 29;
+constexpr u8 kSurfaceRoad      = 0x01;
+constexpr u8 kSurfaceGrass     = 0x0F;
+constexpr u8 kSurfaceSidewalk  = 0x10;
+constexpr u8 kSurfaceSolidWall = 0x14;
+// The name the game gives a surface index ("ROAD", "SOLID_WALL"...), or
+// "SURFACE_<n>" past the end of the table.
+const char* SurfaceName(u8 surface);
 
 // The collision of one streaming section.
 struct CollisionPack {

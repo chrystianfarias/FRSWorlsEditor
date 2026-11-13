@@ -10,6 +10,7 @@
 
 class RenderExtension;
 
+#include <functional>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -195,6 +196,31 @@ public:
     bool CollisionVisible() const { return showCollision_; }
     void SetCollisionVisible(bool visible) { showCollision_ = visible; }
 
+    // Race barrier groups (polygon byte 0 != 0) exist only during the races
+    // that use them. Hidden, they are neither drawn nor picked.
+    bool RaceGroupsVisible() const { return showRaceGroups_; }
+    void SetRaceGroupsVisible(bool visible);
+
+    // Rebuilds the drawn collision of one loaded section after it was edited.
+    void RefreshCollision(size_t loadedSection);
+
+    // Lines and triangles an editing tool draws over the world -- a wall
+    // being drawn, the point under the cursor. In world space, with their
+    // own colours; empty draws nothing.
+    // Each tool keeps its own layer, named by `owner`.
+    struct OverlayVertex { float x, y, z; D3DCOLOR colour; };
+    void SetToolOverlay(std::vector<OverlayVertex> triangles, std::vector<OverlayVertex> lines,
+                        const void* owner = nullptr) {
+        ToolLayer& layer = toolLayers_[owner];
+        layer.triangles = std::move(triangles);
+        layer.lines = std::move(lines);
+    }
+
+    // New positions for every drawn copy of a model, in the space its mesh
+    // is stored in, one per vertex -- written straight into the GPU buffers,
+    // for an edit seen as it is made. The caller keeps the parsed model in step.
+    void UpdateModelPositions(u32 modelHash, const std::vector<Vec3>& positions);
+
     float StreamRadius() const { return streamRadius_; }
     void  SetStreamRadius(float radius) { streamRadius_ = radius < 50.0f ? 50.0f : radius; }
 
@@ -236,6 +262,8 @@ public:
     bool ToggleCollisionSelection(const CollisionPick& pick);
     // Adds every polygon of the pack `pick` belongs to. Returns how many were new.
     size_t SelectCollisionPack(const CollisionPick& pick, bool add);
+    // Replaces the collision selection with these polygons.
+    void SetCollisionSelectionList(std::vector<CollisionPick> picks);
 
     // Things drawn over the world that belong to an editor extension. The
     // extension outlives the renderer's use of it.
@@ -271,6 +299,17 @@ public:
     void BeginOverlay(IDirect3DDevice9* device);
     void EndOverlay(IDirect3DDevice9* device);
     D3D9Context* Context() const { return context_; }
+    // Geometry an extension generates itself, in world space, in the world's
+    // vertex layout and lit the way the world is: BeginUserMesh once, then
+    // BindUserTexture before each draw with a region texture's hash.
+    // A region model's GPU copy, by hash, to draw with BeginModels/DrawModel.
+    bool FindGpuModel(u32 hash, const GpuSection*& gpu, const GpuObject*& object);
+    void BeginUserMesh(IDirect3DDevice9* device);
+    void BindUserTexture(IDirect3DDevice9* device, u32 textureHash);
+
+    // Models the editor shows some other way -- the baked roads, drawn from
+    // their procedural description instead -- left out of drawing and picking.
+    void SetHiddenModels(std::function<bool(const nfs::SolidObject&)> hidden) { hiddenModels_ = std::move(hidden); }
     // Textures the region does not hold, for an extension's models.
     void SetExtraTextureLookup(TextureCache::ExtraLookup lookup) { textures_.SetExtraLookup(std::move(lookup)); }
 
@@ -418,6 +457,10 @@ private:
     bool       showLibrary_ = false;
     bool       showAlternate_ = false;
     bool       showCollision_ = false;
+    bool       showRaceGroups_ = true;
+    struct ToolLayer { std::vector<OverlayVertex> triangles, lines; };
+    std::unordered_map<const void*, ToolLayer> toolLayers_;
+    void DrawToolOverlay(IDirect3DDevice9* device);
     // Off by default: the whole region drawn at once is what editing wants;
     // streaming shows what the game would have loaded, a question asked less.
     bool       streaming_ = false;
@@ -447,6 +490,11 @@ private:
     bool showOriginalBuildings_ = true;
     bool HiddenBuilding(const GpuObject& object) const {
         return !showOriginalBuildings_ && object.source && minimap::IsMinimapBuilding(*object.source);
+    }
+
+    std::function<bool(const nfs::SolidObject&)> hiddenModels_;
+    bool HiddenModel(const GpuObject& object) const {
+        return hiddenModels_ && object.source && hiddenModels_(*object.source);
     }
 
     // The sections whose collision was drawn last frame, so picking only finds

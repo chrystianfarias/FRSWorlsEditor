@@ -4,6 +4,7 @@
 
 #include <d3d9.h>
 
+#include <functional>
 #include <string>
 
 // Owns the Direct3D 9 object and device for the editor viewport.
@@ -47,6 +48,10 @@ public:
     // rather than the screen means the window does not have to be visible,
     // in focus, or free of anything overlapping it.
     bool SaveBackBuffer(const std::wstring& path);
+
+    // Called round every device reset: default-pool objects of others (an
+    // overlay's buffers) have to go before it and come back after.
+    std::function<void()> beforeReset, afterReset;
 
     // True when the driver supports the given texture format.
     bool SupportsTextureFormat(D3DFORMAT format) const;

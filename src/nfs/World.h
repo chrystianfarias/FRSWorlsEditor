@@ -48,6 +48,16 @@ struct LoadedSection {
     // their matrix zeroed.
     std::vector<std::pair<u32, u32>> removedNatives;
 
+    // Collision edited in the editor and not written yet: the packs (indices
+    // into `collision`) whose polygons differ from what is on disk.
+    bool collisionChanged = false;
+    std::vector<u32> changedCollisionPacks;
+    void MarkCollisionChanged(u32 pack) {
+        collisionChanged = true;
+        for (u32 p : changedCollisionPacks) if (p == pack) return;
+        changedCollisionPacks.push_back(pack);
+    }
+
     // Models from other positioned sections to be copied into this one when
     // the placements are written, so they can be placed here. Hashes.
     std::vector<u32> importedModels;
@@ -151,6 +161,13 @@ public:
 
     size_t InstanceCount() const { return instanceCount_; }
 
+    // The race barrier groups the layout file names (chunk 0x3412F): byte 0
+    // of a collision polygon indexes this list, entry 0 being "NONE". A group
+    // exists for the game only during the races that name it -- in free roam
+    // its polygons are not there at all.
+    const std::vector<std::string>& RaceBarrierGroups() const { return raceGroups_; }
+    std::string RaceBarrierGroupName(u8 group) const;
+
     // --- placing scenery -----------------------------------------------------
 
     LoadedSection* MutableLoaded(size_t index) {
@@ -182,6 +199,8 @@ private:
     std::vector<std::unique_ptr<TexturePack>> globalPacks_;
     void OpenGlobalPacks(const std::wstring& tracksDirectory);
     SectionTable table_;
+    std::vector<std::string> raceGroups_;
+    void ReadRaceBarrierGroups();
 
     std::wstring overlayFolder_;
     std::unordered_map<u32, std::vector<Vec3>> overlays_;   // mesh hash -> positions

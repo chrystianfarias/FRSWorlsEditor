@@ -3,6 +3,8 @@
 #include "core/Log.h"
 #include "io/CollisionExport.h"
 #include "io/CollisionImport.h"
+#include "ui/CollisionTools.h"
+#include "ui/MeshTools.h"
 #include "io/PlacementWrite.h"
 #include "io/SectionEdits.h"
 #include "ui/PlacementDialogs.h"
@@ -15,6 +17,7 @@
 #include "minimap/MinimapBuildings.h"   // MINIMAP PREVIEW (temporary)
 #include "render/RenderExtension.h"
 #include "ui/Resource.h"
+#include "ui/RoadsExtension.h"
 #include "ui/SetupWizard.h"
 #include "ui/WorldDialogs.h"
 
@@ -399,6 +402,24 @@ LRESULT MainWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
             RunSetup();
             return 0;
 
+        case kShellLibraryActivate:
+            if (catalog_.onActivate) catalog_.onActivate();
+            return 0;
+
+        case kShellTreeActivate: {
+            // A double click in the drawn scene tree, as on the native one.
+            HTREEITEM selected = (HTREEITEM)::SendMessageW(sectionTree_, TVM_GETNEXTITEM, TVGN_CARET, 0);
+            TVITEMW item{};
+            item.mask = TVIF_PARAM;
+            item.hItem = selected;
+            if (world_ && selected && ::SendMessageW(sectionTree_, TVM_GETITEMW, 0, (LPARAM)&item)) {
+                const intptr_t index = (intptr_t)item.lParam;
+                if (index <= -kMineItemBase && (size_t)(-index - kMineItemBase) < mineHashes_.size())
+                    PlaceModelAtView(mineHashes_[(size_t)(-index - kMineItemBase)]);
+            }
+            return 0;
+        }
+
         case WM_COMMAND:
             OnCommand(LOWORD(wParam), HIWORD(wParam), (HWND)lParam);
             return 0;
@@ -574,6 +595,19 @@ void MainWindow::OnCreate() {
         for (auto& extension : extensions_) extension->CatalogRows(rows);
     });
     properties_.Create(window_, instance_, uiFont_);
+    // A committed value: the extension whose rows they are takes it, else
+    // it is the selected placement's transform.
+    properties_.SetChangeHandler([this] {
+        bool taken = false;
+        for (auto& extension : extensions_)
+            if (!taken) taken = extension->ApplyProperties();
+        if (!taken) ApplyPropertyFields(true);
+    });
+    viewport_.SetUiBars([this] { DrawShellBars(); });
+    viewport_.SetUiCallback([this] {
+        DrawShellPanels();
+        if (viewport_.GetRenderer().Context()) properties_.Draw(viewport_.GetRenderer().Context()->Device());
+    });
 
     if (!viewport_.Create(window_, IDC_VIEWPORT)) {
         ::MessageBoxW(window_,
@@ -596,7 +630,49 @@ void MainWindow::OnCreate() {
 
     // Whatever this build adds, once everything it may build on is up.
     extensions_ = CreateEditorExtensions(*this);
+    extensions_.push_back(CreateRoadsExtension(*this));
+    // The mesh editor (ui/MeshTools.h), asked before the collision tools so
+    // that while it edits, Ctrl+Z steps its own edit back.
+    {
+        MeshToolsHost host;
+        host.window = window_;
+        host.menu = menu_;
+        host.accelerators = &accelerators_;
+        host.viewport = &viewport_;
+        host.world = [this] { return world_.get(); };
+        host.status = [this](const std::wstring& text) { SetStatusText(2, text); };
+        host.menuChecks = [this] { UpdateMenuChecks(); };
+        host.importQuietly = [this](const std::wstring& path) { ImportObj(path, true); };
+        host.undoCommand = CollisionTools::kUndoCommand;
+        auto mesh = std::make_unique<MeshTools>(std::move(host));
+        meshTools_ = mesh.get();
+        extensions_.push_back(std::move(mesh));
+    }
+    // Collision editing (ui/CollisionTools.h) is part of every build, asked
+    // after the build's own extensions.
+    {
+        CollisionToolsHost host;
+        host.instance = instance_;
+        host.window = window_;
+        host.menu = menu_;
+        host.accelerators = &accelerators_;
+        host.viewport = &viewport_;
+        host.properties = &properties_;
+        host.world = [this] { return world_.get(); };
+        host.status = [this](const std::wstring& text) { SetStatusText(2, text); };
+        host.menuChecks = [this] { UpdateMenuChecks(); };
+        auto tools = std::make_unique<CollisionTools>(std::move(host));
+        collisionTools_ = tools.get();
+        extensions_.push_back(std::move(tools));
+    }
     for (auto& extension : extensions_) extension->OnCreate();
+
+    // From here the frame is drawn with ImGui (ui/MainWindowShell.cpp): the
+    // native menu, toolbar, status bar and side panel stay as hidden sources.
+    shell_ = true;
+    ::SetMenu(window_, nullptr);
+    HideNativeShell();
+    OnSize();
 
     UpdateMenuChecks();
     SetStatusText(0, L"No region loaded");
@@ -613,6 +689,16 @@ void MainWindow::OnCreate() {
 
 void MainWindow::OnSize() {
     if (!statusBar_) return;
+    if (shell_) {
+        // Everything is drawn in the viewport now: it takes the whole window.
+        HideNativeShell();
+        RECT client{};
+        ::GetClientRect(window_, &client);
+        viewRect_ = client;
+        contentBottom_ = client.bottom;
+        ::MoveWindow(viewport_.Handle(), 0, 0, client.right, client.bottom, TRUE);
+        return;
+    }
 
     ::SendMessageW(statusBar_, WM_SIZE, 0, 0);
     ::SendMessageW(toolbar_, TB_AUTOSIZE, 0, 0);
@@ -632,8 +718,8 @@ void MainWindow::OnSize() {
     // the panels without forgetting what they were.
     const int left = std::clamp(leftWidth_, kMinSideWidth,
                                 std::max(kMinSideWidth, width - kMinSideWidth - kMinViewport));
-    const int right = std::clamp(rightWidth_, kMinSideWidth,
-                                 std::max(kMinSideWidth, width - left - kMinViewport));
+    // The properties are a panel docked inside the view now (ImGui).
+    const int right = 0;
     // The edits live on the sidebar's Edits tab: nothing under the view.
     const int edits = 0;
 
@@ -728,7 +814,6 @@ void MainWindow::SetLaunchLabel(const wchar_t* text) {
 MainWindow::Splitter MainWindow::HitSplitter(POINT point) const {
     if (point.y < viewRect_.top || point.y >= contentBottom_) return Splitter::None;
     if (point.x >= viewRect_.left - kPanelPadding && point.x < viewRect_.left) return Splitter::Left;
-    if (point.x >= viewRect_.right && point.x < viewRect_.right + kPanelPadding) return Splitter::Right;
     if (point.x >= viewRect_.left && point.x < viewRect_.right &&
         point.y >= viewRect_.bottom && point.y < viewRect_.bottom + kPanelPadding)
         return Splitter::Bottom;
@@ -1919,6 +2004,8 @@ void MainWindow::OpenRegion(std::wstring region) {
 
 void MainWindow::CloseRegion() {
     for (auto& extension : extensions_) extension->OnRegionClosed();
+    properties_.ForgetPictures();
+    ForgetShellThumbnails();
     catalog_.SetWorld(nullptr);
     edits_.Refresh(nullptr, modelsFolder_);
     textures_.SetWorld(nullptr);
@@ -2163,11 +2250,13 @@ void MainWindow::ShowSideTab(int tab) {
     sideTab_ = tab >= 0 && tab <= 2 ? tab : 0;
     const bool library = sideTab_ == 1;
     const bool edits = sideTab_ == 2;
-    ::ShowWindow(sectionTree_, sideTab_ == 0 ? SW_SHOW : SW_HIDE);
-    for (HWND control : { libShelf_, libUsed_, libList_ })
-        ::ShowWindow(control, library ? SW_SHOW : SW_HIDE);
-    ::ShowWindow(sideSearch_, edits ? SW_HIDE : SW_SHOW);
-    edits_.Show(edits);
+    if (!shell_) {
+        ::ShowWindow(sectionTree_, sideTab_ == 0 ? SW_SHOW : SW_HIDE);
+        for (HWND control : { libShelf_, libUsed_, libList_ })
+            ::ShowWindow(control, library ? SW_SHOW : SW_HIDE);
+        ::ShowWindow(sideSearch_, edits ? SW_HIDE : SW_SHOW);
+        edits_.Show(edits);
+    }
     TabCtrl_SetCurSel(sideTabs_, sideTab_);
     if (edits) return;
     // The search box is shared: what is typed applies to the tab now showing.
@@ -2570,7 +2659,7 @@ void MainWindow::StoreGameFolder(const std::wstring& folder) const {
 bool MainWindow::HasUnsavedPlacements() const {
     if (!world_) return false;
     for (const auto& section : world_->Loaded())
-        if (section->placementsChanged) return true;
+        if (section->placementsChanged || section->collisionChanged) return true;
     return false;
 }
 
@@ -2578,12 +2667,15 @@ bool MainWindow::ConfirmUnsavedPlacements() {
     if (!HasUnsavedPlacements()) return true;
     const int answer = ::MessageBoxW(
         window_,
-        L"There are placed objects that have not been written to the game.\n\n"
+        L"There are placed objects or collision edits that have not been written to the game.\n\n"
         L"Write them now?",
         kWindowTitle, MB_ICONQUESTION | MB_YESNOCANCEL);
     if (answer == IDCANCEL) return false;
     if (answer == IDYES) return SavePlacements();
-    for (const auto& section : world_->Loaded()) section->placementsChanged = false;
+    for (const auto& section : world_->Loaded()) {
+        section->placementsChanged = false;
+        section->collisionChanged = false;
+    }
     return true;
 }
 
@@ -3159,7 +3251,8 @@ void MainWindow::UpdateProperties() {
                                                                           : L"Model library (header matrix)";
     add(L"Object", L"Model", model ? Widen(model->name) : L"?", L"The solid object this places.");
     add(L"Object", L"Source", source,
-        L"Placed objects can be edited and deleted; the map's own can be copied or removed.");
+        L"Placed objects can be edited and deleted. The map's own can be copied, removed, or moved -- "
+        L"G, R, the gizmo or these fields; moving one replaces it with a placement of the same model.");
     add(L"Object", L"Section", section && section->info ? Widen(section->info->name) : L"?",
         L"The streaming section that places it: the game draws it while that section is loaded.");
     add(L"Object", L"Model stored in",
@@ -3174,7 +3267,10 @@ void MainWindow::UpdateProperties() {
         add(L"Object", L"Written", section->placementsChanged ? L"No -- Ctrl+Shift+S writes it" : L"Yes",
             L"Whether the game will see it yet.");
 
-    PropertiesPanel::AddTransformRows(view, view.mode == PropertiesPanel::Mode::Placement);
+    // The map's own objects can be moved too: the first change makes one a
+    // placement (Viewport::DetachNatives).
+    PropertiesPanel::AddTransformRows(view, view.mode == PropertiesPanel::Mode::Placement ||
+                                                view.mode == PropertiesPanel::Mode::Native);
 
     if (view.mode == PropertiesPanel::Mode::Native && section &&
         (size_t)picked.native < section->scenery.instances.size()) {
@@ -3193,9 +3289,12 @@ void MainWindow::UpdateProperties() {
 void MainWindow::ApplyPropertyFields(bool rehome) {
     u32 section = 0;
     int placement = -1;
-    if (!world_ || !viewport_.SelectedPlacement(section, placement)) return;
+    if (!world_) return;
     Mat4 transform;
     if (!properties_.Read(transform)) return;
+    // One of the map's own objects edited in the fields: it becomes a placement first.
+    if (!viewport_.SelectedPlacement(section, placement)) viewport_.DetachNatives();
+    if (!viewport_.SelectedPlacement(section, placement)) return;
     viewport_.SetPlacementTransform(section, placement, transform);
     if (rehome) viewport_.RehomePlacement(section, placement);
 }

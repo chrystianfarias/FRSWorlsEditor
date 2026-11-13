@@ -4,10 +4,37 @@
 #include "render/Camera.h"
 #include "render/D3D9Context.h"
 #include "render/WorldRenderer.h"
+#include "ui/ImGuiLayer.h"
 
 #include <windows.h>
 
 #include <functional>
+#include <vector>
+
+// Something that takes the viewport's mouse and keys before the viewport's
+// own handling -- a drawing tool. Each call returns true when it used the
+// event; the default uses nothing.
+class ViewportTool {
+public:
+    virtual ~ViewportTool() = default;
+    virtual bool MouseDown(int x, int y, WPARAM keys) { (void)x; (void)y; (void)keys; return false; }
+    // The second click of a double click; unused, it counts as a plain click.
+    virtual bool MouseDoubleClick(int x, int y, WPARAM keys) { (void)x; (void)y; (void)keys; return false; }
+    // Every move while the view is not being turned. Not consumable.
+    virtual void MouseMove(int x, int y) { (void)x; (void)y; }
+    virtual bool MouseWheel(int notches, WPARAM keys) { (void)notches; (void)keys; return false; }
+    // `repeat` is the keyboard's auto-repeat.
+    virtual bool KeyDown(WPARAM key, bool repeat) { (void)key; (void)repeat; return false; }
+    // Something of the tool's own under the gizmo -- vertices being edited:
+    // where its handles stand. False when the tool has nothing for it.
+    virtual bool GizmoPivot(Vec3& pivot) { (void)pivot; return false; }
+    // The gizmo moved it. `transform` takes the pivot's frame as the drag
+    // began (no turn, unit scale, at the pivot) to where it is now; `done`
+    // once let go, `keep` false when the drag was called off.
+    virtual void GizmoChanged(const Mat4& transform, bool done, bool keep) {
+        (void)transform; (void)done; (void)keep;
+    }
+};
 
 // The 3D child window.
 //
@@ -76,6 +103,18 @@ public:
     using PointSet = std::function<void(const Vec3& position, float heading, bool commit)>;
     void SetPointEditor(PointGet get, PointSet set) { pointGet_ = std::move(get); pointSet_ = std::move(set); }
 
+    // The map's own objects in the selection become editor placements, so
+    // they can be moved: each shipped record is marked removed (as Delete
+    // does) and a placement of the same model, with the same flags and
+    // scenery entry, takes its place in the same scenery chunk. The game
+    // then reads them like any placed object -- which has been tried in it,
+    // where moving the shipped record in place would leave the scenery tree
+    // still bounding it where it was. Keeps them selected; returns how many.
+    // `remember` records them for CancelDetach.
+    size_t DetachNatives(bool remember = false);
+    // Takes back what the last remembered DetachNatives did.
+    void CancelDetach();
+
     // Moves a placement, on screen and in the world, and marks it unsaved.
     void SetPlacementTransform(u32 loadedSection, int placement, const Mat4& transform);
 
@@ -98,6 +137,21 @@ public:
     // The ray through a client-area pixel, and the one through the centre.
     Ray RayAt(int x, int y) const;
 
+    // The panels drawn over the view (ui/ImGuiLayer.h): `draw` lays them out
+    // once a frame, between the scene and the present.
+    void SetUiCallback(std::function<void()> draw) { uiDraw_ = std::move(draw); }
+    // What takes the edges (menu, toolbar, status bar), before the panels.
+    void SetUiBars(std::function<void()> bars) { uiBars_ = std::move(bars); }
+    // A panel's text field has the keyboard: shortcuts leave it alone.
+    bool UiWantsText() const { return ui_.WantsText(); }
+
+    // A tool that sees the mouse and keys first. Not owned.
+    void AddTool(ViewportTool* tool) { tools_.push_back(tool); }
+    // The view the gizmo is measured in, for a tool projecting points to pixels.
+    GizmoView ToolView() const { return CurrentGizmoView(); }
+    bool Looking() const { return looking_; }
+    bool KeyHeld(int key) const { return key >= 0 && key < 256 && keys_[key]; }
+
 private:
     static LRESULT CALLBACK WndProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
     LRESULT Handle(UINT message, WPARAM wParam, LPARAM lParam);
@@ -115,7 +169,18 @@ private:
     void UpdateFlight(float deltaSeconds);
 
     // The gizmo: which object it is on, the view it is measured in, and a drag.
+    // `placement` is kGizmoPoint when the gizmo is on an extension's point
+    // (SetPointEditor) rather than on a placement.
+    static constexpr int kGizmoPoint = -2;
+    // ... and kGizmoTool when it is on a tool's own selection (ViewportTool::GizmoPivot);
+    // `section` is then the tool's index.
+    static constexpr int kGizmoTool = -3;
+    // ... and kGizmoNative on one of the map's own objects, which becomes an
+    // editor placement the moment a drag begins (DetachNatives).
+    static constexpr int kGizmoNative = -4;
     bool GizmoTarget(u32& section, int& placement, Mat4& transform) const;
+    static float PointHeading(const Mat4& transform);
+    Mat4  gizmoNow_;                    // a point's transform as the drag left it
     GizmoView CurrentGizmoView() const;
     bool BeginGizmoDrag(int x, int y);
     void UpdateGizmoDrag(int x, int y);
@@ -159,6 +224,20 @@ private:
     bool  movingPoint_ = false;
     Vec3  pointStart_, pointNow_;
     float pointHeadingStart_ = 0.0f, pointHeadingNow_ = 0.0f;
+
+    std::vector<ViewportTool*> tools_;
+    ImGuiLayer ui_;
+    std::function<void()> uiDraw_, uiBars_;
+    bool inFrame_ = false;
+    // FRS_CAPTURE=<file.bmp>: the frame, panels included, saved once the
+    // region has been up a few seconds -- for checking the look without a
+    // screen capture.
+    float captureClock_ = 0.0f;
+    bool  captured_ = false;
+
+    // What the last remembered DetachNatives changed, to cancel it.
+    struct Detached { u32 section; std::pair<u32, u32> record; size_t placement; bool wasChanged; };
+    std::vector<Detached> detached_;
 
     bool  looking_   = false;
     POINT lookAnchor_{};   // screen position the cursor is pinned to while looking

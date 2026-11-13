@@ -9,14 +9,20 @@
 // The collision of one streaming section, turned into something drawable.
 //
 // Collision has no texture or lighting of its own, so it is drawn as flat
-// colour: ground tinted by surface id and shaded by slope so relief reads,
-// barriers as red walls, and every polygon outlined so the tessellation --
+// colour: ground tinted by surface and shaded by slope so relief reads,
+// barriers as red walls, race barrier groups in orange, and every polygon outlined so the tessellation --
 // which is much coarser than the render mesh -- can be seen.
 class CollisionMesh {
 public:
     ~CollisionMesh();
 
-    bool Upload(IDirect3DDevice9* device, const nfs::LoadedSection& section);
+    // `showRaceGroups` false leaves out the polygons of race barrier groups,
+    // which the game only switches on during the races that use them.
+    bool Upload(IDirect3DDevice9* device, const nfs::LoadedSection& section,
+                bool showRaceGroups = true);
+
+    // The colour a surface is drawn in (0xRRGGBB), for the viewport and a legend.
+    static u32 SurfaceRgb(u8 surface);
     void Release();
 
     // Filled ground and barrier walls, then the outlines. The caller sets the

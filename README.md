@@ -29,10 +29,23 @@ If the editor helps you, you can [buy me a coffee](https://buymeacoffee.com/chry
 - **Objects.** Place any model of the region from a catalogue with a picture of
   each, sorted into shelves (buildings, lights, signs, fences, trees, vehicles...),
   then move, rotate, snap to
-  the ground, copy and paste, remove shipped objects from the world. Every
+  the ground, copy and paste, move or remove shipped objects (a moved one is replaced by a placement of the same model). Every
   edit is listed and can be reverted one by one.
 - **Meshes and collision.** Export a selection to OBJ, edit it in any 3D
   tool, import it back -- geometry, textures and collision.
+- **Collision tools.** The Collision menu draws collision straight onto the
+  map: barriers (no height limit), walls with a real height, and ground from
+  an outline, each snapping to the corners already there. Selected collision
+  can be moved (G), deleted (Del) and given another surface -- road, grass,
+  sidewalk, metal... -- in the properties panel; Ctrl+Z undoes. Polygons along
+  a section edge are kept by both neighbours, and every edit reaches both.
+  Selected objects get collision from their own mesh with one button
+  (Make collision in the properties panel, Ctrl+Shift+K): walls round what a
+  car can hit and ground on their tops, or just ground for ramps and decks.
+- **Mesh editor.** Tab on a selected object edits its shape in place: pick
+  vertices, edges or faces (1 / 2 / 3), move, turn or scale them with the gizmo
+  and watch the model change; Ctrl+Z steps back and Tab writes it, the same way
+  an edit from Blender comes back. Every placement of the model changes.
 - **Edit in Blender.** Objects > Edit in Blender (Ctrl+Shift+E) opens the
   selection in Blender; every save there (Ctrl+S) loads it back into the
   editor. Nothing to install in Blender -- the editor brings its own script.
@@ -86,12 +99,16 @@ another executable the plugins leave the game alone.
 | `F5` `F6` `F7` | Backdrop, backface culling, scenery |
 | `F9` | Texture browser |
 | Ctrl+K | Collision overlay |
+| Ctrl+Shift+W / H / G | Draw a barrier / a wall with height / ground (Enter or a double click finishes, Esc stops) |
+| Ctrl+Shift+K | Make collision for the selected objects |
+| Tab | Edit the selected object's mesh; Tab again writes it (1/2/3 vertices/edges/faces, Ctrl+A all) |
+| Ctrl+Z | Undo (collision, and objects placed, moved or deleted) |
 | Ctrl+N | Place an object |
 | Ctrl+E / Ctrl+I | Export selection / import edited OBJ |
 | Ctrl+Shift+E | Edit the selection in Blender |
 | Ctrl+Shift+N | New object in Blender |
 | Ctrl+S | Save the world |
-| Ctrl+Shift+S | Write placements to the game |
+| Ctrl+Shift+S | Write placements and collision edits to the game |
 
 ## Building
 
@@ -138,7 +155,7 @@ loader        FRSWorldLoader.asi, the game side
 packaging     what goes into the release beside the executable
 docs          the file formats, and how they were worked out
 tools         Python scripts used to explore and validate the formats
-third_party   the Win32 property grid (CPOL)
+third_party   Dear ImGui (MIT), Phosphor icons (MIT), the Win32 property grid (CPOL)
 ```
 
 [`docs/NFSU2-FORMATS.md`](docs/NFSU2-FORMATS.md) records the chunk layouts,
@@ -149,6 +166,8 @@ does inside the game, address by address.
 
 Created by **Chrystian Farias**.
 
+- [Dear ImGui](https://github.com/ocornut/imgui) 1.91.9b, docking branch (MIT), in `third_party/imgui`: the panels.
+- [Phosphor Icons](https://phosphoricons.com) 2.1.1 (MIT), in `third_party/phosphor`: the icons.
 - Win32 property grid by David MacDermot (CPOL), in `third_party/propertygrid`.
 - [Ultimate ASI Loader](https://github.com/ThirteenAG/Ultimate-ASI-Loader) by
   ThirteenAG (MIT), shipped in the release package.

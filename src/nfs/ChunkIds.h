@@ -27,6 +27,7 @@ enum ChunkId : u32 {
     kChunkCollisionPolygons  = 0x00034134,  // 32-byte fixed-point ground polygons and barriers
     kChunkCollisionCellRefs  = 0x00034136,  // (polygon index, 4x4 sub-cell mask) per cell entry
     kChunkCollisionCells     = 0x00034137,  // (first ref, ref count) per 32-unit grid cell
+    kChunkRaceBarrierGroups  = 0x0003412F,  // layout file: names of the race barrier groups (polygon byte 0)
 
     // --- Geometry -------------------------------------------------------------
     kChunkSolidListPack      = 0x80134000,

@@ -1,6 +1,7 @@
 #include "io/PlacementWrite.h"
 
 #include "core/Log.h"
+#include "io/CollisionEdit.h"
 #include "io/ModelCopy.h"
 #include "io/SectionEdits.h"
 #include "io/SectionRebuild.h"
@@ -25,7 +26,7 @@ bool PlanPlacementSave(const nfs::World& world, const std::wstring& modelsFolder
     const auto& loaded = world.Loaded();
     for (size_t index = 0; index < loaded.size(); ++index) {
         const nfs::LoadedSection& section = *loaded[index];
-        if (!section.placementsChanged || !section.info) continue;
+        if (!(section.placementsChanged || section.collisionChanged) || !section.info) continue;
         const nfs::Section& entry = *section.info;
         const std::wstring name(entry.name.begin(), entry.name.end());
 
@@ -79,6 +80,41 @@ bool PlanPlacementSave(const nfs::World& world, const std::wstring& modelsFolder
             edit.placement = placement.instance;
             edit.label = placement.instance.modelName;
             kept.push_back(std::move(edit));
+        }
+
+        // Collision edited in the editor: each changed pack re-encoded, grid
+        // and all, in place of whatever collision edit the section had.
+        size_t collisionPacks = 0, collisionPolygons = 0;
+        if (section.collisionChanged) {
+            std::vector<u32> orders;
+            collision::CollisionChunkOrders(world, entry, orders);
+            bool bad = false;
+            for (const u32 packIndex : section.changedCollisionPacks) {
+                if (packIndex >= section.collision.size() || packIndex >= orders.size()) {
+                    report << name << L": an edited collision pack is not where the loader found it. Left alone.\n";
+                    bad = true;
+                    break;
+                }
+                std::vector<u8> chunk;
+                std::wstring problem;
+                if (!nfs::EncodeCollision(section.collision[packIndex], chunk, problem)) {
+                    report << name << L": " << problem << L" Left alone.\n";
+                    bad = true;
+                    break;
+                }
+                const u32 order = orders[packIndex];
+                kept.erase(std::remove_if(kept.begin(), kept.end(), [&](const SectionEdit& e) {
+                               return e.kind == SectionEdit::Kind::Collision && e.order == order;
+                           }), kept.end());
+                SectionEdit edit;
+                edit.kind = SectionEdit::Kind::Collision;
+                edit.order = order;
+                edit.chunk = std::move(chunk);
+                kept.push_back(std::move(edit));
+                ++collisionPacks;
+                collisionPolygons += section.collision[packIndex].polygons.size();
+            }
+            if (bad) { plan.ok = false; continue; }
         }
 
         // Models to copy in, with the textures the section cannot see.
@@ -147,6 +183,7 @@ bool PlanPlacementSave(const nfs::World& world, const std::wstring& modelsFolder
                << section.removedNatives.size() << L" removed";
         if (copiedModels) report << L", " << copiedModels << L" models and " << copiedTextures
                                  << L" textures copied in";
+        if (collisionPacks) report << L", collision rewritten (" << collisionPolygons << L" polygons)";
         if (spans.moved) report << L"; the section moves past the end of the stream";
         report << L".\n";
         LOG_INFO("placements %s: %zu placed, section %u bytes at %llu%s",

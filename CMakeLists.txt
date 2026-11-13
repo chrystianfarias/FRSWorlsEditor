@@ -17,6 +17,8 @@ add_executable(FRSWorldEditor WIN32
 
     src/io/CollisionExport.cpp
     src/io/CollisionImport.cpp
+    src/io/CollisionEdit.cpp
+    src/io/CollisionGenerate.cpp
     src/io/MeshOverlay.cpp
     src/io/ModelCopy.cpp
     src/io/ObjMesh.cpp
@@ -59,15 +61,31 @@ add_executable(FRSWorldEditor WIN32
     src/ui/EditsPanel.cpp
     src/ui/EmbeddedGame.cpp
     src/ui/MainWindow.cpp
+    src/ui/MainWindowShell.cpp
     src/ui/OverlayBrowser.cpp
     src/ui/PlacementDialogs.cpp
     src/ui/PropertiesPanel.cpp
+    src/ui/RoadsExtension.cpp
+    src/roads/RoadNetwork.cpp
+    src/roads/RoadBake.cpp
+    src/terrain/Terrain.cpp
+    src/terrain/GroundDeform.cpp
     src/ui/BlenderLink.cpp
+    src/ui/CollisionTools.cpp
+    src/ui/MeshTools.cpp
     src/ui/ModelCatalog.cpp
     src/ui/SetupWizard.cpp
     src/ui/WorldDialogs.cpp
 
     third_party/propertygrid/propertyGrid.cpp
+    src/ui/ImGuiLayer.cpp
+    third_party/phosphor/PhosphorFont.cpp
+    third_party/imgui/imgui.cpp
+    third_party/imgui/imgui_draw.cpp
+    third_party/imgui/imgui_tables.cpp
+    third_party/imgui/imgui_widgets.cpp
+    third_party/imgui/imgui_impl_dx9.cpp
+    third_party/imgui/imgui_impl_win32.cpp
     src/ui/TextureBrowser.cpp
     src/ui/Viewport.cpp
     src/ui/App.rc
@@ -126,3 +144,11 @@ if(MSVC)
     set_source_files_properties(third_party/propertygrid/propertyGrid.cpp PROPERTIES
         COMPILE_OPTIONS "/W0;/permissive;/Zc:strictStrings-")
 endif()
+
+# Dear ImGui (docking branch, MIT): the panels over the viewport.
+target_include_directories(FRSWorldEditor PRIVATE third_party/imgui third_party/phosphor)
+target_link_libraries(FRSWorldEditor PRIVATE imm32 dwmapi)
+set_source_files_properties(third_party/imgui/imgui.cpp third_party/imgui/imgui_draw.cpp
+    third_party/imgui/imgui_tables.cpp third_party/imgui/imgui_widgets.cpp
+    third_party/imgui/imgui_impl_dx9.cpp third_party/imgui/imgui_impl_win32.cpp
+    PROPERTIES COMPILE_OPTIONS "/W0")

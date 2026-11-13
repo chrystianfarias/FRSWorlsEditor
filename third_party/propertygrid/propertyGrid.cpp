@@ -1685,12 +1685,64 @@ static LRESULT CALLBACK ComboBox_Proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
 /// @param fEditable TRUE to create an editable combo, FALSE for static.
 ///
 /// @returns HWND A handle to the control.
+// FRS: the drop-down picture hook (PropGrid_SetComboImageHook).
+static PROPGRID_COMBOMEASURE g_comboMeasure = NULL;
+static PROPGRID_COMBODRAW g_comboDraw = NULL;
+
+VOID PropGrid_SetComboImageHook(PROPGRID_COMBOMEASURE measure, PROPGRID_COMBODRAW draw)
+{
+    g_comboMeasure = measure;
+    g_comboDraw = draw;
+}
+
+// FRS: an owner-drawn combo's items, measured and painted through the hook.
+static BOOL Combo_OnMeasureItem(LPMEASUREITEMSTRUCT lpMeasure)
+{
+    if (lpMeasure->CtlType != ODT_COMBOBOX || !g_comboDraw)
+        return FALSE;
+    UINT height = 0;
+    if ((INT)lpMeasure->itemID >= 0 && lpMeasure->itemData && g_comboMeasure)
+        height = g_comboMeasure((LPCTSTR)lpMeasure->itemData);
+    lpMeasure->itemHeight = height ? height : 16;
+    return TRUE;
+}
+
+static BOOL Combo_OnDrawItem(const DRAWITEMSTRUCT *lpDIS)
+{
+    if (lpDIS->CtlType != ODT_COMBOBOX || !g_comboDraw)
+        return FALSE;
+    TCHAR text[512] = { 0 };
+    if ((INT)lpDIS->itemID >= 0)
+    {
+        INT length = ComboBox_GetLBTextLen(lpDIS->hwndItem, lpDIS->itemID);
+        if (length > 0 && length < (INT)NELEMS(text))
+            ComboBox_GetLBText(lpDIS->hwndItem, lpDIS->itemID, text);
+    }
+    BOOL selected = (lpDIS->itemState & ODS_SELECTED) != 0;
+    FillRect(lpDIS->hDC, &lpDIS->rcItem, GetSysColorBrush(selected ? COLOR_HIGHLIGHT : COLOR_WINDOW));
+    // The closed combo's own field shows the text only, at its own height.
+    BOOL field = (lpDIS->itemState & ODS_COMBOBOXEDIT) != 0;
+    if (field || !g_comboDraw(lpDIS, text))
+    {
+        RECT rc = lpDIS->rcItem;
+        rc.left += 2;
+        SetBkMode(lpDIS->hDC, TRANSPARENT);
+        SetTextColor(lpDIS->hDC, GetSysColor(selected ? COLOR_HIGHLIGHTTEXT : COLOR_WINDOWTEXT));
+        DrawText(lpDIS->hDC, text, -1, &rc, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+    }
+    if (lpDIS->itemState & ODS_FOCUS)
+        DrawFocusRect(lpDIS->hDC, &lpDIS->rcItem);
+    return TRUE;
+}
+
 static HWND CreateCombo(HINSTANCE hInstance, HWND hwndParent, INT id, BOOL fEditable)
 {
     DWORD dwStyle, dwExStyle;
     HWND hwnd;
 
     dwStyle = WS_CHILD | CBS_NOINTEGRALHEIGHT | WS_VSCROLL | (fEditable ? CBS_DROPDOWN : CBS_DROPDOWNLIST);
+    if (!fEditable && g_comboDraw)
+        dwStyle |= CBS_OWNERDRAWVARIABLE | CBS_HASSTRINGS;
 
     dwExStyle = WS_EX_LEFT;
 
@@ -4288,6 +4340,16 @@ static LRESULT CALLBACK ListBox_Proc(HWND hList, UINT msg,
 
         case WM_GETDLGCODE:
             return DLGC_WANTALLKEYS;
+
+        case WM_MEASUREITEM: // FRS: the owner-drawn combo, a child of this listbox
+            if (Combo_OnMeasureItem((LPMEASUREITEMSTRUCT)lParam))
+                return TRUE;
+            break;
+
+        case WM_DRAWITEM:
+            if (Combo_OnDrawItem((const DRAWITEMSTRUCT *)lParam))
+                return TRUE;
+            break;
 
         case WM_DESTROY: //Unsubclass the listbox Control
         {

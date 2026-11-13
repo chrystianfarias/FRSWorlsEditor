@@ -441,9 +441,9 @@ regardless of the real terrain.
 
 | Offset | Type | Meaning |
 | --- | --- | --- |
-| `0x00` | `u8` | unknown; 0 on 97% of polygons |
+| `0x00` | `u8` | **race barrier group**, 0 = always present (below) |
 | `0x01` | `u8` | **extreme-corner code** (below) — not a surface id |
-| `0x02` | `u8` | unknown; 1 on most ground, `0x14` on most barriers, a dozen other values |
+| `0x02` | `u8` | **surface** (below): 1 `ROAD` on most ground, `0x14` `SOLID_WALL` on most barriers |
 | `0x03` | `u8` | flags: `0x10` quad, `0x02` vertical (see below); barriers are always `0x16`; `0x01 0x08 0x40` unknown |
 | `0x04` | `i16` | height base, whole units |
 | `0x06` | `u16` | always `0xFFFF` |
@@ -498,6 +498,30 @@ barrier it reads in both directions.
 and no other — has zero area in plan: it is a wall with a real height (a kerb,
 a building side), stored as an ordinary quad with its own z values. Barriers
 (`0x16`) are the same thing with `0x04` added and the height made infinite.
+
+**Race barrier group (byte 0).** Non-zero on 12 049 L4RA polygons: an index
+into the region's `0x3412F` list (126 records of 32 bytes `{hash, count, 1,
+name}`, names `BARRIERS_<race>` and `PLAYER_BARRIERS_<race>`; the counts match
+the polygons carrying each index). The game switches a group on only in the
+races that name it, so in free roam those polygons do not exist -- 97% of them
+stand on an `XO_TRACKBARRIER*` placement. Anything the editor creates for free
+roam must carry 0. (Found converting Bayview to Underground 1, where nothing
+switched them off and they became invisible walls everywhere.)
+
+**Surface (byte 2).** An index into SPEED2's surface table at `0x800EE0`
+(`0x98` bytes per entry, name pointer first): 0 `NONE`, 1 `ROAD`, 2
+`ROAD_WET`, 3 `ROAD_DRIFT`, 4..6 `ROAD_SMOKE_1..3`, 7 `ROAD_BRIDGE`, 8 `DIRT`,
+9 `GRAVEL`, 10 `ROUGH_ROAD`, 11 `COBBLESTONE`, 12 `STAIRS`, 13 `PUDDLE`, 14
+`DEEP_WATER`, 15 `GRASS`, 16 `SIDEWALK`, 17 `WOOD`, 18 `PLASTIC`, 19 `GLASS`,
+20 `SOLID_WALL`, 21 `SEE_THROUGH_WALL`, 22 `PLANT`, 23 `POST`, 24 `PILLAR`, 25
+`METAL_GRATE`, 26 `METAL`, 27 `CHAINLINK`, 28 `CAR`. Prop classes (`0x34026
++0xD4`) index the same table.
+
+**Polygons repeated across packs.** 21 834 polygon shapes of L4RA are stored
+in two or more packs (446 section pairs, mostly neighbours: the polygons along
+a section edge). An edit that removes or moves such a polygon in one pack
+leaves the other copy colliding; new geometry near an edge needs to go into
+every pack the car may be using there.
 
 ### Export for editing
 
@@ -563,10 +587,43 @@ quad with a reflex corner in plan is cut in two through it; larger faces are
 fanned into triangles. A barrier face becomes the segment its bottom edge
 spans, directed by `normal x up` so the wall keeps the side it faced.
 
+### Editing in the editor
+
+`io/CollisionEdit.*` makes and places polygons; `ui/CollisionTools.*` is the
+Collision menu over it. What they rely on:
+
+- **Making.** Ground is a triangle or a quad convex in plan (an outline of
+  more points is ear-clipped into triangles); a barrier is the two-point form
+  above; a wall with height is a quad stored like the shipped `0x12` faces --
+  (A foot, A top, B top, B foot), corners 0/1 and 2/3 sharing their plan
+  position -- with its foot sunk 0.5 below the drawn points. Walls of either
+  kind are written in both directions and cut into pieces of at most 8 units.
+  New polygons carry race group 0 and the surface chosen (default `ROAD` for
+  ground, `SOLID_WALL` for walls).
+- **Placing.** A polygon goes into every pack that has ground under one of its
+  corners or its middle -- the same rule that makes the shipped edge copies --
+  and, over no ground at all, into the nearest pack.
+- **Copies.** Two polygons are the same when their stored shape is (corners in
+  eighths, heights in 1/256, barrier or not); delete, move, surface and race
+  group changes find and change every copy.
+- **From an object.** `io/CollisionGenerate.*` reads the placed mesh. A ramp or
+  a deck -- an upward face that is not level and reaches down to the ground,
+  or anything under 0.6 tall -- becomes ground on its upward faces. Anything
+  else is solid: walls with height round the convex hull, in plan, of the
+  vertices up to 2.5 above its foot (a tree's trunk, not its crown), plus
+  ground on upward faces higher up so a car can land on a roof. Which way a
+  face points is voted from the stored vertex normals, or from the highest
+  faces when a model has none. A polygon a pack already holds is not added
+  again, so making it twice changes nothing.
+- **Saving.** Edited packs live in the loaded sections until Ctrl+Shift+S,
+  which re-encodes each changed pack (`EncodeCollision`) as the section's
+  collision edit, next to its placements, through the same rebuild as every
+  other edit. `FRS_COLLISION_TOOLS_SELFTEST=1` runs the whole path on the
+  loaded region without writing anything and logs the result.
+
 ## 6. Open questions
 
-- What the collision surface id and the unknown flag bits select (grip, sound,
-  sparks, drivable-by-AI).
+- What the unknown collision flag bits (`0x01 0x08 0x40`) select.
 
 - Palette location for the 24 `D3DFMT_P8` textures.
 - ~~Which materials want alpha blending rather than the alpha test.~~ Answered:

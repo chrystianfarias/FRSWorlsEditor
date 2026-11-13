@@ -90,7 +90,7 @@ void WorldRenderer::SyncWithWorld(const nfs::World& world) {
         }
 
         auto collision = std::make_unique<CollisionMesh>();
-        if (collision->Upload(context_->Device(), *loaded[i]))
+        if (collision->Upload(context_->Device(), *loaded[i], showRaceGroups_))
             target.collision = std::move(collision);
 
         for (const nfs::SceneryInstance& instance : loaded[i]->scenery.instances)
@@ -589,6 +589,7 @@ void WorldRenderer::Render(const Camera& camera) {
             for (const GpuObject& object : objects) {
                 if (object.isBackdrop && !showBackdrop_) continue;
                 if (HiddenBuilding(object)) continue;   // MINIMAP PREVIEW (temporary)
+                if (HiddenModel(object)) continue;
                 // An object with no stored bounds cannot be culled, only drawn:
                 // testing its empty-box sentinel would reject it every frame.
                 if (culling_ && object.worldBounds.Valid() &&
@@ -613,6 +614,7 @@ void WorldRenderer::Render(const Camera& camera) {
             const GpuObject& object = sections_[instance.section].gpu->Objects()[instance.object];
             if (object.isBackdrop && !showBackdrop_) continue;
             if (HiddenBuilding(object)) continue;   // MINIMAP PREVIEW (temporary)
+            if (HiddenModel(object)) continue;
 
             stats.instancesVisible++;
             bind(instance.section);
@@ -643,6 +645,7 @@ void WorldRenderer::Render(const Camera& camera) {
     if (showCollision_) DrawCollision(device, collisionVisible);
     collisionDrawn_ = showCollision_ ? collisionVisible : std::vector<size_t>{};
     for (RenderExtension* extension : extensions_) extension->DrawOverlay(device, camera, *this);
+    DrawToolOverlay(device);
     DrawGizmo(device, camera);
 
     device->SetTexture(0, nullptr);
@@ -663,6 +666,7 @@ void WorldRenderer::PickOne(const Ray& ray, const GpuObject& object, const Mat4&
     if (placement >= 0 && placement == excludePlacement_ && sectionIndex == excludeSection_) return;
     if (object.isBackdrop && !showBackdrop_) return;
     if (HiddenBuilding(object)) return;   // MINIMAP PREVIEW (temporary)
+    if (HiddenModel(object)) return;
 
     // A bounds test rejects almost everything; only survivors pay for triangles.
     // Objects with no bounds have to be tested directly.
@@ -1048,6 +1052,79 @@ bool WorldRenderer::CollisionCorners(const CollisionPick& pick, Vec3 out[4], boo
     return true;
 }
 
+void WorldRenderer::SetRaceGroupsVisible(bool visible) {
+    if (showRaceGroups_ == visible) return;
+    showRaceGroups_ = visible;
+    if (!world_) return;
+    for (size_t i = 0; i < sections_.size() && i < world_->Loaded().size(); ++i) RefreshCollision(i);
+    collisionSelection_.erase(
+        std::remove_if(collisionSelection_.begin(), collisionSelection_.end(), [&](const CollisionPick& pick) {
+            const auto& packs = world_->Loaded()[pick.section]->collision;
+            return !visible && pick.pack < packs.size() && pick.polygon < packs[pick.pack].polygons.size() &&
+                   packs[pick.pack].polygons[pick.polygon].raceGroup != 0;
+        }),
+        collisionSelection_.end());
+}
+
+void WorldRenderer::RefreshCollision(size_t loadedSection) {
+    if (!world_ || !context_ || loadedSection >= sections_.size() ||
+        loadedSection >= world_->Loaded().size())
+        return;
+    auto collision = std::make_unique<CollisionMesh>();
+    if (collision->Upload(context_->Device(), *world_->Loaded()[loadedSection], showRaceGroups_))
+        sections_[loadedSection].collision = std::move(collision);
+    else
+        sections_[loadedSection].collision.reset();
+}
+
+void WorldRenderer::SetCollisionSelectionList(std::vector<CollisionPick> picks) {
+    selection_.clear();
+    selectedOwner_ = nullptr; selectedExtra_ = -1;
+    collisionSelection_ = std::move(picks);
+}
+
+void WorldRenderer::DrawToolOverlay(IDirect3DDevice9* device) {
+    bool any = false;
+    for (const auto& [owner, layer] : toolLayers_) any = any || !layer.triangles.empty() || !layer.lines.empty();
+    if (!any) return;
+    BeginOverlay(device);
+    device->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+    device->SetRenderState(D3DRS_SRCBLEND,  D3DBLEND_SRCALPHA);
+    device->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+    device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+    for (const auto& [owner, layer] : toolLayers_) {
+        device->SetRenderState(D3DRS_ZENABLE, TRUE);
+        if (!layer.triangles.empty())
+            device->DrawPrimitiveUP(D3DPT_TRIANGLELIST, (UINT)(layer.triangles.size() / 3),
+                                    layer.triangles.data(), sizeof(OverlayVertex));
+        // The lines show through everything: a point being placed behind a
+        // kerb still has to be seen.
+        device->SetRenderState(D3DRS_ZENABLE, FALSE);
+        if (!layer.lines.empty())
+            device->DrawPrimitiveUP(D3DPT_LINELIST, (UINT)(layer.lines.size() / 2),
+                                    layer.lines.data(), sizeof(OverlayVertex));
+    }
+    EndOverlay(device);
+}
+
+void WorldRenderer::UpdateModelPositions(u32 modelHash, const std::vector<Vec3>& positions) {
+    for (SectionRender& section : sections_) {
+        if (!section.gpu) continue;
+        for (const GpuObject& object : section.gpu->Objects()) {
+            if (!object.source || object.source->hash != modelHash) continue;
+            const size_t count = std::min(positions.size(), object.source->vertices.size());
+            IDirect3DVertexBuffer9* buffer = section.gpu->VertexBuffer();
+            void* data = nullptr;
+            const UINT offset = (UINT)(object.baseVertex * sizeof(nfs::SolidVertex));
+            const UINT bytes = (UINT)(count * sizeof(nfs::SolidVertex));
+            if (!buffer || !count || FAILED(buffer->Lock(offset, bytes, &data, 0))) continue;
+            auto* vertices = (nfs::SolidVertex*)data;
+            for (size_t i = 0; i < count; ++i) vertices[i].position = positions[i];
+            buffer->Unlock();
+        }
+    }
+}
+
 bool WorldRenderer::PickCollision(const Ray& ray, CollisionPick& out) const {
     if (!world_ || !showCollision_) return false;
 
@@ -1061,6 +1138,7 @@ bool WorldRenderer::PickCollision(const Ray& ray, CollisionPick& out) const {
         const auto& packs = world_->Loaded()[index]->collision;
         for (size_t p = 0; p < packs.size(); ++p) {
             for (size_t i = 0; i < packs[p].polygons.size(); ++i) {
+                if (!showRaceGroups_ && packs[p].polygons[i].raceGroup != 0) continue;
                 CollisionPick candidate{ (u32)index, (u32)p, (u32)i };
                 Vec3 corners[4];
                 bool quad = false;
@@ -1231,6 +1309,36 @@ void WorldRenderer::DrawModel(IDirect3DDevice9* device, const GpuObject& object,
 
 void WorldRenderer::BeginTranslucentModels(IDirect3DDevice9* device) { BeginTranslucentStates(device); }
 void WorldRenderer::EndTranslucentModels(IDirect3DDevice9* device) { EndTranslucentStates(device); }
+
+bool WorldRenderer::FindGpuModel(u32 hash, const GpuSection*& gpu, const GpuObject*& object) {
+    if (objectByHash_.empty()) {
+        for (size_t s = 0; s < sections_.size(); ++s) {
+            if (!sections_[s].gpu) continue;
+            const auto& objects = sections_[s].gpu->Objects();
+            for (size_t o = 0; o < objects.size(); ++o)
+                if (objects[o].source && !objects[o].draws.empty())
+                    objectByHash_.emplace(objects[o].source->hash, std::make_pair(s, o));
+        }
+    }
+    const auto found = objectByHash_.find(hash);
+    if (found == objectByHash_.end()) return false;
+    gpu = sections_[found->second.first].gpu.get();
+    object = &gpu->Objects()[found->second.second];
+    return true;
+}
+
+void WorldRenderer::BeginUserMesh(IDirect3DDevice9* device) {
+    const D3DMATRIX identity = ToD3D(Mat4::Identity());
+    device->SetTransform(D3DTS_WORLD, &identity);
+    device->SetFVF(kWorldVertexFvf);
+    device->SetRenderState(D3DRS_CULLMODE, backfaceCulling_ ? cullMode_ : D3DCULL_NONE);
+    device->SetRenderState(D3DRS_FILLMODE, mode_ == RenderMode::Wireframe ? D3DFILL_WIREFRAME : D3DFILL_SOLID);
+}
+
+void WorldRenderer::BindUserTexture(IDirect3DDevice9* device, u32 textureHash) {
+    const bool wantsTexture = mode_ == RenderMode::Textured || mode_ == RenderMode::Unlit;
+    BindTextureStage(device, wantsTexture ? textures_.Get(device, textureHash) : CachedTexture{});
+}
 
 void WorldRenderer::BeginOverlay(IDirect3DDevice9* device) {
     device->SetTexture(0, nullptr);

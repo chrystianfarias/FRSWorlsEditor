@@ -303,8 +303,7 @@ nfs::CollisionPolygon MakeGround(const std::vector<Vec3>& corners, const u8 attr
     const bool vertical = std::fabs(PlanArea(corners)) < 1e-3;
     polygon.attributes[3] = (u8)((attributes[3] & ~0x12) | (polygon.quad ? 0x10 : 0) |
                                  (vertical ? 0x02 : 0));
-    polygon.flags = polygon.attributes[3];
-    polygon.surface = polygon.attributes[1];
+    polygon.SyncFromAttributes();
     return polygon;
 }
 
@@ -378,8 +377,7 @@ void FaceToPolygons(const ObjFace& face, const Vec3& origin, const u8 fallback[4
         polygon.corners[0] = polygon.corners[1] = Vec3{ start->x, start->y, 0.0f };
         polygon.corners[2] = polygon.corners[3] = Vec3{ end->x, end->y, 0.0f };
         std::memcpy(polygon.attributes, attributes, 4);
-        polygon.flags = attributes[3];
-        polygon.surface = attributes[1];
+        polygon.SyncFromAttributes();
         out.push_back(polygon);
         ++stats.barriers;
         return;

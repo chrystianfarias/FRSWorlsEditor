@@ -123,14 +123,39 @@ bool World::Open(const std::wstring& tracksDirectory, const std::wstring& region
             table_.ApplyBytes(span.fileOffset, span.bytes.data(), span.bytes.size());
 
     OpenGlobalPacks(tracksDirectory);
+    ReadRaceBarrierGroups();
 
     region_ = region;
     sectionToLoaded_.assign(table_.Sections().size(), -1);
     return true;
 }
 
+// 32-byte records {u32 hash, u32 polygon count, u8 1, char name[23]}, the
+// first one "NONE". Read from the top level of the layout file.
+void World::ReadRaceBarrierGroups() {
+    raceGroups_.clear();
+    ChunkReader reader(layout_.Span(), 0);
+    Chunk chunk;
+    while (reader.Next(chunk)) {
+        if (chunk.id != kChunkRaceBarrierGroups) continue;
+        for (size_t at = 0; at + 32 <= chunk.data.size; at += 32) {
+            const char* name = reinterpret_cast<const char*>(chunk.data.data + at + 9);
+            raceGroups_.emplace_back(name, strnlen(name, 23));
+        }
+        break;
+    }
+    LOG_INFO("%zu race barrier groups", raceGroups_.size());
+}
+
+std::string World::RaceBarrierGroupName(u8 group) const {
+    if (group == 0) return "NONE";
+    if (group < raceGroups_.size()) return raceGroups_[group];
+    return "GROUP_" + std::to_string(group);
+}
+
 void World::Close() {
     region_.clear();
+    raceGroups_.clear();
     layout_.Close();
     stream_.Close();
     globalPacks_.clear();

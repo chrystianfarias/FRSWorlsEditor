@@ -1,5 +1,7 @@
 #include "nfs/Collision.h"
 
+#include <cstdio>
+
 #include <algorithm>
 #include <functional>
 #include <queue>
@@ -22,7 +24,7 @@ constexpr size_t kHeaderBoundsMax     = 0x20;   // float3 + pad
 
 // --- Polygon, chunk 0x00034134 -----------------------------------------------
 constexpr size_t kPolygonSize         = 32;
-constexpr size_t kPolygonSurface      = 0x01;
+constexpr size_t kPolygonCornerCode   = 0x01;   // computed, see EncodeCollision
 constexpr size_t kPolygonFlags        = 0x03;
 constexpr size_t kPolygonHeightBase   = 0x04;   // i16, whole units
 constexpr size_t kPolygonX            = 0x08;   // i16[4]
@@ -67,6 +69,20 @@ size_t CollisionPack::BarrierCount() const {
     size_t count = 0;
     for (const CollisionPolygon& polygon : polygons) count += polygon.barrier;
     return count;
+}
+
+const char* SurfaceName(u8 surface) {
+    static const char* const kNames[kSurfaceCount] = {
+        "NONE", "ROAD", "ROAD_WET", "ROAD_DRIFT", "ROAD_SMOKE_1", "ROAD_SMOKE_2",
+        "ROAD_SMOKE_3", "ROAD_BRIDGE", "DIRT", "GRAVEL", "ROUGH_ROAD", "COBBLESTONE",
+        "STAIRS", "PUDDLE", "DEEP_WATER", "GRASS", "SIDEWALK", "WOOD", "PLASTIC", "GLASS",
+        "SOLID_WALL", "SEE_THROUGH_WALL", "PLANT", "POST", "PILLAR", "METAL_GRATE", "METAL",
+        "CHAINLINK", "CAR",
+    };
+    if (surface < kSurfaceCount) return kNames[surface];
+    static char other[16];
+    std::snprintf(other, sizeof(other), "SURFACE_%u", (unsigned)surface);
+    return other;
 }
 
 float CollisionPack::GroundHeightNear(const Vec3& point, float fallback) const {
@@ -166,11 +182,10 @@ bool ParseCollision(const Chunk& collisionChunk, CollisionPack& out) {
         const ByteSpan entry = polygons.sub(i * kPolygonSize, kPolygonSize);
 
         CollisionPolygon polygon;
-        polygon.surface = entry.read<u8>(kPolygonSurface);
-        polygon.flags   = entry.read<u8>(kPolygonFlags);
+        for (int b = 0; b < 4; ++b) polygon.attributes[b] = entry.read<u8>((size_t)b);
+        polygon.SyncFromAttributes();
         polygon.quad    = (polygon.flags & kFlagQuad) != 0;
         polygon.barrier = IsBarrier(entry);
-        for (int b = 0; b < 4; ++b) polygon.attributes[b] = entry.read<u8>((size_t)b);
 
         const float base = (float)entry.read<i16>(kPolygonHeightBase);
         for (int corner = 0; corner < 4; ++corner) {
@@ -363,7 +378,7 @@ bool EncodeCollision(const CollisionPack& pack, std::vector<u8>& chunk, std::wst
                 if (greatest ? values[c] >= values[best] : values[c] <= values[best]) best = c;
             return best;
         };
-        records[at + kPolygonSurface] =
+        records[at + kPolygonCornerCode] =
             (u8)(extreme(planX, false) | extreme(planY, false) << 2 |
                  extreme(planX, true) << 4 | extreme(planY, true) << 6);
     }

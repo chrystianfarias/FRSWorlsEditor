@@ -389,6 +389,13 @@ typedef struct tagNMPROPGRID {
 // Exported function prototypes
 
 ATOM InitPropertyGrid(HINSTANCE hInstance);
+
+// FRS: pictures in the drop-down lists. With a hook set, every PIT_COMBO
+// list is owner drawn: `measure` gives an item's height (return 0 for the
+// default), `draw` paints it and returns FALSE to have the plain text drawn.
+typedef UINT (*PROPGRID_COMBOMEASURE)(LPCTSTR text);
+typedef BOOL (*PROPGRID_COMBODRAW)(const DRAWITEMSTRUCT* item, LPCTSTR text);
+VOID PropGrid_SetComboImageHook(PROPGRID_COMBOMEASURE measure, PROPGRID_COMBODRAW draw);
 HWND New_PropertyGrid(HWND hParent, DWORD dwID);
 
 #endif //PROPERTYGRID_H

@@ -3,6 +3,7 @@
 #include "core/Log.h"
 #include "nfs/World.h"
 
+#include <cctype>
 #include <windows.h>
 
 #include <algorithm>
@@ -41,12 +42,17 @@ std::wstring FileNameOf(const std::wstring& path) {
 Vec3 ToBlender(const Vec3& v) { return { v.x, v.z, -v.y }; }
 
 std::string MaterialName(const nfs::CollisionPolygon& polygon) {
-    char name[48];
-    ::_snprintf_s(name, _TRUNCATE, "%s_%02X_%02X_%02X_%02X",
+    // The surface's name trails the bytes so a person can tell the materials
+    // apart in Blender; the import reads only the bytes.
+    char name[80];
+    ::_snprintf_s(name, _TRUNCATE, "%s_%02X_%02X_%02X_%02X_%s",
                   polygon.barrier ? "barrier" : "ground",
                   polygon.attributes[0], polygon.attributes[1],
-                  polygon.attributes[2], polygon.attributes[3]);
-    return name;
+                  polygon.attributes[2], polygon.attributes[3],
+                  nfs::SurfaceName(polygon.surface));
+    std::string text = name;
+    for (char& c : text) c = (char)std::tolower((unsigned char)c);
+    return text;
 }
 
 // The corners a face is written with: the stored ones for ground, the wall

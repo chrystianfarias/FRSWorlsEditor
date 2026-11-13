@@ -65,7 +65,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int showCommand) {
             // the text, not the scene.
             wchar_t focusClass[16] = {};
             ::GetClassNameW(::GetFocus(), focusClass, 16);
-            const bool typing = ::lstrcmpiW(focusClass, L"Edit") == 0;
+            const bool typing = ::lstrcmpiW(focusClass, L"Edit") == 0 || window.WantsTextInput();
 
             if (typing || !::TranslateAcceleratorW(window.Handle(), window.Accelerators(), &message)) {
                 ::TranslateMessage(&message);

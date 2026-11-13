@@ -40,6 +40,8 @@ public:
     };
     void SetExtraRows(std::function<void(std::vector<ExtraRow>&)> rows) { extraRows_ = std::move(rows); }
     void RefreshExtra();
+    // The list itself, for a frame that draws it (ui/MainWindowShell.cpp).
+    HWND ListHandle() const { return list_; }
     std::function<void(const void* owner, const std::vector<size_t>& indices)> onRevertExtra;
 
     // Asks, then reverts the ticked rows. True when something was reverted,

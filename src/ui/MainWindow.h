@@ -17,6 +17,7 @@
 #include <commctrl.h>
 
 #include <memory>
+#include <unordered_map>
 #include <string>
 
 // The editor frame: menu, region picker, section list, viewport and status bar,
@@ -28,6 +29,8 @@ public:
 
     HWND Handle() const { return window_; }
     HACCEL Accelerators() const { return accelerators_; }
+    // A panel's text field has the keyboard, so shortcuts leave the keys to it.
+    bool WantsTextInput() const { return viewport_.UiWantsText(); }
 
 
     // The modeless texture browser, for the same reason.
@@ -39,6 +42,8 @@ public:
 private:
     // How an extension (ui/EditorExtension.h) reaches the window's parts.
     friend struct ExtensionAccess;
+    // The procedural roads (ui/RoadsExtension.cpp), built into every editor.
+    friend struct RoadsAccess;
 
     static LRESULT CALLBACK WndProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
     LRESULT Handle(UINT message, WPARAM wParam, LPARAM lParam);
@@ -184,6 +189,29 @@ private:
     void UpdateStatusBar();
     void SetStatusText(int part, const std::wstring& text);
 
+    // The frame drawn with ImGui (ui/MainWindowShell.cpp): the native
+    // controls stay, hidden, as what everything writes to.
+    bool shell_ = false;
+    void DrawShellBars();
+    void DrawShellPanels();
+    void DrawShellMenu(HMENU menu, bool top);
+    void DrawShellTree(HTREEITEM item, int depth);
+    void DrawShellLibrary();
+    void DrawShellEdits();
+    // Object / Edit mode, floating in a corner of the view.
+    void DrawViewModes();
+    class MeshTools* meshTools_ = nullptr;   // one of extensions_
+    void UpdateShellDrag();
+    void HideNativeShell();
+    void* ShellThumbnail(int image);
+    void ForgetShellThumbnails();
+    HIMAGELIST thumbList_ = nullptr;
+    std::unordered_map<int, void*> thumbTextures_;
+    bool shellDragging_ = false;
+    int  shellDragItem_ = -1;
+    static constexpr UINT kShellTreeActivate = WM_APP + 0x51;
+    static constexpr UINT kShellLibraryActivate = WM_APP + 0x52;
+
     std::wstring LoadStoredGameFolder() const;
     void         StoreGameFolder(const std::wstring& folder) const;
     DWORD        StoredSetupVersion() const;
@@ -208,6 +236,7 @@ private:
     std::unique_ptr<nfs::World> world_;
     // What this build adds to the editor; see CreateEditorExtensions.
     std::vector<std::unique_ptr<EditorExtension>> extensions_;
+    class CollisionTools* collisionTools_ = nullptr;   // one of extensions_
     bool rebuildingTree_ = false;       // selection changes while rebuilding are not clicks
 
     std::wstring gameFolder_;
