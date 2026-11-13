@@ -44,6 +44,7 @@ add_executable(FRSWorldEditor WIN32
     src/nfs/SolidList.cpp
     src/nfs/TextureDecode.cpp
     src/nfs/TexturePack.cpp
+    src/nfs/EaCompress.cpp
     src/nfs/World.cpp
 
     # MINIMAP PREVIEW (temporary)

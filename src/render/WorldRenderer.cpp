@@ -375,7 +375,7 @@ bool WorldRenderer::DrawObject(IDirect3DDevice9* device, const GpuObject& object
 
     for (const GpuDraw& draw : object.draws) {
         if (wantsTexture) {
-            const CachedTexture& texture = textures_.Get(device, draw.textureHash);
+            const CachedTexture& texture = textures_.Get(device, AnimatedTexture(draw.textureHash));
             // A texture that failed to decode is drawn as the grey stand-in,
             // which is solid whatever the header asked for.
             const bool translucent = texture.texture && texture.Translucent();
@@ -479,6 +479,11 @@ void WorldRenderer::Render(const Camera& camera) {
     cullMode_ = camera.ViewIsMirrored() ? D3DCULL_CCW : D3DCULL_CW;
 
     ApplyRenderStates();
+    animationClock_ = start;
+
+    // The sky first, behind everything.
+    RenderStats skyStats;
+    if (showSky_) DrawSky(device, camera, skyStats);
 
     // What the game would draw from here. Falling back to distance keeps the
     // viewport usable above the rooftops, where no zone claims the camera.
@@ -1050,6 +1055,81 @@ bool WorldRenderer::CollisionCorners(const CollisionPick& pick, Vec3 out[4], boo
     for (int c = 0; c < 4; ++c) out[c] = polygon.corners[c];
     quad = polygon.quad;
     return true;
+}
+
+u32 WorldRenderer::AnimatedTexture(u32 hash) const {
+    if (!animate_ || !world_) return hash;
+    const auto& animations = world_->TextureAnimations();
+    if (animations.empty()) return hash;
+    const auto found = animations.find(hash);
+    if (found == animations.end()) return hash;
+    const nfs::TextureAnimation& animation = found->second;
+    const size_t frame = (size_t)(animationClock_ * animation.fps) % animation.frames.size();
+    return animation.frames[frame];
+}
+
+void WorldRenderer::DrawSky(IDirect3DDevice9* device, const Camera& camera, RenderStats& stats) {
+    // The dome is a backdrop model; it is drawn round the eye, so however far
+    // the camera flies the sky stays as far away -- and with depth off, it is
+    // behind whatever the world draws after it.
+    for (size_t i = 0; i < sections_.size(); ++i) {
+        if (!sections_[i].gpu) continue;
+        for (const GpuObject& object : sections_[i].gpu->Objects()) {
+            if (!object.source || !object.isBackdrop || object.source->name.find("SKYDOME") == std::string::npos)
+                continue;
+            const Aabb& local = object.source->bounds;
+            const float radius = local.Valid() ? std::max({ local.max.x - local.min.x, local.max.y - local.min.y,
+                                                            local.max.z - local.min.z }) * 0.5f : 1000.0f;
+            // Inside the far plane, whatever size it was made.
+            const float scale = std::min(1.0f, camera.FarPlane() * 0.45f / std::max(radius, 1.0f));
+            static bool told = false;
+            if (!told) {
+                told = true;
+                LOG_INFO("sky: %s, radius %.0f, drawn at scale %.3f round the camera", object.source->name.c_str(),
+                         radius, scale);
+                for (u32 hash : object.source->textureHashes) {
+                    const nfs::Texture* found = world_->FindDisplayTexture(hash);
+                    LOG_INFO("sky texture %08X: %s", hash, found ? found->name.c_str() : "NOT FOUND");
+                    const auto anim = world_->TextureAnimations().find(hash);
+                    if (anim != world_->TextureAnimations().end())
+                        for (u32 frame : anim->second.frames) {
+                            const nfs::Texture* f = world_->FindDisplayTexture(frame);
+                            LOG_INFO("  frame %08X: %s", frame, f ? f->name.c_str() : "NOT FOUND");
+                        }
+                }
+            }
+            Mat4 transform = Mat4::Identity();
+            for (int r = 0; r < 3; ++r)
+                for (int c = 0; c < 3; ++c) transform.m[r][c] = object.transform.m[r][c] * scale;
+            const Vec3 eye = camera.Position();
+            transform.m[3][0] = eye.x;
+            transform.m[3][1] = eye.y;
+            transform.m[3][2] = eye.z;
+
+            const IDirect3DVertexBuffer9* none = nullptr;
+            (void)none;
+            device->SetStreamSource(0, sections_[i].gpu->VertexBuffer(), 0, sizeof(nfs::SolidVertex));
+            device->SetIndices(sections_[i].gpu->IndexBuffer());
+            device->SetFVF(kWorldVertexFvf);
+            const D3DMATRIX world = ToD3D(transform);
+            device->SetTransform(D3DTS_WORLD, &world);
+            device->SetRenderState(D3DRS_ZENABLE, FALSE);
+            device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+            device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+            const bool layered = DrawObject(device, object, stats);
+            if (layered) {
+                BeginTranslucentStates(device);
+                device->SetRenderState(D3DRS_ZENABLE, FALSE);
+                device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+                DrawObject(device, object, stats, DrawPass::Translucent);
+                EndTranslucentStates(device);
+            }
+            device->SetRenderState(D3DRS_ZENABLE, TRUE);
+            device->SetRenderState(D3DRS_ZWRITEENABLE, TRUE);
+            device->SetRenderState(D3DRS_CULLMODE, backfaceCulling_ ? cullMode_ : D3DCULL_NONE);
+            return;   // one dome
+        }
+    }
 }
 
 void WorldRenderer::SetRaceGroupsVisible(bool visible) {

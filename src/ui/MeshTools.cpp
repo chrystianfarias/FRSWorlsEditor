@@ -641,10 +641,10 @@ void MeshTools::OnRegionLoaded() {
     // FRS_CAMERA="x y z": the view looks at that point from a little way off,
     // for a capture of one spot.
     if (const char* at = std::getenv("FRS_CAMERA"); at && world) {
-        float x = 0, y = 0, z = 0;
-        if (std::sscanf(at, "%f %f %f", &x, &y, &z) == 3) {
+        float x = 0, y = 0, z = 0, pitch = -12.0f;
+        if (std::sscanf(at, "%f %f %f %f", &x, &y, &z, &pitch) >= 3) {
             host_.viewport->GetCamera().SetPosition({ x - 120.0f, y - 120.0f, z + 60.0f });
-            host_.viewport->GetCamera().SetYawPitch(Radians(45.0f), Radians(-12.0f));
+            host_.viewport->GetCamera().SetYawPitch(Radians(45.0f), Radians(pitch));
         }
     }
 

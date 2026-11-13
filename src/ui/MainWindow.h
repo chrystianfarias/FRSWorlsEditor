@@ -242,6 +242,8 @@ private:
     int  shownTab_ = -1;
     static constexpr UINT kShellTreeActivate = WM_APP + 0x51;
     static constexpr UINT kStopGameMessage = WM_APP + 0x55;
+    // View > Sky and View > Animations (added to the View menu at start).
+    static constexpr int kViewSkyCommand = 44601, kViewAnimationsCommand = 44602;
     void StopGame();
     static constexpr UINT kShellLibraryActivate = WM_APP + 0x52;
 

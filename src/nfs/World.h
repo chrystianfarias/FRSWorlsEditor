@@ -77,6 +77,15 @@ struct LoadedSection {
     size_t TriangleCount() const;
 };
 
+// A texture that cycles through frames: water, flashing signs, blinking
+// lights. Materials name the first frame's hash; the game swaps in the frame
+// of the moment (chunk 0xB0300100, beside a section's texture pack).
+struct TextureAnimation {
+    std::string      name;
+    std::vector<u32> frames;     // texture hashes, the first is the one materials use
+    float            fps = 0.0f;
+};
+
 // One track region: the L4Rx.BUN layout file plus its STREAML4Rx.BUN payload.
 //
 // Sections are parsed on demand. Because the stream stays memory-mapped, a
@@ -161,6 +170,9 @@ public:
 
     size_t InstanceCount() const { return instanceCount_; }
 
+    // Every texture animation of the sections loaded, by the hash materials use.
+    const std::unordered_map<u32, TextureAnimation>& TextureAnimations() const { return textureAnimations_; }
+
     // The race barrier groups the layout file names (chunk 0x3412F): byte 0
     // of a collision polygon indexes this list, entry 0 being "NONE". A group
     // exists for the game only during the races that name it -- in free roam
@@ -207,6 +219,8 @@ private:
     void OpenGlobalPacks(const std::wstring& tracksDirectory);
     SectionTable table_;
     std::vector<std::string> raceGroups_;
+    std::unordered_map<u32, TextureAnimation> textureAnimations_;
+    void ReadTextureAnimations(const Chunk& chunk);
     void ReadRaceBarrierGroups();
 
     std::wstring overlayFolder_;

@@ -201,6 +201,16 @@ public:
     bool RaceGroupsVisible() const { return showRaceGroups_; }
     // The race-only objects -- track barriers, start and finish lines -- which
     // free roam never shows. Hidden by default, like the race collision.
+    // The game's animated textures -- water, signs, blinking lights -- played
+    // as it plays them. On by default.
+    bool AnimationsEnabled() const { return animate_; }
+    void SetAnimationsEnabled(bool on) { animate_ = on; }
+
+    // The sky dome drawn round the camera, always behind everything, as the
+    // game draws it. On by default.
+    bool SkyVisible() const { return showSky_; }
+    void SetSkyVisible(bool on) { showSky_ = on; }
+
     bool RacePropsVisible() const { return showRaceProps_; }
     void SetRacePropsVisible(bool visible) { showRaceProps_ = visible; }
     void SetRaceGroupsVisible(bool visible);
@@ -465,6 +475,13 @@ private:
     bool       showCollision_ = false;
     bool       showRaceGroups_ = false;
     bool       showRaceProps_ = false;
+    bool       animate_ = true;
+    bool       showSky_ = true;
+    double     animationClock_ = 0.0;
+    // The texture to draw for a material's: the frame of the moment when it
+    // is animated.
+    u32 AnimatedTexture(u32 hash) const;
+    void DrawSky(IDirect3DDevice9* device, const Camera& camera, RenderStats& stats);
     struct ToolLayer { std::vector<OverlayVertex> triangles, lines; };
     std::unordered_map<const void*, ToolLayer> toolLayers_;
     void DrawToolOverlay(IDirect3DDevice9* device);

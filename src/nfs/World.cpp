@@ -147,6 +147,35 @@ void World::ReadRaceBarrierGroups() {
     LOG_INFO("%zu race barrier groups", raceGroups_.size());
 }
 
+// 0x30300102: 52-byte entries {name[24], first frame hash, frame count, fps,
+// 16 bytes unknown}; 0x30300103: every entry's frames in turn, 16 bytes each
+// with the texture hash first.
+void World::ReadTextureAnimations(const Chunk& container) {
+    ByteSpan entries, frames;
+    ChunkReader reader = ChunkReader::Children(container);
+    Chunk child;
+    while (reader.Next(child)) {
+        if (child.id == 0x30300102u) entries = child.data;
+        else if (child.id == 0x30300103u) frames = child.data;
+    }
+    size_t next = 0;
+    for (size_t at = 0; at + 52 <= entries.size; at += 52) {
+        TextureAnimation animation;
+        const char* name = reinterpret_cast<const char*>(entries.data + at);
+        animation.name.assign(name, strnlen(name, 24));
+        const u32 hash = entries.read<u32>(at + 24);
+        const u32 count = entries.read<u32>(at + 28);
+        animation.fps = (float)entries.read<u32>(at + 32);
+        for (u32 k = 0; k < count && (next + 1) * 16 <= frames.size; ++k, ++next)
+            animation.frames.push_back(frames.read<u32>(next * 16));
+        if (animation.frames.size() > 1 && animation.fps > 0.0f) {
+            LOG_INFO("texture animation %s: %zu frames at %.0f/s", animation.name.c_str(), animation.frames.size(),
+                     animation.fps);
+            textureAnimations_[hash] = std::move(animation);
+        }
+    }
+}
+
 std::string World::RaceBarrierGroupName(u8 group) const {
     if (group == 0) return "NONE";
     if (group < raceGroups_.size()) return raceGroups_[group];
@@ -156,6 +185,7 @@ std::string World::RaceBarrierGroupName(u8 group) const {
 void World::Close() {
     region_.clear();
     raceGroups_.clear();
+    textureAnimations_.clear();
     layout_.Close();
     stream_.Close();
     globalPacks_.clear();
@@ -339,6 +369,8 @@ const LoadedSection* World::LoadSection(const Section& section) {
             auto pack = std::make_unique<TexturePack>();
             if (pack->Parse(chunk))
                 loadedSection->texturePacks.push_back(std::move(pack));
+        } else if (chunk.id == 0xB0300100u) {
+            ReadTextureAnimations(chunk);
         }
     }
 
@@ -543,8 +575,18 @@ void World::OpenGlobalPacks(const std::wstring& tracksDirectory) {
     const size_t slash = tracksDirectory.find_last_of(L"\\/");
     const std::wstring game = slash == std::wstring::npos ? L"." : tracksDirectory.substr(0, slash);
 
-    for (const wchar_t* name : { L"InGameCommon.bun", L"GLOBALB.BUN" }) {
-        const std::wstring path = game + L"\\GLOBAL\\" + name;
+    // The global packs, and the city's dynamic textures (TRACKS\LOC4DYNTEX.BIN):
+    // the sky dome draws from those, which the game swaps with the weather.
+    std::vector<std::wstring> paths;
+    for (const wchar_t* name : { L"InGameCommon.bun", L"GLOBALB.BUN" }) paths.push_back(game + L"\\GLOBAL\\" + name);
+    WIN32_FIND_DATAW found{};
+    HANDLE search = ::FindFirstFileW((tracksDirectory + L"\\LOC*DYNTEX.BIN").c_str(), &found);
+    if (search != INVALID_HANDLE_VALUE) {
+        do paths.push_back(tracksDirectory + L"\\" + found.cFileName);
+        while (::FindNextFileW(search, &found));
+        ::FindClose(search);
+    }
+    for (const std::wstring& path : paths) {
         if (::GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) continue;
 
         auto file = std::make_unique<FileMap>();

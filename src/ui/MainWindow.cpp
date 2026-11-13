@@ -23,6 +23,7 @@
 #include "ui/WorldDialogs.h"
 
 #include <commctrl.h>
+#include <dwmapi.h>
 #include <commdlg.h>
 #include <shellapi.h>
 #include <shlobj.h>
@@ -279,6 +280,18 @@ void MainWindow::WarmThumbnails(DWORD budgetMs) {
 // Construction
 // ---------------------------------------------------------------------------
 
+namespace {
+
+// DWMWA_USE_IMMERSIVE_DARK_MODE: 20 from Windows 10 20H1 on, 19 before it.
+void DarkTitleBar(HWND window) {
+    if (!window || !(::GetWindowLongW(window, GWL_STYLE) & WS_CAPTION)) return;
+    const BOOL dark = TRUE;
+    if (FAILED(::DwmSetWindowAttribute(window, 20, &dark, sizeof(dark))))
+        ::DwmSetWindowAttribute(window, 19, &dark, sizeof(dark));
+}
+
+} // namespace
+
 bool MainWindow::Create(HINSTANCE instance, int showCommand) {
     instance_ = instance;
 
@@ -305,6 +318,14 @@ bool MainWindow::Create(HINSTANCE instance, int showCommand) {
         return false;
     }
 
+    // Dark title bars, for the main window and every dialog and message box the
+    // editor opens: a thread hook darkens each captioned window as it activates.
+    static HHOOK darkHook = ::SetWindowsHookExW(WH_CBT, [](int code, WPARAM wParam, LPARAM lParam) -> LRESULT {
+        if (code == HCBT_ACTIVATE) DarkTitleBar((HWND)wParam);
+        return ::CallNextHookEx(nullptr, code, wParam, lParam);
+    }, nullptr, ::GetCurrentThreadId());
+    (void)darkHook;
+
     window_ = ::CreateWindowExW(0, kWindowClass, kWindowTitle,
                                 WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
                                 CW_USEDEFAULT, CW_USEDEFAULT, 1400, 860,
@@ -313,6 +334,7 @@ bool MainWindow::Create(HINSTANCE instance, int showCommand) {
         LOG_ERROR("failed to create the main window");
         return false;
     }
+    DarkTitleBar(window_);
 
     accelerators_ = ::LoadAcceleratorsW(instance, MAKEINTRESOURCEW(IDR_ACCELERATORS));
 
@@ -682,6 +704,18 @@ void MainWindow::OnCreate() {
 
     // From here the frame is drawn with ImGui (ui/MainWindowShell.cpp): the
     // native menu, toolbar, status bar and side panel stay as hidden sources.
+    // View > Sky and Animations, after what the menu already holds.
+    for (int i = 0; menu_ && i < ::GetMenuItemCount(menu_); ++i) {
+        wchar_t text[64] = {};
+        ::GetMenuStringW(menu_, (UINT)i, text, 63, MF_BYPOSITION);
+        if (std::wstring(text).find(L"View") == std::wstring::npos) continue;
+        if (HMENU view = ::GetSubMenu(menu_, i)) {
+            ::AppendMenuW(view, MF_SEPARATOR, 0, nullptr);
+            ::AppendMenuW(view, MF_STRING, kViewSkyCommand, L"S&ky (follows the camera)");
+            ::AppendMenuW(view, MF_STRING, kViewAnimationsCommand, L"&Animated Textures");
+        }
+        break;
+    }
     shell_ = true;
     online_ = std::make_unique<OnlineLibrary>();
     online_->SetWindow(window_);
@@ -933,6 +967,16 @@ void MainWindow::OnCommand(int id, int notification, HWND control) {
 
     for (auto& extension : extensions_)
         if (extension->OnCommand(id)) return;
+    if (id == kViewSkyCommand) {
+        viewport_.GetRenderer().SetSkyVisible(!viewport_.GetRenderer().SkyVisible());
+        UpdateMenuChecks();
+        return;
+    }
+    if (id == kViewAnimationsCommand) {
+        viewport_.GetRenderer().SetAnimationsEnabled(!viewport_.GetRenderer().AnimationsEnabled());
+        UpdateMenuChecks();
+        return;
+    }
     if (id == MeshTools::kBakeCommand) {
         bakeOpen_ = true;
         return;
@@ -2601,6 +2645,10 @@ void MainWindow::UpdateMenuChecks() {
     ::CheckMenuItem(menu_, ID_VIEW_BACKFACE_CULL,
                     MF_BYCOMMAND | (viewport_.GetRenderer().BackfaceCullingEnabled()
                                         ? MF_CHECKED : MF_UNCHECKED));
+    ::CheckMenuItem(menu_, kViewSkyCommand,
+                    MF_BYCOMMAND | (viewport_.GetRenderer().SkyVisible() ? MF_CHECKED : MF_UNCHECKED));
+    ::CheckMenuItem(menu_, kViewAnimationsCommand,
+                    MF_BYCOMMAND | (viewport_.GetRenderer().AnimationsEnabled() ? MF_CHECKED : MF_UNCHECKED));
     for (auto& extension : extensions_) extension->UpdateMenuChecks(menu_);
 }
 

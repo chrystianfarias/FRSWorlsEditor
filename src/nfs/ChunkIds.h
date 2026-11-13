@@ -49,6 +49,7 @@ enum ChunkId : u32 {
     kChunkTpkInfoBlock       = 0xB3310000,
     kChunkTpkHeader          = 0x33310001,  // pack name and path
     kChunkTpkHashTable       = 0x33310002,
+    kChunkTpkCompressedIndex = 0x33310003,  // compressed packs: 24 bytes per texture
     kChunkTpkTextureHeaders  = 0x33310004,
     kChunkTpkFormatTable     = 0x33310005,
     kChunkTpkDataBlock       = 0xB3320000,

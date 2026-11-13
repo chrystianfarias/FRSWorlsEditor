@@ -1,6 +1,7 @@
 #include "nfs/TexturePack.h"
 
 #include "core/Log.h"
+#include "nfs/EaCompress.h"
 
 #include <algorithm>
 #include <cstring>
@@ -62,11 +63,52 @@ const char* ToString(TextureFormat format) {
     }
 }
 
+static Texture ReadHeader(ByteSpan entry, ByteSpan format) {
+    Texture texture;
+    texture.name          = ReadFixedName(entry, kTexName, kTexNameCapacity);
+    texture.hash          = entry.read<u32>(kTexHash);
+    texture.width         = entry.read<u16>(kTexWidth);
+    texture.height        = entry.read<u16>(kTexHeight);
+    texture.mipCount      = entry.read<u8>(kTexMipCount);
+    texture.baseLevelSize = entry.read<u32>(kTexBaseLevelSize);
+    texture.alphaUsage    = (AlphaUsage)std::min<u8>(entry.read<u8>(kTexAlphaUsage), 2);
+    texture.alphaBlend    = (AlphaBlend)std::min<u8>(entry.read<u8>(kTexAlphaBlend), 2);
+    if (!format.empty()) texture.format = FormatFromFourCc(format.read<u32>(kFormatFourCc));
+    if (texture.mipCount == 0) texture.mipCount = 1;
+    return texture;
+}
+
+bool TexturePack::ParseCompressed(const Chunk& packChunk, ByteSpan index) {
+    // Index entries: hash, absolute file offset, compressed size, size, flags, 0.
+    const u8* file = packChunk.data.data - packChunk.dataOffset;
+    const u64 fileEnd = packChunk.dataOffset + packChunk.data.size;
+    constexpr size_t kEntry = 24;
+    constexpr size_t kTail = kTextureEntrySize + kFormatEntrySize;
+    size_t failed = 0;
+    for (size_t i = 0; i + kEntry <= index.size; i += kEntry) {
+        const u32 offset = index.read<u32>(i + 4), size = index.read<u32>(i + 8);
+        if (offset < packChunk.dataOffset || (u64)offset + size > fileEnd) { ++failed; continue; }
+        std::vector<u8> block;
+        if (!EaDecompress({ file + offset, size }, block) || block.size() < kTail) { ++failed; continue; }
+        owned_.push_back(std::move(block));
+        const ByteSpan all{ owned_.back().data(), owned_.back().size() };
+        const ByteSpan entry = all.sub(all.size - kTail, kTextureEntrySize);
+        Texture texture = ReadHeader(entry, all.sub(all.size - kFormatEntrySize, kFormatEntrySize));
+        texture.pixels = all.sub(0, std::min<size_t>(entry.read<u32>(kTexDataSize), all.size - kTail));
+        if (texture.format == TextureFormat::Palettised8) { ++failed; continue; }   // none ship
+        byHash_.emplace(texture.hash, textures_.size());
+        textures_.push_back(std::move(texture));
+    }
+    LOG_INFO("compressed texture pack '%s': %zu textures, %zu unreadable", name_.c_str(), textures_.size(), failed);
+    return !textures_.empty();
+}
+
 bool TexturePack::Parse(const Chunk& packChunk) {
     textures_.clear();
     byHash_.clear();
+    owned_.clear();
 
-    ByteSpan headers, formats, pixels;
+    ByteSpan headers, formats, pixels, compressed;
 
     ChunkReader top = ChunkReader::Children(packChunk);
     Chunk block;
@@ -81,6 +123,7 @@ bool TexturePack::Parse(const Chunk& packChunk) {
                         break;
                     case kChunkTpkTextureHeaders: headers = part.data; break;
                     case kChunkTpkFormatTable:    formats = part.data; break;
+                    case kChunkTpkCompressedIndex: compressed = part.data; break;
                     default: break;
                 }
             }
@@ -93,6 +136,7 @@ bool TexturePack::Parse(const Chunk& packChunk) {
         }
     }
 
+    if (headers.empty() && !compressed.empty()) return ParseCompressed(packChunk, compressed);
     if (headers.empty() || pixels.empty()) {
         LOG_WARN("texture pack '%s' is missing headers or pixel data", name_.c_str());
         return false;
@@ -104,21 +148,10 @@ bool TexturePack::Parse(const Chunk& packChunk) {
     for (size_t i = 0; i < count; ++i) {
         const ByteSpan entry = headers.sub(i * kTextureEntrySize, kTextureEntrySize);
 
-        Texture texture;
-        texture.name          = ReadFixedName(entry, kTexName, kTexNameCapacity);
-        texture.hash          = entry.read<u32>(kTexHash);
-        texture.width         = entry.read<u16>(kTexWidth);
-        texture.height        = entry.read<u16>(kTexHeight);
-        texture.mipCount      = entry.read<u8>(kTexMipCount);
-        texture.baseLevelSize = entry.read<u32>(kTexBaseLevelSize);
-        texture.alphaUsage    = (AlphaUsage)std::min<u8>(entry.read<u8>(kTexAlphaUsage), 2);
-        texture.alphaBlend    = (AlphaBlend)std::min<u8>(entry.read<u8>(kTexAlphaBlend), 2);
-
         // The format table runs parallel to the header table.
-        if ((i + 1) * kFormatEntrySize <= formats.size) {
-            const ByteSpan format = formats.sub(i * kFormatEntrySize, kFormatEntrySize);
-            texture.format = FormatFromFourCc(format.read<u32>(kFormatFourCc));
-        }
+        const ByteSpan format = (i + 1) * kFormatEntrySize <= formats.size
+                                    ? formats.sub(i * kFormatEntrySize, kFormatEntrySize) : ByteSpan{};
+        Texture texture = ReadHeader(entry, format);
 
         const u32 dataOffset = entry.read<u32>(kTexDataOffset);
         const u32 dataSize   = entry.read<u32>(kTexDataSize);
@@ -128,8 +161,6 @@ bool TexturePack::Parse(const Chunk& packChunk) {
         // texture slice, addressed the same way as the pixels.
         if (const u32 paletteSize = entry.read<u32>(kTexPaletteSize))
             texture.palette = pixels.sub(entry.read<u32>(kTexPaletteOffset), paletteSize);
-
-        if (texture.mipCount == 0) texture.mipCount = 1;
 
         byHash_.emplace(texture.hash, textures_.size());
         textures_.push_back(std::move(texture));

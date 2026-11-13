@@ -42,7 +42,8 @@ enum class AlphaBlend : u8 {
 //
 // Materials reference textures by hash, so the pack keeps a hash lookup. The
 // pixel data is not copied: `pixels` points into the mapped stream file and
-// stays valid as long as the mapping does.
+// stays valid as long as the mapping does. Textures of a compressed pack point
+// into the pack's own decompressed copy instead.
 struct Texture {
     std::string   name;
     u32           hash   = 0;
@@ -72,8 +73,14 @@ public:
     const std::string& Name() const { return name_; }
 
 private:
+    // A compressed pack (TRACKS\LOC4DYNTEX.BIN: the sky, the weather and the
+    // other textures the game swaps) keeps each texture as an EA-compressed
+    // block holding its pixels, then its 124-byte header and 32-byte format.
+    bool ParseCompressed(const Chunk& packChunk, ByteSpan index);
+
     std::string          name_;
     std::vector<Texture> textures_;
+    std::vector<std::vector<u8>> owned_;   // decompressed blocks
     std::unordered_map<u32, size_t> byHash_;
 };
 
