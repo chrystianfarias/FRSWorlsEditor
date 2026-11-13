@@ -45,6 +45,7 @@ add_executable(FRSWorldEditor WIN32
     src/nfs/TextureDecode.cpp
     src/nfs/TexturePack.cpp
     src/nfs/EaCompress.cpp
+    src/nfs/WorldAnimation.cpp
     src/nfs/World.cpp
 
     # MINIMAP PREVIEW (temporary)
@@ -61,6 +62,7 @@ add_executable(FRSWorldEditor WIN32
 
     src/ui/EditsPanel.cpp
     src/ui/EmbeddedGame.cpp
+    src/ui/CrashReport.cpp
     src/ui/MainWindow.cpp
     src/ui/MainWindowShell.cpp
     src/ui/OnlineLibrary.cpp

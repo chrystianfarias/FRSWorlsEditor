@@ -4,6 +4,7 @@
 #include "io/CollisionExport.h"
 #include "io/CollisionImport.h"
 #include "ui/CollisionTools.h"
+#include "ui/CrashReport.h"
 #include "ui/MeshTools.h"
 #include "ui/OnlineLibrary.h"
 #include "io/PlacementWrite.h"
@@ -679,6 +680,7 @@ void MainWindow::OnCreate() {
         host.menuChecks = [this] { UpdateMenuChecks(); };
         host.importQuietly = [this](const std::wstring& path) { ImportObj(path, true); };
         host.undoCommand = CollisionTools::kUndoCommand;
+        host.collision = [this] { return collisionTools_; };
         auto mesh = std::make_unique<MeshTools>(std::move(host));
         meshTools_ = mesh.get();
         extensions_.push_back(std::move(mesh));
@@ -712,7 +714,7 @@ void MainWindow::OnCreate() {
         if (HMENU view = ::GetSubMenu(menu_, i)) {
             ::AppendMenuW(view, MF_SEPARATOR, 0, nullptr);
             ::AppendMenuW(view, MF_STRING, kViewSkyCommand, L"S&ky (follows the camera)");
-            ::AppendMenuW(view, MF_STRING, kViewAnimationsCommand, L"&Animated Textures");
+            ::AppendMenuW(view, MF_STRING, kViewAnimationsCommand, L"&Animations");
         }
         break;
     }
@@ -1486,6 +1488,15 @@ void MainWindow::UpdateGameView() {
     if (!game_.Running()) {
         const bool watching = ::KillTimer(window_, kGameViewTimer) != 0;
         if (!watching && !game_.Embedded()) return;
+        // Gone without being asked, with an error: everything worth reading
+        // to find out why, in a window of its own (ui/CrashReport.h).
+        DWORD exitCode = 0;
+        if (game_.EndedOnItsOwn(exitCode) && exitCode != 0) {
+            LOG_WARN("game: ended on its own with exit code 0x%08lX (%S)", exitCode,
+                     crash::ExitCodeName(exitCode).c_str());
+            crash::Show(window_, crash::BuildReport(gameFolder_, game_.Launched(), exitCode), gameFolder_);
+            SetStatusText(2, L"The game crashed -- its logs are in the window that opened");
+        }
         game_.Release();
         SetLaunchLabel(L"Launch game");
         return;

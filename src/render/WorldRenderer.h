@@ -204,6 +204,10 @@ public:
     // The game's animated textures -- water, signs, blinking lights -- played
     // as it plays them. On by default.
     bool AnimationsEnabled() const { return animate_; }
+    // The game's moving scenery (doors, planes, cranes, trams), drawn where
+    // the layout file places it; still at its first frame when animations
+    // are off.
+    void DrawObjectAnimations(IDirect3DDevice9* device, bool usingVisibility, const Vec3& eye, RenderStats& stats);
     void SetAnimationsEnabled(bool on) { animate_ = on; }
 
     // The sky dome drawn round the camera, always behind everything, as the

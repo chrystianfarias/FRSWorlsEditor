@@ -24,6 +24,11 @@ public:
     // True while the game process is alive.
     bool Running() const;
 
+    // The game is gone and nobody asked it to go (Stop): its exit code. Read
+    // it before Release, which forgets the process.
+    bool EndedOnItsOwn(DWORD& exitCode) const;
+    const FILETIME& Launched() const { return launched_; }
+
     // Finds the game's window once it exists and keeps it over `area` (screen
     // coordinates). Cheap when nothing changed; call it on a timer and on
     // every move or resize of the editor.
@@ -59,4 +64,6 @@ private:
     RECT   placed_{};
     bool   shown_ = true;
     bool   fullscreen_ = false;
+    bool   stopRequested_ = false;
+    FILETIME launched_{};
 };

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "io/CollisionEdit.h"
 #include "render/WorldRenderer.h"
 #include "ui/EditorExtension.h"
 #include "ui/UndoRegistry.h"
@@ -26,6 +27,8 @@ struct MeshToolsHost {
     // Reads an exported OBJ back the way the Blender round trip does.
     std::function<void(const std::wstring& objPath)> importQuietly;
     int undoCommand = 0;                  // the editor's Ctrl+Z command
+    // The collision tools: their editor, undo history and redraw.
+    std::function<class CollisionTools*()> collision;
 };
 
 // A small mesh editor for the object selected in the viewport: vertices,
@@ -42,6 +45,13 @@ struct MeshToolsHost {
 // 1 / 2 / 3 pick vertices, edges or faces while editing (the toolbar keeps
 // the gizmo's move / rotate / scale), Ctrl+click adds, Ctrl+A takes all,
 // Ctrl+Z steps back, Esc drops the selection, Mesh > Discard throws the edit away.
+//
+// With collision polygons selected instead (the collision layer shown), Tab
+// edits the collision the same way: the selected polygons and the ones that
+// share a corner with them, each copy in a neighbouring section moving with
+// it. Ground and walls are faces, barriers are edges (only where they stand
+// matters, not their height). Each drag is one step of the collision undo;
+// the next save writes it. E extrudes the picked edges into new faces.
 class MeshTools : public EditorExtension, public ViewportTool, public UndoParticipant {
 public:
     explicit MeshTools(MeshToolsHost host) : host_(std::move(host)) {}
@@ -85,6 +95,14 @@ private:
     void Status(const std::wstring& text) const { if (host_.status) host_.status(text); }
 
     bool Begin();
+    bool BeginCollision();
+    // The edit session over these polygons (copies added): points, welds,
+    // edges and faces. A polygon already in the session keeps its starting
+    // shape, for Discard.
+    bool BuildCollision(std::vector<collision::PolygonRef> refs);
+    // E: each picked edge grows a new face, its far edge 2 m outward (up, for
+    // the top of a wall) and picked, ready for the gizmo.
+    void ExtrudeCollision();
     void Finish();                 // writes the edit
     void Stop(bool restore);       // leaves edit mode; `restore` puts the shape back
     void SetPickMode(Pick mode);
@@ -123,4 +141,26 @@ private:
     std::vector<Vec3> dragStart_;
     Vec3 pivotStart_{};
     HMENU popup_ = nullptr;
+
+    // --- editing collision instead of a model ----------------------------------
+    // Points: one per distinct corner of each polygon (a barrier has two, a
+    // triangle three); world_ holds their positions and the welds join the
+    // ones at one spot, so a shared corner and the edge copies move as one.
+    struct CollisionPoint {
+        u32 polygon = 0;   // index into collisionRefs_
+        u8  slots = 0;     // corners it sets, bit per slot
+        bool barrier = false;
+    };
+    class CollisionTools* Collision() const { return host_.collision ? host_.collision() : nullptr; }
+    void ReadCollision();          // positions from the packs (after an undo)
+    void PushCollision();          // positions into the packs, while dragging
+    void StopCollision(bool restore);
+    bool collision_ = false;
+    std::vector<collision::PolygonRef> collisionRefs_;
+    std::vector<collision::PolygonRef> collisionSelected_;   // the selection editing began from
+    std::vector<nfs::CollisionPolygon> collisionStart_;      // as editing began
+    std::vector<CollisionPoint> collisionPoints_;
+    std::vector<u32> facePolygon_;   // per face, its polygon: a quad's two halves pick together
+    u64 collisionUndone_ = 0;        // the editor's counter, to notice an undo
+    bool collisionSteps_ = false;    // any drag kept
 };

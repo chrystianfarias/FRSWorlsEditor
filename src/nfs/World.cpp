@@ -124,6 +124,7 @@ bool World::Open(const std::wstring& tracksDirectory, const std::wstring& region
 
     OpenGlobalPacks(tracksDirectory);
     ReadRaceBarrierGroups();
+    objectAnimations_.Parse(layout_.Span());
 
     region_ = region;
     sectionToLoaded_.assign(table_.Sections().size(), -1);
@@ -186,6 +187,7 @@ void World::Close() {
     region_.clear();
     raceGroups_.clear();
     textureAnimations_.clear();
+    objectAnimations_.Clear();
     layout_.Close();
     stream_.Close();
     globalPacks_.clear();

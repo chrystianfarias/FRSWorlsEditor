@@ -3,6 +3,7 @@
 #include "core/FileMap.h"
 #include "core/Math.h"
 #include "io/MeshOverlay.h"
+#include "nfs/WorldAnimation.h"
 #include "nfs/Collision.h"
 #include "nfs/Preculler.h"
 #include "nfs/SectionTable.h"
@@ -173,6 +174,9 @@ public:
     // Every texture animation of the sections loaded, by the hash materials use.
     const std::unordered_map<u32, TextureAnimation>& TextureAnimations() const { return textureAnimations_; }
 
+    // The moving scenery of the layout file: doors, planes, cranes, trams.
+    const WorldAnimations& ObjectAnimations() const { return objectAnimations_; }
+
     // The race barrier groups the layout file names (chunk 0x3412F): byte 0
     // of a collision polygon indexes this list, entry 0 being "NONE". A group
     // exists for the game only during the races that name it -- in free roam
@@ -220,6 +224,7 @@ private:
     SectionTable table_;
     std::vector<std::string> raceGroups_;
     std::unordered_map<u32, TextureAnimation> textureAnimations_;
+    WorldAnimations objectAnimations_;
     void ReadTextureAnimations(const Chunk& chunk);
     void ReadRaceBarrierGroups();
 

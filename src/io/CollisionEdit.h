@@ -119,6 +119,17 @@ public:
     void EndMove(bool keep);
     bool Moving() const { return moving_; }
 
+    // Reshaping (the edit mode's vertices, edges and faces): Begin records
+    // exactly `refs` -- the caller includes the copies -- as one undo step,
+    // SetShape gives one of them new corners, EndMove keeps or puts back.
+    bool BeginReshape(const std::vector<PolygonRef>& refs);
+    void SetShape(const PolygonRef& ref, const nfs::CollisionPolygon& polygon);
+
+    // A polygon as it is now, or nullptr.
+    const nfs::CollisionPolygon* Polygon(const PolygonRef& ref) const;
+    // Where a barrier stands on screen: its quad with the ground's heights.
+    bool BarrierQuad(const PolygonRef& ref, Vec3 out[4]) const;
+
     // Counters of undo steps recorded and taken back, for a history that
     // interleaves these with other kinds of edit.
     u64 StepsRecorded() const { return recorded_; }

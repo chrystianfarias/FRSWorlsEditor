@@ -568,6 +568,44 @@ void Editor::UpdateMove(const Vec3& offset) {
     }
 }
 
+bool Editor::BeginReshape(const std::vector<PolygonRef>& refs) {
+    if (moving_) EndMove(false);
+    moveRefs_.clear();
+    moveStart_.clear();
+    std::vector<std::pair<u32, u32>> packs;
+    for (const PolygonRef& ref : refs) {
+        nfs::CollisionPack* pack = Pack(ref.section, ref.pack);
+        if (!pack || ref.polygon >= pack->polygons.size()) continue;
+        moveRefs_.push_back(ref);
+        moveStart_.push_back(pack->polygons[ref.polygon]);
+        packs.push_back({ ref.section, ref.pack });
+    }
+    if (moveRefs_.empty()) return false;
+    Remember(L"Reshape collision", packs);
+    moving_ = true;
+    return true;
+}
+
+void Editor::SetShape(const PolygonRef& ref, const nfs::CollisionPolygon& polygon) {
+    if (!moving_) return;
+    nfs::CollisionPack* pack = Pack(ref.section, ref.pack);
+    if (!pack || ref.polygon >= pack->polygons.size()) return;
+    pack->polygons[ref.polygon] = polygon;
+    if (std::find(touched_.begin(), touched_.end(), ref.section) == touched_.end()) touched_.push_back(ref.section);
+}
+
+const nfs::CollisionPolygon* Editor::Polygon(const PolygonRef& ref) const {
+    const nfs::CollisionPack* pack = Pack(ref.section, ref.pack);
+    return pack && ref.polygon < pack->polygons.size() ? &pack->polygons[ref.polygon] : nullptr;
+}
+
+bool Editor::BarrierQuad(const PolygonRef& ref, Vec3 out[4]) const {
+    const nfs::CollisionPack* pack = Pack(ref.section, ref.pack);
+    if (!pack || ref.polygon >= pack->polygons.size()) return false;
+    pack->BarrierQuad(pack->polygons[ref.polygon], out);
+    return true;
+}
+
 void Editor::EndMove(bool keep) {
     if (!moving_) return;
     moving_ = false;

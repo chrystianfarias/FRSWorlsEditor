@@ -137,7 +137,7 @@ void ImGuiLayer::ApplyTheme(float scale) {
     style.DockingSeparatorSize = 2;
 
     ImVec4* c = style.Colors;
-    const ImVec4 accent = Rgb(0x4C8DFF);
+    const ImVec4 accent = Rgb(0x3696DB);
     c[ImGuiCol_Text]                  = Rgb(0xDCDDDE);
     c[ImGuiCol_TextDisabled]          = Rgb(0x80838A);
     c[ImGuiCol_WindowBg]              = Rgb(0x1E1F22, 0.97f);
@@ -158,7 +158,7 @@ void ImGuiLayer::ApplyTheme(float scale) {
     c[ImGuiCol_ScrollbarGrabActive]   = Rgb(0x5A5F6A);
     c[ImGuiCol_CheckMark]             = accent;
     c[ImGuiCol_SliderGrab]            = accent;
-    c[ImGuiCol_SliderGrabActive]      = Rgb(0x6FA3FF);
+    c[ImGuiCol_SliderGrabActive]      = Rgb(0x4DB0E6);
     c[ImGuiCol_Button]                = Rgb(0x2F3136);
     c[ImGuiCol_ButtonHovered]         = Rgb(0x3C3F46);
     c[ImGuiCol_ButtonActive]          = Rgb(0x4A4E57);
@@ -169,7 +169,7 @@ void ImGuiLayer::ApplyTheme(float scale) {
     c[ImGuiCol_SeparatorHovered]      = accent;
     c[ImGuiCol_SeparatorActive]       = accent;
     c[ImGuiCol_ResizeGrip]            = Rgb(0x34363C, 0.0f);
-    c[ImGuiCol_ResizeGripHovered]     = Rgb(0x4C8DFF, 0.5f);
+    c[ImGuiCol_ResizeGripHovered]     = Rgb(0x3696DB, 0.5f);
     c[ImGuiCol_ResizeGripActive]      = accent;
     c[ImGuiCol_Tab]                   = Rgb(0x18191C);
     c[ImGuiCol_TabHovered]            = Rgb(0x34363C);
@@ -177,8 +177,8 @@ void ImGuiLayer::ApplyTheme(float scale) {
     c[ImGuiCol_TabSelectedOverline]   = accent;
     c[ImGuiCol_TabDimmed]             = Rgb(0x18191C);
     c[ImGuiCol_TabDimmedSelected]     = Rgb(0x1E1F22);
-    c[ImGuiCol_TabDimmedSelectedOverline] = Rgb(0x4C8DFF, 0.4f);
-    c[ImGuiCol_DockingPreview]        = Rgb(0x4C8DFF, 0.45f);
+    c[ImGuiCol_TabDimmedSelectedOverline] = Rgb(0x3696DB, 0.4f);
+    c[ImGuiCol_DockingPreview]        = Rgb(0x3696DB, 0.45f);
     c[ImGuiCol_DockingEmptyBg]        = Rgb(0x000000, 0.0f);
     c[ImGuiCol_PlotLines]             = accent;
     c[ImGuiCol_PlotHistogram]         = accent;
@@ -187,7 +187,7 @@ void ImGuiLayer::ApplyTheme(float scale) {
     c[ImGuiCol_TableBorderLight]      = Rgb(0x2B2D31);
     c[ImGuiCol_TableRowBg]            = Rgb(0x000000, 0.0f);
     c[ImGuiCol_TableRowBgAlt]         = Rgb(0xFFFFFF, 0.025f);
-    c[ImGuiCol_TextSelectedBg]        = Rgb(0x4C8DFF, 0.35f);
+    c[ImGuiCol_TextSelectedBg]        = Rgb(0x3696DB, 0.35f);
     c[ImGuiCol_DragDropTarget]        = accent;
     c[ImGuiCol_NavCursor]             = accent;
     c[ImGuiCol_ModalWindowDimBg]      = Rgb(0x000000, 0.5f);

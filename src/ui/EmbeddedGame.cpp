@@ -43,12 +43,20 @@ bool EmbeddedGame::Launch(const std::wstring& gameFolder, HWND owner) {
     owner_ = owner;
     shown_ = true;
     fullscreen_ = false;
+    stopRequested_ = false;
+    ::GetSystemTimeAsFileTime(&launched_);
     LOG_INFO("game started, process %lu", processId_);
     return true;
 }
 
 bool EmbeddedGame::Running() const {
     return process_ && ::WaitForSingleObject(process_, 0) == WAIT_TIMEOUT;
+}
+
+bool EmbeddedGame::EndedOnItsOwn(DWORD& exitCode) const {
+    exitCode = 0;
+    if (!process_ || stopRequested_ || Running()) return false;
+    return ::GetExitCodeProcess(process_, &exitCode) != FALSE;
 }
 
 bool EmbeddedGame::Adopt(HWND window) {
@@ -104,6 +112,7 @@ void EmbeddedGame::SetShown(bool shown) {
 
 void EmbeddedGame::Stop(DWORD graceMs) {
     if (!Running()) return;
+    stopRequested_ = true;
     HWND window = window_;
     if (!window) {
         Search search{ processId_, nullptr };

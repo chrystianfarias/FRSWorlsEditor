@@ -644,6 +644,7 @@ void WorldRenderer::Render(const Camera& camera) {
         device->SetFVF(kWorldVertexFvf);
     }
 
+    if (showScenery_) DrawObjectAnimations(device, usingVisibility, eye, stats);
     DrawTranslucent(device, stats);
     for (RenderExtension* extension : extensions_) extension->DrawWithWorld(device, *this);
     DrawSelection(device);
@@ -1407,6 +1408,66 @@ void WorldRenderer::DrawModel(IDirect3DDevice9* device, const GpuObject& object,
 
 void WorldRenderer::BeginTranslucentModels(IDirect3DDevice9* device) { BeginTranslucentStates(device); }
 void WorldRenderer::EndTranslucentModels(IDirect3DDevice9* device) { EndTranslucentStates(device); }
+
+void WorldRenderer::DrawObjectAnimations(IDirect3DDevice9* device, bool usingVisibility, const Vec3& eye,
+                                         RenderStats& stats) {
+    if (!world_) return;
+    const nfs::WorldAnimations& animations = world_->ObjectAnimations();
+    if (animations.Placements().empty()) return;
+    const GpuSection* unusedGpu = nullptr;
+    const GpuObject* unusedObject = nullptr;
+    FindGpuModel(0, unusedGpu, unusedObject);   // fills objectByHash_
+    const double seconds = animate_ ? animationClock_ : 0.0;
+    std::vector<Mat4> pose;
+    device->SetFVF(kWorldVertexFvf);
+    size_t bound = (size_t)-1;
+    for (const nfs::WorldAnimationPlacement& placement : animations.Placements()) {
+        // The game shows a tree only while its section is streamed in.
+        if (usingVisibility && !std::binary_search(visibleSections_.begin(), visibleSections_.end(),
+                                                   (u32)placement.section))
+            continue;
+        animations.Pose(placement, seconds, pose);
+        const nfs::WorldAnimationTree& tree = animations.Trees()[placement.tree];
+        for (size_t i = 0; i < tree.parts.size() && i < pose.size(); ++i) {
+            if (!tree.parts[i].model) continue;
+            const auto found = objectByHash_.find(tree.parts[i].model);
+            if (found == objectByHash_.end()) continue;
+            const size_t s = found->second.first;
+            const GpuSection& gpu = *sections_[s].gpu;
+            const GpuObject& object = gpu.Objects()[found->second.second];
+            if (bound != s) {
+                device->SetStreamSource(0, gpu.VertexBuffer(), 0, sizeof(nfs::SolidVertex));
+                device->SetIndices(gpu.IndexBuffer());
+                bound = s;
+            }
+            const bool mirrored = Determinant3x3(pose[i]) < 0.0f;
+            if (backfaceCulling_)
+                device->SetRenderState(D3DRS_CULLMODE, mirrored ? OppositeCull(cullMode_) : cullMode_);
+            const D3DMATRIX world = ToD3D(pose[i]);
+            device->SetTransform(D3DTS_WORLD, &world);
+            stats.instancesVisible++;
+            if (DrawObject(device, object, stats))
+                QueueTranslucent(object, s, pose[i], mirrored,
+                                 object.source ? Transform(object.source->bounds, pose[i]) : Aabb{}, eye);
+        }
+    }
+    if (backfaceCulling_) device->SetRenderState(D3DRS_CULLMODE, cullMode_);
+    static bool told = false;
+    if (!told) {
+        told = true;
+        size_t visible = 0, parts = 0, missing = 0;
+        for (const nfs::WorldAnimationPlacement& placement : animations.Placements()) {
+            if (usingVisibility && !std::binary_search(visibleSections_.begin(), visibleSections_.end(),
+                                                       (u32)placement.section))
+                continue;
+            ++visible;
+            for (const nfs::WorldAnimationPart& part : animations.Trees()[placement.tree].parts)
+                if (part.model) (objectByHash_.count(part.model) ? parts : missing)++;
+        }
+        LOG_INFO("object animations: %zu of %zu placements in view, %zu parts drawn, %zu models not found",
+                 visible, animations.Placements().size(), parts, missing);
+    }
+}
 
 bool WorldRenderer::FindGpuModel(u32 hash, const GpuSection*& gpu, const GpuObject*& object) {
     if (objectByHash_.empty()) {
