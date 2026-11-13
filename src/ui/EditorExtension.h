@@ -56,6 +56,9 @@ public:
     virtual void OnRegionClosed() {}
     // File > Save World: whatever it has not written yet.
     virtual void Save() {}
+    // The edits were just written to the game (Ctrl+Shift+S or Save World),
+    // before the region reopens: a record kept beside them is written now.
+    virtual void OnSaved() {}
 
     // ---- the scene tree
 

@@ -16,6 +16,7 @@
 #include "io/SelectionExport.h"
 #include "io/SelectionImport.h"
 #include "io/WorldProfiles.h"
+#include "io/WorldFile.h"
 #include "minimap/MinimapBuildings.h"   // MINIMAP PREVIEW (temporary)
 #include "render/RenderExtension.h"
 #include "ui/Resource.h"
@@ -520,7 +521,7 @@ LRESULT MainWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
             return 0;
 
         case WM_CLOSE:
-            if (!ConfirmUnsavedPlacements()) return 0;
+            if (!ConfirmUnsavedPlacements() || !ConfirmWorldFileSaved()) return 0;
             RestoreFastBoot();
             game_.Release();   // an owned window would be destroyed with the editor
             ::DestroyWindow(window_);
@@ -624,6 +625,11 @@ void MainWindow::OnCreate() {
     edits_.SetExtraRows([this](std::vector<EditsPanel::ExtraRow>& rows) {
         for (auto& extension : extensions_) extension->EditRows(rows);
     });
+    // Collision changes are listed one by one from the collision log, not
+    // as whole packs.
+    edits_.collisionLogged = [this](const std::string& section) {
+        return collisionTools_ && collisionTools_->LogCovers(section);
+    };
     edits_.onRevertExtra = [this](const void* owner, const std::vector<size_t>& indices) {
         if (EditorExtension* extension = ExtensionOf(owner)) extension->RevertRows(indices);
     };
@@ -1007,6 +1013,7 @@ void MainWindow::OnCommand(int id, int notification, HWND control) {
         case ID_WORLD_NEW:       NewWorld(); break;
         case ID_WORLD_OPEN:      OpenWorld(); break;
         case ID_WORLD_SAVE:      SaveWorld(); break;
+        case ID_WORLD_SAVE_AS:   SaveWorldAs(); break;
         case ID_WORLD_LOAD_ALL:  LoadAllSections(); break;
         case ID_WORLD_FRAME:
             if (world_) viewport_.FrameBounds(world_->TrackBounds());
@@ -1263,29 +1270,142 @@ bool MainWindow::CanSwitchWorld() {
     return false;
 }
 
+// A world is one file (io/WorldFile.h), kept wherever the person likes;
+// <game>\models is where the game reads the open one from.
+
+std::wstring MainWindow::WorldDisplayName() const {
+    if (worldPath_.empty()) return L"untitled world";
+    const size_t slash = worldPath_.find_last_of(L"\\/");
+    std::wstring name = slash == std::wstring::npos ? worldPath_ : worldPath_.substr(slash + 1);
+    const size_t dot = name.find_last_of(L'.');
+    return dot == std::wstring::npos ? name : name.substr(0, dot);
+}
+
+void MainWindow::RememberWorldFile() {
+    worldSignature_ = io::WorldSignature(modelsFolder_);
+    HKEY key = nullptr;
+    if (::RegCreateKeyExW(HKEY_CURRENT_USER, kSettingsKey, 0, nullptr, 0, KEY_WRITE, nullptr, &key, nullptr) ==
+        ERROR_SUCCESS) {
+        ::RegSetValueExW(key, L"WorldFile", 0, REG_SZ, (const BYTE*)worldPath_.c_str(),
+                         (DWORD)((worldPath_.size() + 1) * sizeof(wchar_t)));
+        ::RegSetValueExA(key, "WorldSignature", 0, REG_SZ, (const BYTE*)worldSignature_.c_str(),
+                         (DWORD)(worldSignature_.size() + 1));
+        ::RegCloseKey(key);
+    }
+    worldName_ = WorldDisplayName();
+    UpdateTitle();
+}
+
+bool MainWindow::ConfirmWorldFileSaved() {
+    if (modelsFolder_.empty() || io::WorldSignature(modelsFolder_) == worldSignature_) return true;
+    if (worldPath_.empty() && !io::WorldHasFiles(modelsFolder_)) return true;   // nothing edited yet
+    const std::wstring question =
+        Format(L"The edits of \"%s\" have changed since the world file was last saved.\n\n"
+               L"Save the world file now?", WorldDisplayName().c_str());
+    const int answer = ::MessageBoxW(window_, question.c_str(), kWindowTitle, MB_ICONQUESTION | MB_YESNOCANCEL);
+    if (answer == IDCANCEL) return false;
+    if (answer == IDNO) return true;
+    if (worldPath_.empty()) {
+        SaveWorldAs();
+        return !worldPath_.empty() && io::WorldSignature(modelsFolder_) == worldSignature_;
+    }
+    return WriteWorldFile(worldPath_);
+}
+
+bool MainWindow::WriteWorldFile(const std::wstring& path) {
+    io::WorldFile file;
+    std::wstring error;
+    // Entries of its own an extension keeps survive a resave.
+    if (::GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES) file.Load(path, error);
+    size_t files = 0;
+    if (!io::PackWorld(modelsFolder_, file, files, error) || !file.Save(path, error)) {
+        ::MessageBoxW(window_, (L"The world file was not written.\n\n" + error).c_str(), kWindowTitle,
+                      MB_ICONWARNING | MB_OK);
+        return false;
+    }
+    worldPath_ = path;
+    RememberWorldFile();
+    LOG_INFO("world file %S written: %zu files", path.c_str(), files);
+    return true;
+}
+
+bool MainWindow::InstallWorldFile(const io::WorldFile& file, const std::wstring& path) {
+    const std::wstring region = world_ ? world_->Region() : std::wstring();
+    Camera& camera = viewport_.GetCamera();
+    const Vec3 position = camera.Position();
+    const float yaw = camera.Yaw(), pitch = camera.Pitch();
+    CloseRegion();
+
+    // The world that was open is moved, never deleted: models\worlds\_before-<time>.
+    SYSTEMTIME now{};
+    ::GetLocalTime(&now);
+    const std::wstring backup = modelsFolder_ + Format(L"\\worlds\\_before-%04u%02u%02u-%02u%02u%02u", now.wYear,
+                                                       now.wMonth, now.wDay, now.wHour, now.wMinute, now.wSecond);
+    ::CreateDirectoryW((modelsFolder_ + L"\\worlds").c_str(), nullptr);
+    std::wstring error;
+    size_t files = 0;
+    const bool ok = io::UnpackWorld(file, modelsFolder_, backup, files, error);
+    if (ok) {
+        worldPath_ = path;
+        RememberWorldFile();
+        LOG_INFO("world %S opened: %zu files written into models", path.empty() ? L"(new)" : path.c_str(), files);
+    }
+    if (!region.empty()) {
+        OpenRegion(region);
+        camera.SetPosition(position);
+        camera.SetYawPitch(yaw, pitch);
+    }
+    if (!ok)
+        ::MessageBoxW(window_, (L"The world could not be opened.\n\n" + error).c_str(), kWindowTitle,
+                      MB_ICONWARNING | MB_OK);
+    return ok;
+}
+
 void MainWindow::NewWorld() {
-    if (!CanSwitchWorld() || !ConfirmUnsavedPlacements()) return;
-    std::vector<std::wstring> taken = io::ListStoredWorlds(modelsFolder_);
-    taken.push_back(worldName_);
-    std::wstring name;
-    if (!AskNewWorldName(instance_, window_, taken, name)) return;
-    SwitchToWorld(name, true);
+    if (!CanSwitchWorld() || !ConfirmUnsavedPlacements() || !ConfirmWorldFileSaved()) return;
+    if (InstallWorldFile(io::WorldFile{}, L""))
+        SetStatusText(2, L"New world: the game as shipped. Save World picks where its file goes.");
 }
 
 void MainWindow::OpenWorld() {
-    if (!CanSwitchWorld()) return;
-    const std::vector<std::wstring> worlds = io::ListStoredWorlds(modelsFolder_);
-    if (worlds.empty()) {
-        ::MessageBoxW(window_,
-                      (L"\"" + worldName_ + L"\" is the only world so far. New World puts it away and starts "
-                       L"another from the game as shipped.").c_str(),
-                      kWindowTitle, MB_ICONINFORMATION | MB_OK);
+    if (!CanSwitchWorld() || !ConfirmUnsavedPlacements() || !ConfirmWorldFileSaved()) return;
+    wchar_t path[MAX_PATH * 2] = {};
+    OPENFILENAMEW dialog{ sizeof(dialog) };
+    dialog.hwndOwner = window_;
+    dialog.lpstrFilter = L"FRS worlds (*.frsworld)\0*.frsworld\0All files\0*.*\0";
+    dialog.lpstrFile = path;
+    dialog.nMaxFile = MAX_PATH * 2;
+    dialog.lpstrTitle = L"Open World";
+    dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+    if (!::GetOpenFileNameW(&dialog)) return;
+    io::WorldFile file;
+    std::wstring error;
+    if (!file.Load(path, error)) {
+        ::MessageBoxW(window_, (L"That world could not be read.\n\n" + error).c_str(), kWindowTitle,
+                      MB_ICONWARNING | MB_OK);
         return;
     }
-    if (!ConfirmUnsavedPlacements()) return;
-    std::wstring chosen;
-    if (!ChooseWorldToOpen(instance_, window_, worldName_, worlds, chosen)) return;
-    SwitchToWorld(chosen, false);
+    if (InstallWorldFile(file, path)) SetStatusText(2, Format(L"World \"%s\" opened", WorldDisplayName().c_str()));
+}
+
+void MainWindow::SaveWorldAs() {
+    if (modelsFolder_.empty()) return;
+    wchar_t path[MAX_PATH * 2] = {};
+    const std::wstring suggested = worldPath_.empty() ? L"My world.frsworld" : worldPath_;
+    wcsncpy_s(path, suggested.c_str(), _TRUNCATE);
+    OPENFILENAMEW dialog{ sizeof(dialog) };
+    dialog.hwndOwner = window_;
+    dialog.lpstrFilter = L"FRS worlds (*.frsworld)\0*.frsworld\0";
+    dialog.lpstrFile = path;
+    dialog.nMaxFile = MAX_PATH * 2;
+    dialog.lpstrDefExt = L"frsworld";
+    dialog.lpstrTitle = L"Save World As";
+    dialog.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
+    if (!::GetSaveFileNameW(&dialog)) return;
+    // Whatever is still only in the editor goes into the game files first.
+    for (auto& extension : extensions_) extension->Save();
+    if (world_ && !SavePlacements()) return;
+    if (WriteWorldFile(path)) SetStatusText(2, Format(L"World saved as %s", path));
 }
 
 void MainWindow::SwitchToWorld(const std::wstring& target, bool createNew) {
@@ -1324,7 +1444,9 @@ void MainWindow::SaveWorld() {
     // reopen the region once written.
     for (auto& extension : extensions_) extension->Save();
     if (!SavePlacements()) return;
-    SetStatusText(2, Format(L"World \"%s\" saved", worldName_.c_str()));
+    // Then the world file: the first time, wherever the person wants it.
+    if (worldPath_.empty()) { SaveWorldAs(); return; }
+    if (WriteWorldFile(worldPath_)) SetStatusText(2, Format(L"World \"%s\" saved", worldName_.c_str()));
 }
 
 void MainWindow::SaveCameraPosition() {
@@ -2128,7 +2250,24 @@ void MainWindow::SetGameFolder(const std::wstring& folder) {
     gameFolder_   = folder;
     tracksFolder_ = folder + L"\\TRACKS";
     modelsFolder_ = folder + L"\\models";
-    worldName_    = io::ActiveWorldName(modelsFolder_);
+    // The world file last opened or saved, and how <game>\models stood then.
+    {
+        wchar_t path[MAX_PATH * 2] = {};
+        char signature[64] = {};
+        DWORD size = sizeof(path);
+        if (::RegGetValueW(HKEY_CURRENT_USER, kSettingsKey, L"WorldFile", RRF_RT_REG_SZ, nullptr, path, &size) ==
+            ERROR_SUCCESS)
+            worldPath_ = path;
+        size = sizeof(signature);
+        if (::RegGetValueA(HKEY_CURRENT_USER, "Software\\FRSWorldEditor", "WorldSignature", RRF_RT_REG_SZ, nullptr,
+                           signature, &size) == ERROR_SUCCESS)
+            worldSignature_ = signature;
+        if (!worldPath_.empty() && ::GetFileAttributesW(worldPath_.c_str()) == INVALID_FILE_ATTRIBUTES) {
+            LOG_WARN("world file %S is gone; the world in models is kept as untitled", worldPath_.c_str());
+            worldPath_.clear();
+        }
+    }
+    worldName_    = WorldDisplayName();
     UpdateTitle();
 
     ::SendMessageW(regionCombo_, CB_RESETCONTENT, 0, 0);
@@ -3322,6 +3461,7 @@ bool MainWindow::SavePlacements() {
         return false;
     }
     for (const auto& section : world_->Loaded()) section->placementsChanged = false;
+    for (auto& extension : extensions_) extension->OnSaved();
 
     // Reopened so the viewport shows exactly what the game will read, from
     // the same viewpoint.

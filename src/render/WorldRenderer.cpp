@@ -386,6 +386,7 @@ bool WorldRenderer::DrawObject(IDirect3DDevice9* device, const GpuObject& object
                                        texture.blend == SurfaceBlend::Additive
                                            ? D3DBLEND_ONE : D3DBLEND_INVSRCALPHA);
             BindTextureStage(device, texture);
+            ScrollTextureStage(device, texture);
         } else if (pass == DrawPass::Translucent) {
             continue;   // the lighting-only views draw everything solid
         }
@@ -400,7 +401,33 @@ bool WorldRenderer::DrawObject(IDirect3DDevice9* device, const GpuObject& object
         stats.drawCalls++;
         stats.triangles += draw.primitiveCount;
     }
+    // Nothing drawn after this one should inherit the scroll (ImGui included).
+    if (scrolling_) ScrollTextureStage(device, CachedTexture{});
     return other;
+}
+
+// The game's texture scrolling (TextureInfo::GetScroll): the fraction of
+// time * speed, time counted in whole steps for the stepped kind.
+void WorldRenderer::ScrollTextureStage(IDirect3DDevice9* device, const CachedTexture& texture) {
+    const bool scroll = animate_ && texture.scrollType != 0;
+    if (!scroll) {
+        if (scrolling_) {
+            device->SetTextureStageState(0, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
+            scrolling_ = false;
+        }
+        return;
+    }
+    double t = animationClock_;
+    if (texture.scrollType == 2) t = std::floor(t / texture.scrollStep);
+    const auto fraction = [](double v) { return (float)(v - std::floor(v)); };
+    D3DMATRIX m{};
+    m._11 = m._22 = m._33 = m._44 = 1.0f;
+    // Two texture coordinates: the third row moves them.
+    m._31 = fraction(t * texture.scrollS);
+    m._32 = fraction(t * texture.scrollT);
+    device->SetTransform(D3DTS_TEXTURE0, &m);
+    if (!scrolling_) device->SetTextureStageState(0, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_COUNT2);
+    scrolling_ = true;
 }
 
 void WorldRenderer::QueueTranslucent(const GpuObject& object, size_t section, const Mat4& transform,

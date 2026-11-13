@@ -76,6 +76,9 @@ enum class SurfaceBlend : u8 {
 struct CachedTexture {
     IDirect3DTexture9* texture = nullptr;   // nullptr marks a known miss
     SurfaceBlend       blend   = SurfaceBlend::Opaque;
+    // Scrolling (nfs::Texture::scrollType): 0 none, 1 smooth, 2 in steps.
+    u8    scrollType = 0;
+    float scrollStep = 1.0f, scrollS = 0.0f, scrollT = 0.0f;
 
     bool Translucent() const { return blend == SurfaceBlend::Blend || blend == SurfaceBlend::Additive; }
 };

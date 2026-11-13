@@ -85,6 +85,24 @@ struct PolygonRef {
     }
 };
 
+// One change kept, as the polygons it took out of and put into each pack.
+// Packs are named by section and their place among the section's packs, so
+// an entry outlives the session that made it.
+struct PackDelta {
+    std::string section;
+    u32 pack = 0;
+    std::vector<nfs::CollisionPolygon> removed, added;
+};
+struct LogEntry {
+    std::wstring label;
+    std::vector<PackDelta> packs;
+    size_t Polygons() const;
+};
+
+// The log as a text file (models\collision-<REGION>.txt).
+bool SaveLog(const std::wstring& path, const std::vector<LogEntry>& log);
+bool LoadLog(const std::wstring& path, std::vector<LogEntry>& log);
+
 class Editor {
 public:
     // Forgets the undo history: its indices belong to the world it was made in.
@@ -135,10 +153,21 @@ public:
     u64 StepsRecorded() const { return recorded_; }
     u64 StepsUndone() const { return undone_; }
 
+    // Every change kept since the shipped collision, one entry per step --
+    // the Edits tab's collision rows. Reading it closes the step in progress.
+    const std::vector<LogEntry>& Log();
+    void SetLog(std::vector<LogEntry> log) { log_ = std::move(log); openStep_ = false; }
+    // Steps that change the collision without an entry: a tool keeping its
+    // own record of what it made (the roads' bake) turns this off around it.
+    void SetLogging(bool on) { FinishOpenStep(); logging_ = on; }
+    // Takes entries back: each pack they touched is rebuilt from the shipped
+    // pack with every other entry replayed in order. Clears the undo history.
+    size_t RevertLog(const std::vector<size_t>& entries, std::wstring& summary);
+
     bool CanUndo() const { return !undo_.empty(); }
     std::wstring UndoLabel() const { return undo_.empty() ? std::wstring() : undo_.back().label; }
     bool Undo();
-    void ClearHistory() { undo_.clear(); }
+    void ClearHistory() { FinishOpenStep(); undo_.clear(); }
 
     // The loaded sections whose collision changed since the last call, so the
     // caller can redraw them.
@@ -154,7 +183,13 @@ private:
     struct Step {
         std::wstring label;
         std::vector<PackState> packs;
+        long logIndex = -1;     // its entry in log_, once closed
+        bool logged = true;
     };
+    void FinishOpenStep();
+    std::vector<LogEntry> log_;
+    bool openStep_ = false;     // undo_.back() still changing, not in the log yet
+    bool logging_ = true;
 
     nfs::CollisionPack* Pack(u32 section, u32 pack) const;
     // Records the packs about to change as one undo step.

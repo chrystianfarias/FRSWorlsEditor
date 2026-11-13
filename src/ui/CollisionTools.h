@@ -69,6 +69,13 @@ public:
     bool FillProperties(PropertiesPanel::View& view) override;
     bool ApplyProperties() override;
     bool DeleteSelection() override;
+    void OnSaved() override;
+    void EditRows(std::vector<EditsPanel::ExtraRow>& rows) override;
+    void RevertRows(const std::vector<size_t>& indices) override;
+
+    // The collision log has a change in this section (the Edits tab lists
+    // those one by one).
+    bool LogCovers(const std::string& section);
     void Tick(float deltaSeconds) override;
 
     // ---- UndoParticipant (ui/UndoRegistry.h): collision and placements
@@ -90,6 +97,7 @@ private:
     void Status(const std::wstring& text) const { if (host_.status) host_.status(text); }
 
     void BuildMenu();
+    std::wstring LogPath() const;
     void ExtendAccelerators();
 
     // Collision for the selected objects, from their meshes.

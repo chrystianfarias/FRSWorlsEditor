@@ -268,6 +268,18 @@ public:
 
     // Junctions made into the game's own roads.
     const std::vector<GameJunction>& GameJunctions() const { return gameJunctions_; }
+    // Takes out a junction made into a game road (the road stays the game's
+    // there again), or a stretch cut out of one.
+    void RemoveGameJunction(size_t index) {
+        if (index < gameJunctions_.size()) gameJunctions_.erase(gameJunctions_.begin() + (ptrdiff_t)index);
+        SetDirty();
+    }
+    void RemoveCut(size_t index) {
+        if (index < cuts_.size()) cuts_.erase(cuts_.begin() + (ptrdiff_t)index);
+        SetDirty();
+    }
+    const std::vector<GameCut>& StoredCuts() const { return cuts_; }
+
     // The junction whose mouth `node` is, or null.
     const GameJunction* FindGameJunction(u32 node) const {
         for (const GameJunction& j : gameJunctions_)

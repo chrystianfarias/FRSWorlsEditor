@@ -76,6 +76,7 @@ public:
     bool FillProperties(PropertiesPanel::View& view) override;
     bool DeleteSelection() override;
     bool MoveSelectionToView() override;
+    void Tick(float deltaSeconds) override;   // diagnostics only (FRS_ANIM_REPORT)
 
     // ---- ViewportTool
     bool MouseDown(int x, int y, WPARAM keys) override;

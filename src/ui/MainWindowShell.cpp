@@ -538,9 +538,11 @@ void MainWindow::DrawViewModes() {
                     editing ? "Back to objects: the mesh edit is written (Tab)" : "Select, move, turn and place objects"))
             if (editing) ::PostMessageW(window_, WM_COMMAND, MAKEWPARAM(MeshTools::kFinishCommand, 0), 0);
         ImGui::SameLine();
-        if (segment(ICON_PH_PENCIL_SIMPLE "  Edit Mode", editing, editing || oneObject,
+        const bool collisionPicked = !viewport_.GetRenderer().CollisionSelection().empty();
+        if (segment(ICON_PH_PENCIL_SIMPLE "  Edit Mode", editing, editing || oneObject || collisionPicked,
                     oneObject || editing ? "Edit the selected object's vertices, edges and faces (Tab)"
-                                         : "Select one object first"))
+                    : collisionPicked    ? "Edit the picked collision's vertices, edges and faces (Tab)"
+                                         : "Select one object or collision polygons first"))
             if (!editing) ::PostMessageW(window_, WM_COMMAND, MAKEWPARAM(MeshTools::kEditCommand, 0), 0);
 
         if (editing) {

@@ -8,7 +8,7 @@
 #include <string>
 #include <vector>
 
-namespace nfs { class World; struct Section; }
+namespace nfs { class World; struct Section; struct CollisionPack; }
 
 // The edits in force on a section, one by one.
 //
@@ -92,6 +92,11 @@ bool PlanSectionFromEdits(const nfs::World& world, const nfs::Section& section,
 // top-level chunk `id`. False when the section shipped without one.
 bool ShippedChunkData(const nfs::World& world, const nfs::Section& section, u32 id,
                       std::vector<u8>& data);
+
+// The section's collision packs as the game shipped them, in the order the
+// loader lists them (LoadedSection::collision).
+bool ShippedCollisionPacks(const nfs::World& world, const nfs::Section& section,
+                           std::vector<nfs::CollisionPack>& packs);
 
 // A zero-id chunk that brings the next write to `wanted` modulo 128.
 void PadToModulo(std::vector<u8>& out, u64 base, u64 wanted);

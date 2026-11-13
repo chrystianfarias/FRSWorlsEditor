@@ -230,6 +230,10 @@ const CachedTexture& TextureCache::Get(IDirect3DDevice9* device, u32 hash) {
     if (source) {
         created.texture = Create(device, *source);
         created.blend   = BlendOf(*source);
+        created.scrollType = source->scrollType;
+        created.scrollStep = source->scrollStep;
+        created.scrollS    = source->scrollS;
+        created.scrollT    = source->scrollT;
     }
     return textures_.emplace(hash, created).first->second;
 }

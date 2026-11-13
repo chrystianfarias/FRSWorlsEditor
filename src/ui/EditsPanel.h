@@ -43,6 +43,9 @@ public:
     // The list itself, for a frame that draws it (ui/MainWindowShell.cpp).
     HWND ListHandle() const { return list_; }
     std::function<void(const void* owner, const std::vector<size_t>& indices)> onRevertExtra;
+    // A section whose collision changes an extension lists itself, one row
+    // per change: its whole-pack "Collision edited" rows are left out.
+    std::function<bool(const std::string& section)> collisionLogged;
 
     // Asks, then reverts the ticked rows. True when something was reverted,
     // so the caller reloads the region; `summary` says what happened.

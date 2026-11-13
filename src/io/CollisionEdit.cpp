@@ -1,6 +1,9 @@
+#include <windows.h>
+
 #include "io/CollisionEdit.h"
 
 #include "core/Log.h"
+#include "io/SectionEdits.h"
 #include "nfs/ChunkReader.h"
 #include "nfs/World.h"
 
@@ -247,6 +250,8 @@ void AppendStrip(const std::vector<Vec3>& left, const std::vector<Vec3>& right, 
 void Editor::SetWorld(nfs::World* world) {
     world_ = world;
     undo_.clear();
+    log_.clear();
+    openStep_ = false;
     touched_.clear();
     moving_ = false;
     moveRefs_.clear();
@@ -263,8 +268,10 @@ nfs::CollisionPack* Editor::Pack(u32 section, u32 pack) const {
 void Editor::Remember(const std::wstring& label, std::vector<std::pair<u32, u32>> packs) {
     std::sort(packs.begin(), packs.end());
     packs.erase(std::unique(packs.begin(), packs.end()), packs.end());
+    FinishOpenStep();
     Step step;
     step.label = label;
+    step.logged = logging_;
     for (const auto& [section, pack] : packs) {
         const nfs::CollisionPack* data = Pack(section, pack);
         if (!data) continue;
@@ -272,6 +279,7 @@ void Editor::Remember(const std::wstring& label, std::vector<std::pair<u32, u32>
         step.packs.push_back({ section, pack, *data, loaded.collisionChanged, loaded.changedCollisionPacks });
     }
     undo_.push_back(std::move(step));
+    openStep_ = true;
     ++recorded_;
     // Packs are a few hundred kilobytes at most; fifty steps is plenty.
     if (undo_.size() > 50) undo_.erase(undo_.begin());
@@ -294,9 +302,17 @@ std::vector<u32> Editor::TakeTouchedSections() {
 bool Editor::Undo() {
     if (undo_.empty() || !world_) return false;
     if (moving_) EndMove(false);
+    const bool wasOpen = openStep_;
+    openStep_ = false;
     Step step = std::move(undo_.back());
     undo_.pop_back();
     ++undone_;
+    // Its entry goes with it.
+    if (!wasOpen && step.logIndex >= 0 && (size_t)step.logIndex < log_.size()) {
+        log_.erase(log_.begin() + step.logIndex);
+        for (Step& other : undo_)
+            if (other.logIndex > step.logIndex) --other.logIndex;
+    }
     for (PackState& state : step.packs) {
         nfs::CollisionPack* pack = Pack(state.section, state.pack);
         nfs::LoadedSection* loaded = world_->MutableLoaded(state.section);
@@ -566,6 +582,212 @@ void Editor::UpdateMove(const Vec3& offset) {
         if (std::find(touched_.begin(), touched_.end(), ref.section) == touched_.end())
             touched_.push_back(ref.section);
     }
+}
+
+namespace {
+
+std::string PolygonKey(const nfs::CollisionPolygon& p) {
+    std::string key((const char*)p.corners, sizeof(p.corners));
+    key.append((const char*)p.attributes, 4);
+    key += p.quad ? 'q' : 't';
+    key += p.barrier ? 'b' : 'g';
+    return key;
+}
+
+// Same polygon, give or take the fixed point a save rounds it to.
+bool Matches(const nfs::CollisionPolygon& a, const nfs::CollisionPolygon& b) {
+    if (a.quad != b.quad || a.barrier != b.barrier || a.attributes[0] != b.attributes[0] ||
+        a.attributes[2] != b.attributes[2] || a.attributes[3] != b.attributes[3])
+        return false;
+    for (int c = 0; c < 4; ++c) {
+        const Vec3 d = a.corners[c] - b.corners[c];
+        if (std::fabs(d.x) > 0.05f || std::fabs(d.y) > 0.05f || (!a.barrier && std::fabs(d.z) > 0.05f)) return false;
+    }
+    return true;
+}
+
+void Apply(const PackDelta& delta, std::vector<nfs::CollisionPolygon>& polygons) {
+    for (const nfs::CollisionPolygon& gone : delta.removed)
+        for (size_t i = 0; i < polygons.size(); ++i)
+            if (Matches(polygons[i], gone)) { polygons.erase(polygons.begin() + (long long)i); break; }
+    polygons.insert(polygons.end(), delta.added.begin(), delta.added.end());
+}
+
+} // namespace
+
+size_t LogEntry::Polygons() const {
+    size_t n = 0;
+    for (const PackDelta& d : packs) n += d.removed.size() + d.added.size();
+    return n;
+}
+
+void Editor::FinishOpenStep() {
+    if (!openStep_ || moving_ || undo_.empty() || !world_) return;
+    openStep_ = false;
+    Step& step = undo_.back();
+    if (!step.logged) return;
+    LogEntry entry;
+    entry.label = step.label;
+    for (const PackState& state : step.packs) {
+        const nfs::CollisionPack* now = Pack(state.section, state.pack);
+        const nfs::LoadedSection* loaded = world_->Loaded()[state.section].get();
+        if (!now || !loaded->info) continue;
+        PackDelta delta;
+        delta.section = loaded->info->name;
+        delta.pack = state.pack;
+        std::unordered_map<std::string, int> before;
+        for (const nfs::CollisionPolygon& p : state.data.polygons) ++before[PolygonKey(p)];
+        for (const nfs::CollisionPolygon& p : now->polygons) {
+            auto found = before.find(PolygonKey(p));
+            if (found != before.end() && found->second > 0) --found->second;
+            else delta.added.push_back(p);
+        }
+        for (const nfs::CollisionPolygon& p : state.data.polygons) {
+            auto found = before.find(PolygonKey(p));
+            if (found != before.end() && found->second > 0) { --found->second; delta.removed.push_back(p); }
+        }
+        if (!delta.added.empty() || !delta.removed.empty()) entry.packs.push_back(std::move(delta));
+    }
+    if (entry.packs.empty()) return;
+    step.logIndex = (long)log_.size();
+    log_.push_back(std::move(entry));
+}
+
+const std::vector<LogEntry>& Editor::Log() {
+    FinishOpenStep();
+    return log_;
+}
+
+size_t Editor::RevertLog(const std::vector<size_t>& entries, std::wstring& summary) {
+    FinishOpenStep();
+    if (!world_) return 0;
+    std::set<size_t> going(entries.begin(), entries.end());
+    std::set<std::pair<std::string, u32>> packs;
+    for (size_t e : going)
+        if (e < log_.size())
+            for (const PackDelta& d : log_[e].packs) packs.insert({ d.section, d.pack });
+    size_t rebuilt = 0;
+    for (const auto& [name, index] : packs) {
+        u32 section = 0;
+        bool found = false;
+        for (; section < (u32)world_->Loaded().size(); ++section) {
+            const auto& loaded = world_->Loaded()[section];
+            if (loaded->info && loaded->info->name == name) { found = true; break; }
+        }
+        nfs::CollisionPack* pack = found ? Pack(section, index) : nullptr;
+        std::vector<nfs::CollisionPack> shipped;
+        if (!pack || !ShippedCollisionPacks(*world_, *world_->Loaded()[section]->info, shipped)) {
+            summary += L"Section " + std::wstring(name.begin(), name.end()) + L" is not loaded; left as it is.\n";
+            continue;
+        }
+        // What the log explains, and what it does not -- changes made with
+        // the log off (the roads' bake) or before it existed -- kept apart,
+        // so taking entries back leaves the rest alone.
+        const std::vector<nfs::CollisionPolygon> base =
+            index < shipped.size() ? shipped[index].polygons : std::vector<nfs::CollisionPolygon>{};
+        std::vector<nfs::CollisionPolygon> all = base, kept = base;
+        for (size_t e = 0; e < log_.size(); ++e)
+            for (const PackDelta& d : log_[e].packs) {
+                if (d.section != name || d.pack != index) continue;
+                Apply(d, all);
+                if (!going.count(e)) Apply(d, kept);
+            }
+        std::vector<nfs::CollisionPolygon> extra = pack->polygons;   // in the pack, not explained
+        std::vector<nfs::CollisionPolygon> missing;                  // explained, not in the pack
+        for (const nfs::CollisionPolygon& p : all) {
+            bool found = false;
+            for (size_t i = 0; i < extra.size(); ++i)
+                if (Matches(extra[i], p)) { extra.erase(extra.begin() + (long long)i); found = true; break; }
+            if (!found) missing.push_back(p);
+        }
+        PackDelta outside;
+        outside.removed = std::move(missing);
+        outside.added = std::move(extra);
+        Apply(outside, kept);
+        pack->polygons = std::move(kept);
+        Changed(section, index);
+        ++rebuilt;
+    }
+    size_t removed = 0;
+    for (auto it = going.rbegin(); it != going.rend(); ++it)
+        if (*it < log_.size()) { log_.erase(log_.begin() + (long long)*it); ++removed; }
+    undo_.clear();
+    summary += std::to_wstring(removed) + L" collision edit(s) taken back, " + std::to_wstring(rebuilt) +
+               L" pack(s) rebuilt from the game's own.\n";
+    LOG_INFO("collision: %zu log entries reverted, %zu packs rebuilt", removed, rebuilt);
+    return removed;
+}
+
+bool SaveLog(const std::wstring& path, const std::vector<LogEntry>& log) {
+    if (log.empty()) { ::DeleteFileW(path.c_str()); return true; }
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, path.c_str(), L"wb") != 0 || !f) return false;
+    std::fprintf(f, "FRS collision log 1\n");
+    const auto polygon = [f](char sign, const nfs::CollisionPolygon& p) {
+        std::fprintf(f, "%c %u %u %u %u %d %d", sign, p.attributes[0], p.attributes[1], p.attributes[2],
+                     p.attributes[3], p.quad ? 1 : 0, p.barrier ? 1 : 0);
+        for (const Vec3& c : p.corners) std::fprintf(f, " %.4f %.4f %.4f", c.x, c.y, c.z);
+        std::fprintf(f, "\n");
+    };
+    for (const LogEntry& entry : log) {
+        const int size = ::WideCharToMultiByte(CP_UTF8, 0, entry.label.c_str(), (int)entry.label.size(), nullptr, 0,
+                                               nullptr, nullptr);
+        std::string label((size_t)std::max(size, 0), '\0');
+        ::WideCharToMultiByte(CP_UTF8, 0, entry.label.c_str(), (int)entry.label.size(), label.data(), size, nullptr,
+                              nullptr);
+        std::fprintf(f, "entry %s\n", label.c_str());
+        for (const PackDelta& d : entry.packs) {
+            std::fprintf(f, "pack %s %u\n", d.section.c_str(), d.pack);
+            for (const auto& p : d.removed) polygon('-', p);
+            for (const auto& p : d.added) polygon('+', p);
+        }
+    }
+    std::fclose(f);
+    return true;
+}
+
+bool LoadLog(const std::wstring& path, std::vector<LogEntry>& log) {
+    log.clear();
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, path.c_str(), L"rb") != 0 || !f) return false;
+    char line[1024];
+    PackDelta* pack = nullptr;
+    while (std::fgets(line, sizeof(line), f)) {
+        std::string text = line;
+        while (!text.empty() && (text.back() == '\n' || text.back() == '\r')) text.pop_back();
+        if (text.rfind("entry ", 0) == 0) {
+            LogEntry entry;
+            const std::string label = text.substr(6);
+            const int size = ::MultiByteToWideChar(CP_UTF8, 0, label.c_str(), (int)label.size(), nullptr, 0);
+            entry.label.assign((size_t)std::max(size, 0), L'\0');
+            ::MultiByteToWideChar(CP_UTF8, 0, label.c_str(), (int)label.size(), entry.label.data(), size);
+            log.push_back(std::move(entry));
+            pack = nullptr;
+        } else if (text.rfind("pack ", 0) == 0 && !log.empty()) {
+            char name[64] = {};
+            unsigned index = 0;
+            if (std::sscanf(text.c_str() + 5, "%63s %u", name, &index) != 2) continue;
+            log.back().packs.push_back({ name, index, {}, {} });
+            pack = &log.back().packs.back();
+        } else if ((text[0] == '-' || text[0] == '+') && pack) {
+            nfs::CollisionPolygon p;
+            unsigned a[4] = {};
+            int quad = 0, barrier = 0;
+            float v[12] = {};
+            if (std::sscanf(text.c_str() + 1, "%u %u %u %u %d %d %f %f %f %f %f %f %f %f %f %f %f %f", &a[0], &a[1],
+                            &a[2], &a[3], &quad, &barrier, &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7],
+                            &v[8], &v[9], &v[10], &v[11]) != 18)
+                continue;
+            for (int k = 0; k < 4; ++k) p.attributes[k] = (u8)a[k];
+            p.SyncFromAttributes();
+            p.quad = quad != 0;
+            p.barrier = barrier != 0;
+            for (int c = 0; c < 4; ++c) p.corners[c] = { v[3 * c], v[3 * c + 1], v[3 * c + 2] };
+            (text[0] == '-' ? pack->removed : pack->added).push_back(p);
+        }
+    }
+    std::fclose(f);
+    return true;
 }
 
 bool Editor::BeginReshape(const std::vector<PolygonRef>& refs) {

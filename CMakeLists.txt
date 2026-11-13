@@ -29,6 +29,7 @@ add_executable(FRSWorldEditor WIN32
     src/io/TextureImport.cpp
     src/io/TpkBuild.cpp
     src/io/WorldProfiles.cpp
+    src/io/WorldFile.cpp
     src/io/SelectionExport.cpp
     src/io/SelectionImport.cpp
     src/nfs/ChunkReader.cpp

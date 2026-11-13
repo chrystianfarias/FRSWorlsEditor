@@ -357,6 +357,14 @@ void CollisionTools::OnRegionLoaded() {
     StopTool();
     moving_ = false;
     editor_.SetWorld(World());
+    // Every collision change kept so far, one by one (models\collision-<REGION>.txt).
+    if (World()) {
+        std::vector<collision::LogEntry> log;
+        if (collision::LoadLog(LogPath(), log)) {
+            LOG_INFO("collision log: %zu changes", log.size());
+            editor_.SetLog(std::move(log));
+        }
+    }
     // A check of the whole edit path, run on the loaded region without
     // writing anything: set FRS_COLLISION_TOOLS_SELFTEST=1 before starting.
     static const bool selfTest = std::getenv("FRS_COLLISION_TOOLS_SELFTEST") != nullptr;
@@ -366,6 +374,61 @@ void CollisionTools::OnRegionLoaded() {
         for (size_t i = 0; i < World()->Loaded().size(); ++i) Renderer().RefreshCollision(i);
     }
     ResetHistory();
+}
+
+std::wstring CollisionTools::LogPath() const {
+    nfs::World* world = World();
+    if (!world || world->OverlayFolder().empty()) return L"";
+    return world->OverlayFolder() + L"\\collision-" + world->Region() + L".txt";
+}
+
+void CollisionTools::OnSaved() {
+    const std::wstring path = LogPath();
+    if (path.empty()) return;
+    if (!collision::SaveLog(path, editor_.Log())) LOG_WARN("collision log could not be written to %S", path.c_str());
+}
+
+bool CollisionTools::LogCovers(const std::string& section) {
+    for (const collision::LogEntry& entry : editor_.Log())
+        for (const collision::PackDelta& delta : entry.packs)
+            if (delta.section == section) return true;
+    return false;
+}
+
+void CollisionTools::EditRows(std::vector<EditsPanel::ExtraRow>& rows) {
+    const auto& log = editor_.Log();
+    for (size_t i = 0; i < log.size(); ++i) {
+        std::set<std::string> sections;
+        size_t added = 0, removed = 0;
+        for (const collision::PackDelta& delta : log[i].packs) {
+            sections.insert(delta.section);
+            added += delta.added.size();
+            removed += delta.removed.size();
+        }
+        std::wstring where;
+        for (const std::string& s : sections) where += (where.empty() ? L"" : L" ") + std::wstring(s.begin(), s.end());
+        EditsPanel::ExtraRow row;
+        row.owner = this;
+        row.index = i;
+        row.kind = L"Collision";
+        row.what = log[i].label;
+        row.detail = std::to_wstring(added) + L" polygons added, " + std::to_wstring(removed) + L" taken out, in " + where;
+        rows.push_back(std::move(row));
+    }
+}
+
+void CollisionTools::RevertRows(const std::vector<size_t>& indices) {
+    if (indices.empty()) return;
+    std::wstring summary;
+    if (!editor_.RevertLog(indices, summary)) {
+        Status(L"No collision change was taken back. " + summary);
+        return;
+    }
+    RefreshAfterEdit();
+    ResetHistory();
+    Status(summary);
+    // Written straight away, as every other revert in the Edits tab is.
+    if (host_.window) ::PostMessageW(host_.window, WM_COMMAND, MAKEWPARAM(ID_OBJECT_SAVE, 0), 0);
 }
 
 void CollisionTools::OnRegionClosed() {

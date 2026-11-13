@@ -15,6 +15,7 @@ BEGIN
         MENUITEM "&New World...",                  ID_WORLD_NEW
         MENUITEM "&Open World...",                 ID_WORLD_OPEN
         MENUITEM "&Save World\tCtrl+S",           ID_WORLD_SAVE
+        MENUITEM "Save World &As...",              ID_WORLD_SAVE_AS
         MENUITEM SEPARATOR
         MENUITEM "&Game Folder and Plugins...\tCtrl+O", ID_FILE_OPEN_GAME
         MENUITEM "Choose &Blender...",             ID_FILE_BLENDER

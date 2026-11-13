@@ -526,6 +526,20 @@ bool ShippedChunkData(const nfs::World& world, const nfs::Section& section, u32 
     return false;
 }
 
+bool ShippedCollisionPacks(const nfs::World& world, const nfs::Section& section,
+                           std::vector<nfs::CollisionPack>& packs) {
+    packs.clear();
+    const ByteSpan stream = world.StreamBytes();
+    if (section.originalStreamOffset + (u64)section.originalStreamSize > stream.size) return false;
+    const ByteSpan original = stream.sub(section.originalStreamOffset, section.originalStreamSize);
+    for (const TopChunk& top : TopChunks(original, section.originalStreamOffset)) {
+        if (top.id != nfs::kChunkCollisionPack) continue;
+        nfs::CollisionPack pack;
+        if (nfs::ParseCollision(top.chunk, pack)) packs.push_back(std::move(pack));
+    }
+    return true;
+}
+
 bool PlanSectionFromEdits(const nfs::World& world, const nfs::Section& section,
                           const std::vector<SectionEdit>& edits,
                           const std::vector<SpanOverlayInfo>& existing,

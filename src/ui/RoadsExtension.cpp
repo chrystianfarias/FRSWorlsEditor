@@ -554,6 +554,109 @@ public:
         modelsByName_.clear();
     }
 
+    // ---- the Edits tab
+    //
+    // Every source item of the roads and the terrain is a row there: each
+    // road, each junction made into a game road, each stretch cut out of one,
+    // each terrain patch, the ground sculpting not yet baked -- and, once
+    // baked, what the game holds of them. Reverting an item takes it out of
+    // the source and, when the roads are baked, bakes again, so its models,
+    // street lights, collision and routes leave the game with it. Reverting
+    // the baked row takes everything baked out of the game.
+
+    enum class EditKind : size_t { Segment = 1, GameJunction, Cut, Patch, Ground, Baked };
+    static size_t EditIndex(EditKind kind, size_t i) { return ((size_t)kind << 24) | (i & 0xFFFFFF); }
+
+    size_t BakedModels() const {
+        size_t count = 0;
+        if (const nfs::World* world = app_.World())
+            for (const nfs::SolidObject* model : world->AllModels()) count += model && roads::IsBakedRoadModel(model->name);
+        return count;
+    }
+
+    void EditRows(std::vector<EditsPanel::ExtraRow>& rows) override {
+        const auto add = [&](EditKind kind, size_t i, std::wstring what, std::wstring detail, const wchar_t* label) {
+            EditsPanel::ExtraRow row;
+            row.owner = static_cast<EditorExtension*>(this);
+            row.index = EditIndex(kind, i);
+            row.kind = label;
+            row.what = std::move(what);
+            row.detail = std::move(detail);
+            rows.push_back(std::move(row));
+        };
+        const size_t baked = BakedModels();
+        const wchar_t* state = baked ? L"" : L"  (not baked)";
+        const auto& segments = network_.Segments();
+        for (size_t i = 0; i < segments.size(); ++i) {
+            const roads::Segment& sgm = segments[i];
+            add(EditKind::Segment, i, Fmt(L"Road %u", sgm.id),
+                Fmt(L"%d+%d lanes, %.0f long%s%s%s", sgm.profile.lanesForward, sgm.profile.lanesBackward,
+                    SegmentLength(sgm), sgm.profile.bridge ? L", bridge" : L"",
+                    sgm.profile.keepGround ? L", over a game road" : L"", state),
+                L"Road");
+        }
+        const auto& junctions = network_.GameJunctions();
+        for (size_t i = 0; i < junctions.size(); ++i)
+            add(EditKind::GameJunction, i, Fmt(L"Junction at %.0f, %.0f", junctions[i].centre.x, junctions[i].centre.y),
+                Fmt(L"into the game's road, %.1f wide%s", junctions[i].halfRoad * 2.0f, state), L"Road junction");
+        const auto& cuts = network_.StoredCuts();
+        for (size_t i = 0; i < cuts.size(); ++i)
+            add(EditKind::Cut, i, Fmt(L"Cut at %.0f, %.0f", cuts[i].centre.x, cuts[i].centre.y),
+                Fmt(L"%.0f of the game's road replaced%s", cuts[i].halfLength * 2.0f, state), L"Road cut");
+        const auto& patches = terrain_.Patches();
+        for (size_t i = 0; i < patches.size(); ++i)
+            add(EditKind::Patch, i, Fmt(L"Terrain %u", patches[i].id),
+                Fmt(L"%d x %d cells of %.1f%s", patches[i].columns, patches[i].rows, patches[i].cell, state), L"Terrain");
+        if (!ground_.Empty()) add(EditKind::Ground, 0, L"Game ground sculpting", L"not baked yet", L"Terrain");
+        if (baked)
+            add(EditKind::Baked, 0, Fmt(L"%zu road and terrain models", baked),
+                L"in the game, with their street lights, collision and routes", L"Roads baked");
+    }
+
+    void RevertRows(const std::vector<size_t>& chosen) override {
+        // From the last of each kind, so the indices before stay true.
+        std::vector<size_t> indices = chosen;
+        std::sort(indices.begin(), indices.end());
+        indices.erase(std::unique(indices.begin(), indices.end()), indices.end());
+        bool unbake = false, changed = false;
+        std::vector<u32> segments, patches;
+        for (auto it = indices.rbegin(); it != indices.rend(); ++it) {
+            const EditKind kind = (EditKind)(*it >> 24);
+            const size_t i = *it & 0xFFFFFF;
+            switch (kind) {
+                case EditKind::Segment:
+                    if (i < network_.Segments().size()) segments.push_back(network_.Segments()[i].id);
+                    break;
+                case EditKind::GameJunction: network_.RemoveGameJunction(i); changed = true; break;
+                case EditKind::Cut:          network_.RemoveCut(i); changed = true; break;
+                case EditKind::Patch:
+                    if (i < terrain_.Patches().size()) patches.push_back(terrain_.Patches()[i].id);
+                    break;
+                case EditKind::Ground:       ground_.Clear(); changed = true; break;
+                case EditKind::Baked:        unbake = true; break;
+            }
+        }
+        for (u32 id : segments) network_.RemoveSegment(id);
+        for (u32 id : patches) terrain_.Remove(id);
+        changed |= !segments.empty() || !patches.empty();
+        app_.Renderer().ClearSelection();
+        if (changed) {
+            terrainBatches_.clear();
+            SaveTerrain();
+            SaveGround();
+            RefreshGround(nullptr);
+            Changed(true);          // saves the network and records the step
+        }
+        if (unbake) {
+            Unbake();
+        } else if (changed && BakedModels()) {
+            // What the game holds follows the source: bake again.
+            app_.Status(L"Reverted -- baking again so the game follows");
+            Bake();
+        }
+        app_.Edits().RefreshExtra();
+    }
+
     void Save() override {
         SaveNetwork();
         SaveTerrain();
@@ -1209,6 +1312,7 @@ private:
         if (save) {
             SaveNetwork();
             Commit(L"road edit");
+            app_.Edits().RefreshExtra();
         }
         const int selected = Selected();
         app_.RebuildTree();
@@ -3433,6 +3537,16 @@ bool RoadsExtension::BakePoles(const std::vector<roads::Pole>& poles, size_t& ad
     return true;
 }
 
+namespace {
+struct UnloggedCollision {
+    collision::Editor& editor;
+    explicit UnloggedCollision(collision::Editor& e) : editor(e) { editor.SetLogging(false); }
+    ~UnloggedCollision() { editor.SetLogging(true); }
+    UnloggedCollision(const UnloggedCollision&) = delete;
+    UnloggedCollision& operator=(const UnloggedCollision&) = delete;
+};
+} // namespace
+
 // The ground's collision follows the ground: every polygon of it with a
 // corner the offsets or the road fitting move is replaced by a moved copy,
 // and inside a cut of the game's roads it is taken out -- cut on the cut's
@@ -3448,6 +3562,9 @@ bool RoadsExtension::BakeGroundCollision(size_t& moved) {
     if (ground_.Empty() && !(fitGround_ && !groundField_.Empty()) && cuts.empty()) return true;
     collision::Editor& editor = tools->Editor();
     if (editor.World() != world) editor.SetWorld(world);
+    // The bake's polygons are the roads' own edit (the "Roads baked" row),
+    // kept out of the collision change log so they are not listed twice.
+    const UnloggedCollision unlogged(editor);
 
     const auto ours = [&](const nfs::CollisionPolygon& p) {
         for (const nfs::CollisionPolygon& r : roadCollision_) {
@@ -3780,6 +3897,9 @@ bool RoadsExtension::BakeCollision(const std::vector<roads::MeshPiece>& pieces, 
     if (!world || !tools) return false;
     collision::Editor& editor = tools->Editor();
     if (editor.World() != world) editor.SetWorld(world);
+    // The bake's polygons are the roads' own edit (the "Roads baked" row),
+    // kept out of the collision change log so they are not listed twice.
+    const UnloggedCollision unlogged(editor);
 
     // What the last bake put in comes out first.
     std::vector<RecordedPolygon> old;

@@ -17,6 +17,7 @@
 #define ID_WORLD_NEW           40104
 #define ID_WORLD_OPEN          40105
 #define ID_WORLD_SAVE          40106
+#define ID_WORLD_SAVE_AS       40107
 
 // View
 #define ID_VIEW_TEXTURED       40201

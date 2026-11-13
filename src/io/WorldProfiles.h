@@ -16,6 +16,8 @@ std::wstring ActiveWorldName(const std::wstring& modelsFolder);
 // A file in <game>\models that belongs to every world, so switching worlds
 // leaves it where it is: for what extensions keep there.
 void AddSharedWorldFile(const std::wstring& name);
+// Whether a name at the top of <game>\models is shared rather than the world's.
+bool IsSharedWorldFile(const wchar_t* name);
 
 // The worlds put away, by name, sorted.
 std::vector<std::wstring> ListStoredWorlds(const std::wstring& modelsFolder);

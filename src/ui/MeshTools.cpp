@@ -11,6 +11,7 @@
 #include "render/Gizmo.h"
 #include "ui/CollisionTools.h"
 #include "ui/CrashReport.h"
+#include "io/WorldFile.h"
 #include "ui/Resource.h"
 
 #include <algorithm>
@@ -630,12 +631,106 @@ bool MeshTools::FillProperties(PropertiesPanel::View& view) {
     return true;
 }
 
+void MeshTools::Tick(float deltaSeconds) {
+    static float clock = 0.0f;
+    static bool reported = false;
+    clock += deltaSeconds;
+    nfs::World* world = World();
+    if (reported || clock < 25.0f || !world || !std::getenv("FRS_ANIM_REPORT")) return;
+    reported = true;
+    // FRS_ANIM_REPORT=1: each texture animation, its frames, and the models
+    // whose materials name one of them; also every texture called *WATER*.
+    {
+        for (const auto& [key, animation] : world->TextureAnimations()) {
+            std::string frames;
+            for (u32 frame : animation.frames) {
+                const nfs::Texture* t = world->FindDisplayTexture(frame);
+                char item[96];
+                std::snprintf(item, sizeof(item), "%08X=%s ", frame, t ? t->name.c_str() : "?");
+                frames += item;
+            }
+            LOG_INFO("anim report: %s key %08X fps %.0f frames %s", animation.name.c_str(), key, animation.fps,
+                     frames.c_str());
+            std::map<std::string, std::string> users;
+            for (const auto& section : world->Loaded())
+                for (const auto& list : section->solidLists)
+                    for (const auto& object : list.objects)
+                        for (u32 hash : object.textureHashes) {
+                            if (hash == key) users[object.name] += "key ";
+                            else if (std::find(animation.frames.begin(), animation.frames.end(), hash) !=
+                                     animation.frames.end())
+                                users[object.name] += "frame ";
+                        }
+            for (const auto& [name, how] : users)
+                LOG_INFO("anim report:   used by %s (%s)", name.c_str(), how.c_str());
+        }
+        std::set<std::string> waters;
+        for (const auto& section : world->Loaded())
+            for (const auto& pack : section->texturePacks)
+                for (const nfs::Texture& t : pack->Textures())
+                    if (t.name.find("WATER") != std::string::npos) {
+                        char item[96];
+                        std::snprintf(item, sizeof(item), "%s %08X", t.name.c_str(), t.hash);
+                        waters.insert(item);
+                    }
+        for (const std::string& w : waters) LOG_INFO("anim report: water texture %s", w.c_str());
+        std::map<std::string, std::string> waterModels;
+        for (const auto& section : world->Loaded())
+            for (const auto& list : section->solidLists)
+                for (const auto& object : list.objects)
+                    for (u32 hash : object.textureHashes) {
+                        const nfs::Texture* t = world->FindDisplayTexture(hash);
+                        if (t && t->name.find("WATER") != std::string::npos) waterModels[object.name] += t->name + " ";
+                    }
+        for (const auto& [name, textures] : waterModels)
+            LOG_INFO("anim report: model %s uses %s", name.c_str(), textures.c_str());
+    }
+
+}
+
 // FRS_MESH_TOOLS_SELFTEST=1: the edit path on a street light, nothing written
 // into the game -- the import is only planned.
 void MeshTools::OnRegionLoaded() {
     Stop(false);
     static const bool selfTest = std::getenv("FRS_MESH_TOOLS_SELFTEST") != nullptr;
     nfs::World* world = World();
+
+    // FRS_WORLDFILE_SELFTEST=<scratch folder>: the open world's files packed
+    // into <scratch>\\test.frsworld (read only), read back and unpacked into
+    // <scratch>\\unpacked; every file compared.
+    if (const char* scratch = std::getenv("FRS_WORLDFILE_SELFTEST"); scratch && world) {
+        const std::wstring folder = Widen(scratch);
+        const std::wstring models = world->OverlayFolder();
+        io::WorldFile file;
+        std::wstring error;
+        size_t packed = 0, unpacked = 0;
+        bool ok = io::PackWorld(models, file, packed, error) && file.Save(folder + L"\\test.frsworld", error);
+        io::WorldFile back;
+        ok = ok && back.Load(folder + L"\\test.frsworld", error);
+        ::CreateDirectoryW((folder + L"\\unpacked").c_str(), nullptr);
+        ok = ok && io::UnpackWorld(back, folder + L"\\unpacked", folder + L"\\backup", unpacked, error);
+        size_t same = 0;
+        for (const std::string& name : back.Names()) {
+            if (name.rfind("models/", 0) != 0) continue;
+            std::wstring relative = Widen(name.substr(7));
+            for (wchar_t& c : relative) if (c == L'/') c = L'\\';
+            FILE* a = _wfopen((models + L"\\" + relative).c_str(), L"rb");
+            FILE* b = _wfopen((folder + L"\\unpacked\\" + relative).c_str(), L"rb");
+            bool equal = a && b;
+            while (equal) {
+                const int ca = std::fgetc(a), cb = std::fgetc(b);
+                if (ca != cb) equal = false;
+                if (ca == EOF || cb == EOF) break;
+            }
+            if (a) std::fclose(a);
+            if (b) std::fclose(b);
+            same += equal;
+            if (!equal) LOG_ERROR("world file selftest: %S differs", relative.c_str());
+        }
+        LOG_INFO("world file selftest: %zu packed, %zu unpacked, %zu identical, names %zu, signature %s -- %s %S",
+                 packed, unpacked, same, back.Names().size(), io::WorldSignature(models).c_str(),
+                 ok && same == packed && unpacked == packed ? "PASSED" : "FAILED", error.c_str());
+    }
 
     // FRS_CRASH_DEMO=<game folder>: the crash window, as if the game had just
     // died of an access violation.
@@ -712,10 +807,13 @@ void MeshTools::OnRegionLoaded() {
                     copiesMoved &= has;
                 }
                 check(copiesMoved, "every copy moved with it");
+                const size_t logged = editor.Log().size();
+                check(logged >= 1, "the move is in the collision log");
                 editor.Undo();
                 Collision()->RefreshAfterEdit();
                 ReadCollision();
                 check(std::fabs(editor.Polygon(target)->corners[0].z - before.corners[0].z) < 1e-4f, "Ctrl+Z puts it back");
+                check(editor.Log().size() == logged - 1, "and takes its log entry out");
 
                 // Extrude the edge from corner 0 to corner 1.
                 long other = -1;
@@ -742,6 +840,45 @@ void MeshTools::OnRegionLoaded() {
                     editor.Undo();
                     Collision()->RefreshAfterEdit();
                 }
+
+                // Two changes kept, the first taken back from the Edits tab:
+                // the second stays.
+                StopCollision(false);
+                Renderer().SetCollisionSelectionList({ { target.section, target.pack, target.polygon, 0.0f } });
+                Begin();
+                for (size_t w = 0; w < weldVertices_.size(); ++w)
+                    if (Length(WeldPosition((u32)w) - before.corners[0]) < 1e-4f) weld = (long)w;
+                pick_ = Pick::Vertex;
+                selected_ = { (u32)weld };
+                Vec3 pivot2;
+                GizmoPivot(pivot2);
+                GizmoChanged(Mat4::Translation(pivot2 + Vec3{ 0.0f, 0.0f, 1.5f }), true, true);
+                const size_t first = editor.Log().size() - 1;
+                const size_t packsBefore = world->Loaded()[target.section]->collision[target.pack].polygons.size();
+                std::vector<nfs::CollisionPolygon> wall;
+                const Vec3 a = before.corners[2] + Vec3{ 0, 0, 0.2f }, b = before.corners[3] + Vec3{ 0, 0, 0.2f };
+                wall.push_back(collision::MakeBarrier(a, b, nfs::kSurfaceSolidWall));
+                editor.Add(wall, L"Selftest barrier");
+                Collision()->RefreshAfterEdit();
+                const size_t entries = editor.Log().size();
+                std::wstring summary;
+                const size_t reverted = editor.RevertLog({ first }, summary);
+                Collision()->RefreshAfterEdit();
+                const auto& polygons = world->Loaded()[target.section]->collision[target.pack].polygons;
+                bool cornerBack = false, barrierKept = false;
+                for (const auto& p : polygons) {
+                    if (!p.barrier && Length(p.corners[0] - before.corners[0]) < 0.05f) cornerBack = true;
+                    if (p.barrier && Length(Vec3{ p.corners[0].x - a.x, p.corners[0].y - a.y, 0 }) < 0.05f) barrierKept = true;
+                }
+                check(reverted == 1 && editor.Log().size() == entries - 1, "Edits revert takes one entry out");
+                check(cornerBack, "the reverted move is undone in the pack");
+                check(barrierKept && polygons.size() >= packsBefore, "the later barrier stays");
+                // Leave the region as it was.
+                std::wstring ignored;
+                editor.RevertLog({ editor.Log().size() - 1 }, ignored);
+                Collision()->RefreshAfterEdit();
+                active_ = true;
+                collision_ = true;
             }
             StopCollision(false);
             check(!active_, "Tab ends it");
@@ -777,6 +914,17 @@ void MeshTools::OnRegionLoaded() {
                                  object.duplicatePlacement, object.IsBackdrop(), object.transform.m[3][0],
                                  object.transform.m[3][1], object.transform.m[3][2], onGpu,
                                  world->FindModel(object.hash) == &object);
+                        for (size_t m = 0; m < object.materials.size(); ++m) {
+                            const nfs::SolidMaterial& material = object.materials[m];
+                            const u32 hash = material.textureIndex < object.textureHashes.size()
+                                                 ? object.textureHashes[material.textureIndex] : 0;
+                            const nfs::Texture* t = world->FindDisplayTexture(hash);
+                            LOG_INFO("find model:   material %zu: texture %08X %s (%s, alpha %d/%d), flags %08X, "
+                                     "%u triangles, animated %d",
+                                     m, hash, t ? t->name.c_str() : "NOT FOUND", t ? nfs::ToString(t->format) : "-",
+                                     t ? (int)t->alphaUsage : -1, t ? (int)t->alphaBlend : -1, material.flags,
+                                     material.indexCount / 3, world->TextureAnimations().count(hash) ? 1 : 0);
+                        }
                     }
             for (size_t i = 0; i < section.scenery.infos.size(); ++i) {
                 const auto& info = section.scenery.infos[i];

@@ -23,6 +23,10 @@ constexpr size_t kTexBaseLevelSize = 0x40;
 constexpr size_t kTexWidth         = 0x44;
 constexpr size_t kTexHeight        = 0x46;
 constexpr size_t kTexMipCount      = 0x4E;
+constexpr size_t kTexScrollType    = 0x52;
+constexpr size_t kTexScrollStep    = 0x58;  // i16, 8.8 fixed point, as are the two after it
+constexpr size_t kTexScrollS       = 0x5A;
+constexpr size_t kTexScrollT       = 0x5C;
 // Across the 1 821 textures of the eight track streams +0x55 only ever holds
 // 0..2 and +0x56 0..2, and they line up with what the game draws: every neon
 // sign and flare is 2/2, the barrier tape and smoke 2/1, trees and chain-link
@@ -74,6 +78,12 @@ static Texture ReadHeader(ByteSpan entry, ByteSpan format) {
     texture.alphaUsage    = (AlphaUsage)std::min<u8>(entry.read<u8>(kTexAlphaUsage), 2);
     texture.alphaBlend    = (AlphaBlend)std::min<u8>(entry.read<u8>(kTexAlphaBlend), 2);
     if (!format.empty()) texture.format = FormatFromFourCc(format.read<u32>(kFormatFourCc));
+    texture.scrollType    = entry.read<u8>(kTexScrollType);
+    texture.scrollStep    = entry.read<i16>(kTexScrollStep) / 256.0f;
+    texture.scrollS       = entry.read<i16>(kTexScrollS) / 256.0f;
+    texture.scrollT       = entry.read<i16>(kTexScrollT) / 256.0f;
+    if (texture.scrollType > 2 || (texture.scrollS == 0.0f && texture.scrollT == 0.0f)) texture.scrollType = 0;
+    if (!(texture.scrollStep > 0.0f)) texture.scrollStep = 1.0f;
     if (texture.mipCount == 0) texture.mipCount = 1;
     return texture;
 }

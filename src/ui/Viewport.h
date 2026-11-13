@@ -234,6 +234,7 @@ private:
     // screen capture.
     float captureClock_ = 0.0f;
     bool  captured_ = false;
+    bool  capturedSecond_ = false;
 
     // What the last remembered DetachNatives changed, to cancel it.
     struct Detached { u32 section; std::pair<u32, u32> record; size_t placement; bool wasChanged; };

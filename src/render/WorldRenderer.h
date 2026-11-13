@@ -480,6 +480,8 @@ private:
     bool       showRaceGroups_ = false;
     bool       showRaceProps_ = false;
     bool       animate_ = true;
+    bool       scrolling_ = false;   // texture stage 0 has a scroll transform on
+    void ScrollTextureStage(IDirect3DDevice9* device, const CachedTexture& texture);
     bool       showSky_ = true;
     double     animationClock_ = 0.0;
     // The texture to draw for a material's: the frame of the moment when it

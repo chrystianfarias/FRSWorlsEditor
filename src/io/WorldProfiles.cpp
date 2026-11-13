@@ -39,6 +39,8 @@ using Moves = std::vector<std::pair<std::wstring, std::wstring>>;
 
 } // namespace
 
+bool IsSharedWorldFile(const wchar_t* name) { return IsShared(name); }
+
 void AddSharedWorldFile(const std::wstring& name) {
     if (!IsShared(name.c_str())) ExtraShared().push_back(name);
 }

@@ -1,5 +1,7 @@
 #pragma once
 
+namespace io { class WorldFile; }
+
 #include "nfs/CityZones.h"
 #include "nfs/World.h"
 #include "render/ModelThumbnails.h"
@@ -70,6 +72,18 @@ private:
     void NewWorld();
     void OpenWorld();
     void SaveWorld();
+    void SaveWorldAs();
+    // The world file (io/WorldFile.h): where it is, and the fingerprint of
+    // <game>\models when it was last written or opened, to see unsaved work.
+    std::wstring worldPath_;
+    std::string  worldSignature_;
+    std::wstring WorldDisplayName() const;
+    bool WriteWorldFile(const std::wstring& path);
+    // Puts the world in <game>\models aside and writes `file`'s in its place.
+    bool InstallWorldFile(const class io::WorldFile& file, const std::wstring& path);
+    void RememberWorldFile();
+    // True when the world file is up to date, or the person said what to do.
+    bool ConfirmWorldFileSaved();
     // Puts the open world away for `target`, then reopens the region.
     void SwitchToWorld(const std::wstring& target, bool createNew);
     void UpdateTitle();

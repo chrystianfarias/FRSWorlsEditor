@@ -381,16 +381,27 @@ void Viewport::Tick(float deltaSeconds) {
     }
     renderer_.Render(camera_);
     if (panels) ui_.Render();
-    if (!captured_ && world_) {
+    if (world_ && (!captured_ || !capturedSecond_)) {
         captureClock_ += deltaSeconds;
         wchar_t path[MAX_PATH] = {};
         wchar_t wait[16] = L"6";
         ::GetEnvironmentVariableW(L"FRS_CAPTURE_DELAY", wait, 16);
-        if (captureClock_ > (float)_wtof(wait) && ::GetEnvironmentVariableW(L"FRS_CAPTURE", path, MAX_PATH)) {
+        const float at = (float)_wtof(wait);
+        if (!captured_ && captureClock_ > at && ::GetEnvironmentVariableW(L"FRS_CAPTURE", path, MAX_PATH)) {
             captured_ = true;
             context_.Device()->EndScene();
             LOG_INFO("capture %S: %s", path, context_.SaveBackBuffer(path) ? "saved" : "failed");
             context_.Device()->BeginScene();
+        }
+        // FRS_CAPTURE2: a second picture 0.4 s later, the camera unmoved --
+        // what an animation changed in between.
+        if (captured_ && !capturedSecond_ && captureClock_ > at + 0.4f) {
+            capturedSecond_ = true;
+            if (::GetEnvironmentVariableW(L"FRS_CAPTURE2", path, MAX_PATH)) {
+                context_.Device()->EndScene();
+                LOG_INFO("capture %S: %s", path, context_.SaveBackBuffer(path) ? "saved" : "failed");
+                context_.Device()->BeginScene();
+            }
         }
     }
     context_.EndFrame();

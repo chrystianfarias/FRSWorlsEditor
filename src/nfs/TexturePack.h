@@ -54,6 +54,14 @@ struct Texture {
     AlphaUsage    alphaUsage = AlphaUsage::None;
     AlphaBlend    alphaBlend = AlphaBlend::SrcCopy;
 
+    // Scrolling, from +0x52 (type: 0 none, 1 smooth, 2 in steps) and the
+    // 8.8 fixed-point values at +0x58: seconds a step, texture lengths a
+    // second along S and T. The fountains' and waterfalls' water flows by
+    // it, rolling neon signs turn by it.
+    u8    scrollType = 0;
+    float scrollStep = 1.0f;
+    float scrollS = 0.0f, scrollT = 0.0f;
+
     u32 baseLevelSize = 0;   // bytes of mip 0
     ByteSpan pixels;         // all mip levels, tightly packed
     ByteSpan palette;        // 256 entries, empty unless the format is palettised

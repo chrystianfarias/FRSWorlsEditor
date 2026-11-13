@@ -32,6 +32,7 @@ struct Row {
 
 struct State {
     const nfs::World* world = nullptr;
+    std::function<bool(const std::string&)> collisionLogged;
     std::wstring modelsFolder;
     std::vector<const nfs::Section*> sections;
     std::vector<std::vector<SectionEdit>> edits;     // parallel to `sections`
@@ -70,6 +71,9 @@ void Collect(State& state) {
     for (size_t s = 0; s < state.sections.size(); ++s) {
         for (size_t e = 0; e < state.edits[s].size(); ++e) {
             const SectionEdit& edit = state.edits[s][e];
+            if (edit.kind == SectionEdit::Kind::Collision && state.collisionLogged &&
+                state.collisionLogged(state.sections[s]->name))
+                continue;
             Row row;
             row.section = state.sections[s];
             row.edit = e;
@@ -275,6 +279,7 @@ void EditsPanel::Refresh(const nfs::World* world, const std::wstring& modelsFold
     State& state = impl_->state;
     state.world = world;
     state.modelsFolder = modelsFolder;
+    state.collisionLogged = collisionLogged;
     Collect(state);
     RefreshExtra();
 }
