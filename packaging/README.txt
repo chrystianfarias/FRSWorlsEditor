@@ -60,6 +60,8 @@ own window.
 SUPPORT
 -------
 
+Questions, bugs and ideas: the official Discord, https://discord.gg/jTKwQXYQkb
+
 FRS World Editor is free. If it helps you, you can buy me a coffee:
 https://buymeacoffee.com/chrystianfarias
 

@@ -1,5 +1,10 @@
 <p align="center"><img src="docs/cover.png" alt="FRS World Editor: a map editor for Need for Speed Underground 2"></p>
 
+<p align="center">
+  <a href="https://discord.gg/jTKwQXYQkb"><img src="https://img.shields.io/badge/Discord-join%20the%20community-5865F2?logo=discord&logoColor=white" alt="Discord"></a>
+  <a href="../../releases/latest"><img src="https://img.shields.io/github/v/release/chrystianfarias/FRSWorlsEditor?label=download" alt="Latest release"></a>
+</p>
+
 # FRS World Editor
 
 A map editor for **Need for Speed Underground 2**, by Chrystian Farias.
@@ -11,6 +16,8 @@ and a small ASI plugin puts it into the game as it loads.
 
 **[Download the latest release](../../releases/latest)** -- unzip, run
 `FRSWorldEditor.exe`, and the setup does the rest.
+
+Questions, bugs, ideas, or something you built: join the **[official Discord](https://discord.gg/jTKwQXYQkb)**.
 
 If the editor helps you, you can [buy me a coffee](https://buymeacoffee.com/chrystianfarias).
 
