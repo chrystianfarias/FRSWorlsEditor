@@ -2,7 +2,9 @@
 
 #include "core/Types.h"
 #include "io/SectionSplice.h"
+#include "nfs/Collision.h"
 
+#include <map>
 #include <string>
 #include <vector>
 
@@ -41,8 +43,12 @@ struct CollisionImportPlan {
 bool IsCollisionObj(const std::wstring& objPath);
 
 // Works out what would be written. Touches no files.
+// `bases`, when given, are the packs as they were when the OBJ was exported,
+// by the OBJ object name: each save of a Blender session is laid on that same
+// state, so saving again replaces the last save instead of being refused.
 bool PlanCollisionImport(const nfs::World& world, const std::wstring& objPath,
-                         const std::wstring& modelsFolder, CollisionImportPlan& plan);
+                         const std::wstring& modelsFolder, CollisionImportPlan& plan,
+                         const std::map<std::string, nfs::CollisionPack>* bases = nullptr);
 
 // Writes the spans and removes the ones they supersede. Returns how many span
 // files were written.

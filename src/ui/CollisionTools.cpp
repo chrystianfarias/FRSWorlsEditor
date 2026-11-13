@@ -271,6 +271,7 @@ void RunCollisionSelfTest(nfs::World& world) {
 
 void CollisionTools::OnCreate() {
     host_.viewport->AddTool(this);
+    undo::Register(this);
     BuildMenu();
     ExtendAccelerators();
 }
@@ -476,14 +477,26 @@ void CollisionTools::Undo() {
         UpdateOverlay();
         return;
     }
+    // Whatever part of the editor made the most recent step takes it back --
+    // roads, terrain, a mesh edit, or the collision and objects here.
     WatchHistory();
-    if (history_.empty()) { Status(L"Nothing to undo."); return; }
+    if (!undo::UndoLatest()) Status(L"Nothing to undo.");
+}
 
-    const StepKind kind = history_.back();
+u64 CollisionTools::LatestUndoStamp() const {
+    const_cast<CollisionTools*>(this)->WatchHistory();
+    return history_.empty() ? 0 : history_.back().stamp;
+}
+
+bool CollisionTools::UndoLatest() {
+    WatchHistory();
+    if (history_.empty()) return false;
+
+    const StepKind kind = history_.back().kind;
     history_.pop_back();
     if (kind == StepKind::Collision) {
         const std::wstring label = editor_.UndoLabel();
-        if (!editor_.Undo()) { Status(L"That collision edit is too old to undo."); return; }
+        if (!editor_.Undo()) { Status(L"That collision edit is too old to undo."); return true; }
         ++seenUndone_;
         Renderer().SetCollisionSelectionList({});
         RefreshAfterEdit();
@@ -497,6 +510,7 @@ void CollisionTools::Undo() {
         Status(L"Undone: the last change to the objects");
     }
     if (host_.menuChecks) host_.menuChecks();
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -570,13 +584,13 @@ void CollisionTools::WatchHistory() {
     // Collision steps, in the order the editor recorded them; one it took
     // back on its own (a cancelled move) leaves the history again.
     while (seenRecorded_ < editor_.StepsRecorded()) {
-        history_.push_back(StepKind::Collision);
+        history_.push_back({ StepKind::Collision, undo::NextStamp() });
         ++seenRecorded_;
     }
     while (seenUndone_ < editor_.StepsUndone()) {
         ++seenUndone_;
         for (size_t i = history_.size(); i-- > 0;)
-            if (history_[i] == StepKind::Collision) { history_.erase(history_.begin() + (ptrdiff_t)i); break; }
+            if (history_[i].kind == StepKind::Collision) { history_.erase(history_.begin() + (ptrdiff_t)i); break; }
     }
 
     // Placements: one step each time they come to rest in a new state. While
@@ -586,13 +600,13 @@ void CollisionTools::WatchHistory() {
     const size_t signature = PlacementSignature();
     if (signature == settledSignature_) return;
     placementUndo_.push_back(std::move(settled_));
-    history_.push_back(StepKind::Placements);
+    history_.push_back({ StepKind::Placements, undo::NextStamp() });
     settled_ = CapturePlacements();
     settledSignature_ = signature;
 
     // A hundred steps back is plenty; the oldest go first.
     while (history_.size() > 100) {
-        if (history_.front() == StepKind::Placements && !placementUndo_.empty())
+        if (history_.front().kind == StepKind::Placements && !placementUndo_.empty())
             placementUndo_.erase(placementUndo_.begin());
         history_.erase(history_.begin());
     }

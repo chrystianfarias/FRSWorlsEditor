@@ -115,6 +115,8 @@ bool ExportCollision(const nfs::World& world,
         }
     }
     const Vec3 origin = bounds.Valid() ? (bounds.min + bounds.max) * 0.5f : Vec3{};
+    summary.origin = origin;
+    summary.bounds = bounds;
 
     const std::wstring mtlPath      = ReplaceExtension(objPath, L".mtl");
     const std::wstring manifestPath = ReplaceExtension(objPath, L".json");
@@ -263,4 +265,46 @@ bool ExportCollision(const nfs::World& world,
     LOG_INFO("exported collision: %zu packs, %zu polygons of which %zu barriers",
              written, polygons, barriers);
     return written > 0;
+}
+
+size_t ExportReferenceMeshes(const nfs::World& world, const Aabb& area, const Vec3& origin,
+                             const std::wstring& objPath, size_t limit) {
+    FILE* obj = nullptr;
+    if (::_wfopen_s(&obj, objPath.c_str(), L"w") != 0 || !obj) return 0;
+    std::fprintf(obj, "# FRS World Editor: the world around the collision, for reference only\no reference\n");
+    size_t vertexBase = 1, triangles = 0;
+    const auto overlaps = [&](const Aabb& box) {
+        return box.Valid() && box.max.x >= area.min.x && box.min.x <= area.max.x && box.max.y >= area.min.y &&
+               box.min.y <= area.max.y && box.max.z >= area.min.z && box.min.z <= area.max.z;
+    };
+    const auto write = [&](const nfs::SolidObject& model, const Mat4& transform) {
+        if (triangles >= limit || model.vertices.empty()) return;
+        const Vec3 size = model.bounds.Valid() ? model.bounds.max - model.bounds.min : Vec3{};
+        if (size.x > 2000.0f || size.y > 2000.0f) return;   // a backdrop
+        for (const nfs::SolidVertex& v : model.vertices) {
+            const Vec3 p = ToBlender(transform.TransformPoint(v.position) - origin);
+            std::fprintf(obj, "v %.3f %.3f %.3f\n", p.x, p.y, p.z);
+        }
+        for (size_t k = 0; k + 2 < model.indices.size(); k += 3) {
+            std::fprintf(obj, "f %zu %zu %zu\n", vertexBase + model.indices[k], vertexBase + model.indices[k + 1],
+                         vertexBase + model.indices[k + 2]);
+            ++triangles;
+        }
+        vertexBase += model.vertices.size();
+    };
+    for (const auto& section : world.Loaded()) {
+        for (const nfs::SceneryInstance& instance : section->scenery.instances) {
+            if (!overlaps(instance.worldBounds)) continue;
+            if (const nfs::SolidObject* model = world.FindModel(section->scenery.ModelHash(instance)))
+                write(*model, instance.transform);
+        }
+        if (world.IsLibrary(*section)) continue;
+        for (const nfs::SolidList& list : section->solidLists)
+            for (const nfs::SolidObject& model : list.objects)
+                if (model.bounds.Valid() && overlaps(Transform(model.bounds, model.transform)))
+                    write(model, model.transform);
+    }
+    std::fclose(obj);
+    LOG_INFO("collision reference: %zu triangles around the selection", triangles);
+    return triangles;
 }

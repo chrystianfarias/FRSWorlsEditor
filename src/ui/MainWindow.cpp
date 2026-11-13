@@ -5,6 +5,7 @@
 #include "io/CollisionImport.h"
 #include "ui/CollisionTools.h"
 #include "ui/MeshTools.h"
+#include "ui/OnlineLibrary.h"
 #include "io/PlacementWrite.h"
 #include "io/SectionEdits.h"
 #include "ui/PlacementDialogs.h"
@@ -402,6 +403,14 @@ LRESULT MainWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
             RunSetup();
             return 0;
 
+        case kBakeWriteMessage:
+            WriteBake();
+            return 0;
+
+        case OnlineLibrary::kPlaceMessage:
+            PlaceOnlineModel();
+            return 0;
+
         case kShellLibraryActivate:
             if (catalog_.onActivate) catalog_.onActivate();
             return 0;
@@ -670,6 +679,8 @@ void MainWindow::OnCreate() {
     // From here the frame is drawn with ImGui (ui/MainWindowShell.cpp): the
     // native menu, toolbar, status bar and side panel stay as hidden sources.
     shell_ = true;
+    online_ = std::make_unique<OnlineLibrary>();
+    online_->SetWindow(window_);
     ::SetMenu(window_, nullptr);
     HideNativeShell();
     OnSize();
@@ -918,6 +929,10 @@ void MainWindow::OnCommand(int id, int notification, HWND control) {
 
     for (auto& extension : extensions_)
         if (extension->OnCommand(id)) return;
+    if (id == MeshTools::kBakeCommand) {
+        bakeOpen_ = true;
+        return;
+    }
 
     if (id >= ID_TRAVEL_ZONE && id < ID_TRAVEL_ZONE + 100) {
         TravelToZone((size_t)(id - ID_TRAVEL_ZONE));
@@ -1457,15 +1472,21 @@ void MainWindow::ImportEditedObjects() {
     }
 }
 
-void MainWindow::ImportEditedCollision(const std::wstring& path) {
+void MainWindow::ImportEditedCollision(const std::wstring& path, bool quick) {
     const std::wstring modelsFolder = gameFolder_ + L"\\models";
 
     CollisionImportPlan plan;
-    const bool planned = PlanCollisionImport(*world_, path, modelsFolder, plan);
+    const bool planned = PlanCollisionImport(*world_, path, modelsFolder, plan,
+                                             quick && !blenderBases_.empty() ? &blenderBases_ : nullptr);
 
     std::wstring message = Format(L"Read %zu collision objects from the OBJ.\n\n%s",
                                   plan.objectsRead, plan.report.c_str());
     if (!planned) {
+        if (quick) {
+            SetStatusText(2, L"Blender: the collision could not be put back -- the log has why");
+            LOG_WARN("collision quick edit: %S", plan.report.c_str());
+            return;
+        }
         message += L"Nothing was written.";
         ::MessageBoxW(window_, message.c_str(), kWindowTitle, MB_ICONWARNING | MB_OK);
         return;
@@ -1474,8 +1495,20 @@ void MainWindow::ImportEditedCollision(const std::wstring& path) {
     const std::wstring region = world_->Region();
     const size_t written = ApplyCollisionImport(plan, modelsFolder, region);
 
-    // Reopened so the viewport shows the collision the game will be handed.
+    // Reopened so the viewport shows the collision the game will be handed --
+    // from the same viewpoint, and with the collision still showing.
+    const Camera camera = viewport_.GetCamera();
     OpenRegion(region);
+    if (quick) {
+        viewport_.GetCamera().SetPosition(camera.Position());
+        viewport_.GetCamera().SetYawPitch(camera.Yaw(), camera.Pitch());
+        if (!viewport_.GetRenderer().CollisionVisible()) ::SendMessageW(window_, WM_COMMAND, ID_VIEW_COLLISION, 0);
+        SetStatusText(2, written == plan.spans.size()
+                             ? Format(L"Blender: collision loaded into %zu sections", written)
+                             : std::wstring(L"Blender: some sections could not be written -- the log has why"));
+        LOG_INFO("collision quick edit:\n%S", plan.report.c_str());
+        return;
+    }
 
     if (written == plan.spans.size()) {
         message += Format(L"Wrote %zu section overlays into\n%s\n", written, modelsFolder.c_str());
@@ -1604,6 +1637,13 @@ void MainWindow::EditInBlender() {
         return;
     }
 
+    // Collision polygons selected: those go to Blender instead.
+    if (!viewport_.GetRenderer().CollisionSelection().empty()) {
+        EditCollisionInBlender();
+        return;
+    }
+    blenderCollision_ = false;
+
     const auto& selection = viewport_.GetRenderer().Selection();
     if (selection.empty() || !selection.front().object) {
         ::MessageBoxW(window_,
@@ -1650,6 +1690,53 @@ void MainWindow::EditInBlender() {
     SetStatusText(2, Format(L"Editing %zu meshes in Blender -- save there (Ctrl+S) to load "
                             L"them here. New objects added there are placed too.",
                             summary.objects));
+}
+
+void MainWindow::EditCollisionInBlender() {
+    const auto& selection = viewport_.GetRenderer().CollisionSelection();
+    const std::wstring blender = BlenderLink::FindBlender(window_, kSettingsKey);
+    if (blender.empty()) return;
+
+    const std::wstring label = world_->Region() + Format(L"-collision-%zu", selection.size());
+    const std::wstring folder = BlenderLink::NewSessionFolder(label);
+    if (folder.empty()) {
+        ::MessageBoxW(window_, L"No folder could be made for the edit.", kWindowTitle, MB_ICONWARNING | MB_OK);
+        return;
+    }
+    const std::wstring objPath = folder + L"\\" + label + L".obj";
+    CollisionExportSummary summary;
+    if (!ExportCollision(*world_, selection, objPath, world_->Region(), summary)) {
+        ::MessageBoxW(window_, L"The collision could not be written. The log has why.", kWindowTitle,
+                      MB_ICONWARNING | MB_OK);
+        return;
+    }
+
+    // The packs as they are now, by the object names the export gave them:
+    // every save of this session is laid on them (PlanCollisionImport).
+    blenderBases_.clear();
+    for (const CollisionPick& pick : selection) {
+        const nfs::LoadedSection& section = *world_->Loaded()[pick.section];
+        const std::string name = "collision_" + (section.info ? section.info->name : std::string("unknown")) +
+                                 (pick.pack ? "_" + std::to_string(pick.pack) : std::string());
+        if (!blenderBases_.count(name)) blenderBases_[name] = section.collision[pick.pack];
+    }
+
+    // The world around it, 40 units each way, to model against; and a mark
+    // that tells the Blender script this is collision.
+    Aabb area = summary.bounds;
+    area.min = area.min - Vec3{ 40.0f, 40.0f, 20.0f };
+    area.max = area.max + Vec3{ 40.0f, 40.0f, 30.0f };
+    ExportReferenceMeshes(*world_, area, summary.origin, folder + L"\\reference.obj");
+    if (FILE* mark = _wfopen((objPath + L".collision").c_str(), L"w")) std::fclose(mark);
+
+    std::wstring error;
+    if (!blender_.Start(blender, objPath, error)) {
+        ::MessageBoxW(window_, error.c_str(), kWindowTitle, MB_ICONWARNING | MB_OK);
+        return;
+    }
+    blenderCollision_ = true;
+    SetStatusText(2, Format(L"Editing %zu collision polygons in Blender -- save there (Ctrl+S) to load them here",
+                            summary.polygons));
 }
 
 void MainWindow::NewObjectInBlender() {
@@ -1784,7 +1871,8 @@ void MainWindow::PollBlender() {
     if (blender_.PollSaved()) {
         LOG_INFO("quick edit: Blender saved, importing %S", blender_.ObjPath().c_str());
         try {
-            ImportObj(blender_.ObjPath(), true);
+            if (blenderCollision_) ImportEditedCollision(blender_.ObjPath(), true);
+            else ImportObj(blender_.ObjPath(), true);
         } catch (const std::exception& error) {
             LOG_ERROR("quick edit import threw: %s", error.what());
             ::MessageBoxW(window_,
@@ -1797,6 +1885,8 @@ void MainWindow::PollBlender() {
 
     if (!blender_.Running()) {
         blender_.Stop();
+        blenderCollision_ = false;
+        blenderBases_.clear();
         SetStatusText(2, L"Blender closed; the quick edit is finished");
     }
 }
@@ -2247,7 +2337,8 @@ size_t MainWindow::SceneSignature() const {
 }
 
 void MainWindow::ShowSideTab(int tab) {
-    sideTab_ = tab >= 0 && tab <= 2 ? tab : 0;
+    sideTab_ = tab >= 0 && tab <= (shell_ ? 3 : 2) ? tab : 0;   // 3: Online, drawn only
+    if (sideTab_ == 3) return;
     const bool library = sideTab_ == 1;
     const bool edits = sideTab_ == 2;
     if (!shell_) {

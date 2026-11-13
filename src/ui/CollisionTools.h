@@ -4,6 +4,7 @@
 #include "nfs/World.h"
 #include "render/WorldRenderer.h"
 #include "ui/EditorExtension.h"
+#include "ui/UndoRegistry.h"
 #include "ui/Viewport.h"
 
 #include <windows.h>
@@ -46,7 +47,7 @@ struct CollisionToolsHost {
 // collision, and objects placed, moved, turned or deleted -- the latter
 // noticed by watching the placements settle after each change.
 // Nothing reaches the game until the next save (Ctrl+Shift+S).
-class CollisionTools : public EditorExtension, public ViewportTool {
+class CollisionTools : public EditorExtension, public ViewportTool, public UndoParticipant {
 public:
     explicit CollisionTools(CollisionToolsHost host) : host_(std::move(host)) {}
 
@@ -69,6 +70,10 @@ public:
     bool ApplyProperties() override;
     bool DeleteSelection() override;
     void Tick(float deltaSeconds) override;
+
+    // ---- UndoParticipant (ui/UndoRegistry.h): collision and placements
+    u64 LatestUndoStamp() const override;
+    bool UndoLatest() override;
 
     // ---- ViewportTool
     bool MouseDown(int x, int y, WPARAM keys) override;
@@ -105,7 +110,8 @@ private:
     void ResetHistory();
     void WatchHistory();
     enum class StepKind : char { Collision, Placements };
-    std::vector<StepKind> history_;
+    struct Step { StepKind kind; u64 stamp; };   // stamp: the editor-wide undo order
+    std::vector<Step> history_;
     std::vector<PlacementState> placementUndo_;
     PlacementState settled_;          // the placements as they last came to rest
     size_t settledSignature_ = 0;

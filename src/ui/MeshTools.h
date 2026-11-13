@@ -2,6 +2,7 @@
 
 #include "render/WorldRenderer.h"
 #include "ui/EditorExtension.h"
+#include "ui/UndoRegistry.h"
 #include "ui/Viewport.h"
 
 #include <windows.h>
@@ -41,7 +42,7 @@ struct MeshToolsHost {
 // 1 / 2 / 3 pick vertices, edges or faces while editing (the toolbar keeps
 // the gizmo's move / rotate / scale), Ctrl+click adds, Ctrl+A takes all,
 // Ctrl+Z steps back, Esc drops the selection, Mesh > Discard throws the edit away.
-class MeshTools : public EditorExtension, public ViewportTool {
+class MeshTools : public EditorExtension, public ViewportTool, public UndoParticipant {
 public:
     explicit MeshTools(MeshToolsHost host) : host_(std::move(host)) {}
 
@@ -52,7 +53,8 @@ public:
     // The Mesh menu's commands, for a control elsewhere that drives it (the
     // mode switch over the view).
     static constexpr int kEditCommand = 44501, kVerticesCommand = 44502, kEdgesCommand = 44503,
-                         kFacesCommand = 44504, kFinishCommand = 44506;
+                         kFacesCommand = 44504, kFinishCommand = 44506,
+                         kBakeCommand = 44508;   // handled by the window: its dialog
 
     // ---- EditorExtension
     void OnCreate() override;
@@ -70,6 +72,10 @@ public:
     bool KeyDown(WPARAM key, bool repeat) override;
     bool GizmoPivot(Vec3& pivot) override;
     void GizmoChanged(const Mat4& transform, bool done, bool keep) override;
+
+    // ---- UndoParticipant: the steps of the mesh being edited
+    u64 LatestUndoStamp() const override { return active_ && !undoStamps_.empty() ? undoStamps_.back() : 0; }
+    bool UndoLatest() override;
 
 private:
     enum class Pick { Vertex, Edge, Face };
@@ -111,6 +117,7 @@ private:
 
     std::set<u32> selected_;       // welds, edges or faces, by the pick mode
     std::vector<std::vector<Vec3>> undo_;
+    std::vector<u64> undoStamps_;      // one per undo_ step, from undo::NextStamp()
 
     bool dragging_ = false;
     std::vector<Vec3> dragStart_;

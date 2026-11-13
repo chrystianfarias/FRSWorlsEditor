@@ -5,6 +5,7 @@
 #include "roads/GameCut.h"
 
 #include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -230,7 +231,7 @@ struct MeshPiece {
 
 class Network {
 public:
-    void Clear() { nodes_.clear(); segments_.clear(); cuts_.clear(); nextId_ = 1; SetDirty(); }
+    void Clear() { nodes_.clear(); segments_.clear(); cuts_.clear(); gameJunctions_.clear(); nextId_ = 1; SetDirty(); }
 
     const std::vector<Node>& Nodes() const { return nodes_; }
     const std::vector<Segment>& Segments() const { return segments_; }
@@ -252,9 +253,28 @@ public:
     // Puts every following node beside the node it follows. True when one moved.
     bool UpdateFollowers();
 
-    // Stretches of the game's roads replaced by procedural ones.
-    const std::vector<GameCut>& Cuts() const { return cuts_; }
+    // Stretches of the game's roads replaced by procedural ones, and the
+    // boxes the junctions made into them take out.
+    std::vector<GameCut> Cuts() const;
     void AddCut(const GameCut& cut) { cuts_.push_back(cut); SetDirty(); }
+
+    // Junctions made into the game's own roads.
+    const std::vector<GameJunction>& GameJunctions() const { return gameJunctions_; }
+    void AddGameJunction(const GameJunction& junction) { gameJunctions_.push_back(junction); SetDirty(); }
+    // The new road's width at a junction: (half kerb to kerb, sidewalk).
+    void MouthOf(const GameJunction& junction, float& half, float& walk) const;
+
+    // Where the light comes from besides the network's own street lights:
+    // `sample` reads the light the game baked into its own ground under a
+    // point -- its street lights and signs, already in the vertex colours --
+    // and `lamps` are the game's street lights, for ground with nothing of the
+    // game's under it.
+    struct LightSources {
+        std::function<bool(const Vec3& point, u32& colour)> sample;
+        std::vector<Pole> lamps;
+    };
+    void SetLightSources(std::shared_ptr<const LightSources> sources) { light_ = std::move(sources); SetDirty(); }
+    const LightSources* Light() const { return light_.get(); }
     // Removes the segment, and either end left with nothing.
     void RemoveSegment(u32 id);
 
@@ -299,7 +319,9 @@ private:
     std::vector<Node> nodes_;
     std::vector<Segment> segments_;
     std::vector<GameCut> cuts_;
+    std::vector<GameJunction> gameJunctions_;
     GroundQuery ground_;
+    std::shared_ptr<const LightSources> light_;
     u32 nextId_ = 1;
     bool dirty_ = true;
     u64 revision_ = 1;
@@ -307,7 +329,8 @@ private:
 
 // Lights `pieces` the way BuildMesh lights the roads: `ambient` (RRGGBB)
 // everywhere, and the pool of every lamp in reach.
-void ApplyLighting(std::vector<MeshPiece>& pieces, const std::vector<Pole>& poles, u32 ambient);
+void ApplyLighting(std::vector<MeshPiece>& pieces, const std::vector<Pole>& poles, u32 ambient,
+                   const Network::LightSources* sources = nullptr);
 
 // Where the roads are, for ground that has to fit around them: the nearest
 // road to a point, its height there and how far outside its edge the point

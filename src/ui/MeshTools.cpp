@@ -2,7 +2,10 @@
 
 #include "core/Log.h"
 #include "io/SelectionExport.h"
+#include "io/GlbToObj.h"
+#include "io/LightBake.h"
 #include "io/PlacementWrite.h"
+#include "online/Sketchfab.h"
 #include "io/SelectionImport.h"
 #include "nfs/World.h"
 #include "render/Gizmo.h"
@@ -77,6 +80,7 @@ std::wstring EditFolder() {
 
 void MeshTools::OnCreate() {
     host_.viewport->AddTool(this);
+    undo::Register(this);
     if (host_.menu) {
         popup_ = ::CreatePopupMenu();
         ::AppendMenuW(popup_, MF_STRING, kIdEdit, L"&Edit Mesh of the Selected Object\tTab");
@@ -92,6 +96,8 @@ void MeshTools::OnCreate() {
         ::AppendMenuW(popup_, MF_SEPARATOR, 0, nullptr);
         ::AppendMenuW(popup_, MF_STRING, kIdFinish, L"Finish and &Write\tTab");
         ::AppendMenuW(popup_, MF_STRING, kIdDiscard, L"&Discard the Edit");
+        ::AppendMenuW(popup_, MF_SEPARATOR, 0, nullptr);
+        ::AppendMenuW(popup_, MF_STRING, kBakeCommand, L"Bake Night &Lighting...\tCtrl+Shift+L");
         const int count = ::GetMenuItemCount(host_.menu);
         ::InsertMenuW(host_.menu, count > 0 ? (UINT)(count - 1) : 0, MF_BYPOSITION | MF_POPUP,
                       (UINT_PTR)popup_, L"&Mesh");
@@ -102,6 +108,7 @@ void MeshTools::OnCreate() {
         std::vector<ACCEL> table((size_t)count);
         ::CopyAcceleratorTableW(*host_.accelerators, table.data(), count);
         table.push_back({ FVIRTKEY | FCONTROL, 'A', (WORD)kIdSelectAll });
+        table.push_back({ FVIRTKEY | FCONTROL | FSHIFT, 'L', (WORD)kBakeCommand });
         if (HACCEL extended = ::CreateAcceleratorTableW(table.data(), (int)table.size()))
             *host_.accelerators = extended;
     }
@@ -118,10 +125,7 @@ bool MeshTools::OnCommand(int id) {
         }
         return false;
     }
-    if (active_ && host_.undoCommand && id == host_.undoCommand) {
-        Undo();
-        return true;
-    }
+
     switch (id) {
         case kIdEdit:      if (!active_) Begin(); return true;
         case kIdVertices:  SetPickMode(Pick::Vertex); return true;
@@ -223,6 +227,7 @@ bool MeshTools::Begin() {
 
     selected_.clear();
     undo_.clear();
+    undoStamps_.clear();
     dragging_ = false;
     active_ = true;
     Renderer().ClearSelection();
@@ -247,6 +252,7 @@ void MeshTools::Stop(bool restore) {
     dragging_ = false;
     selected_.clear();
     undo_.clear();
+    undoStamps_.clear();
     Renderer().SetToolOverlay({}, {}, this);
     if (host_.menuChecks) host_.menuChecks();
 }
@@ -284,6 +290,7 @@ void MeshTools::Finish() {
     active_ = false;
     selected_.clear();
     undo_.clear();
+    undoStamps_.clear();
     Renderer().SetToolOverlay({}, {}, this);
     LOG_INFO("mesh edit: %s written through %S", modelName_.c_str(), objPath.c_str());
     host_.importQuietly(objPath);
@@ -349,11 +356,18 @@ void MeshTools::SelectAll() {
     UpdateOverlay();
 }
 
+bool MeshTools::UndoLatest() {
+    if (!active_ || undo_.empty()) return false;
+    Undo();
+    return true;
+}
+
 void MeshTools::Undo() {
     if (dragging_) return;
     if (undo_.empty()) { Status(L"Nothing to undo in this mesh edit."); return; }
     world_ = std::move(undo_.back());
     undo_.pop_back();
+    if (!undoStamps_.empty()) undoStamps_.pop_back();
     Push();
     UpdateOverlay();
     Status(L"Mesh edit: one step back.");
@@ -389,7 +403,8 @@ void MeshTools::GizmoChanged(const Mat4& transform, bool done, bool keep) {
         dragging_ = false;
         if (keep && !SameShape(world_, dragStart_)) {
             undo_.push_back(std::move(dragStart_));
-            if (undo_.size() > 100) undo_.erase(undo_.begin());
+            undoStamps_.push_back(undo::NextStamp());
+            if (undo_.size() > 100) { undo_.erase(undo_.begin()); undoStamps_.erase(undoStamps_.begin()); }
         }
         dragStart_.clear();
     }
@@ -466,7 +481,7 @@ bool MeshTools::KeyDown(WPARAM key, bool repeat) {
             UpdateOverlay();
             return true;
         case 'Z':
-            if (::GetKeyState(VK_CONTROL) < 0) { Undo(); return true; }
+            if (::GetKeyState(VK_CONTROL) < 0) { undo::UndoLatest(); return true; }
             return false;
         default:
             return false;
@@ -561,6 +576,85 @@ void MeshTools::OnRegionLoaded() {
     Stop(false);
     static const bool selfTest = std::getenv("FRS_MESH_TOOLS_SELFTEST") != nullptr;
     nfs::World* world = World();
+
+    // FRS_BAKE_SELFTEST=1: the map's own road by a street light, baked, set
+    // beside the colours the game baked into it -- nothing changed.
+    if (std::getenv("FRS_BAKE_SELFTEST") && world) {
+        const nfs::SolidObject* road = nullptr;
+        Mat4 roadTransform;
+        for (const auto& section : world->Loaded()) {
+            if (road || !section->info || world->IsLibrary(*section)) continue;
+            for (const auto& instance : section->scenery.instances) {
+                const nfs::SolidObject* model = world->FindModel(section->scenery.ModelHash(instance));
+                if (!model || !lightbake::IsLamp(model->name.c_str())) continue;
+                // The road under this lamp.
+                const Vec3 at{ instance.transform.m[3][0], instance.transform.m[3][1], instance.transform.m[3][2] };
+                for (const auto& other : section->scenery.instances) {
+                    const nfs::SolidObject* candidate = world->FindModel(section->scenery.ModelHash(other));
+                    if (!candidate || candidate->name.rfind("TRN_", 0) != 0 || !other.worldBounds.Valid()) continue;
+                    if (at.x >= other.worldBounds.min.x && at.x <= other.worldBounds.max.x &&
+                        at.y >= other.worldBounds.min.y && at.y <= other.worldBounds.max.y) {
+                        road = candidate;
+                        roadTransform = other.transform;
+                        break;
+                    }
+                }
+                if (road) break;
+            }
+        }
+        if (road) {
+            lightbake::Settings settings;
+            const lightbake::Environment environment =
+                lightbake::Measure(*world, Transform(road->bounds, roadTransform), settings);
+            const std::vector<u32> baked = lightbake::Bake(*road, roadTransform, environment, settings);
+            double gameSum = 0, bakedSum = 0, diff = 0;
+            for (size_t i = 0; i < baked.size(); ++i) {
+                const auto luma = [](u32 c) { return ((c >> 16) & 255) * 0.3 + ((c >> 8) & 255) * 0.59 + (c & 255) * 0.11; };
+                gameSum += luma(road->vertices[i].color);
+                bakedSum += luma(baked[i]);
+                diff += std::fabs(luma(road->vertices[i].color) - luma(baked[i]));
+            }
+            const double n = (double)std::max<size_t>(1, baked.size());
+            LOG_INFO("bake selftest: %s, %zu vertices -- game mean %.1f, baked mean %.1f, mean difference %.1f (of 255)",
+                     road->name.c_str(), baked.size(), gameSum / n, bakedSum / n, diff / n);
+        } else {
+            LOG_INFO("bake selftest: no road found under a street light");
+        }
+    }
+
+    // FRS_ONLINE_SELFTEST=<a .glb>: a Sketchfab search, the GLB turned into an
+    // OBJ beside it, and the import planned as a new object -- nothing written.
+    if (const char* glb = std::getenv("FRS_ONLINE_SELFTEST"); glb && world) {
+        sketchfab::Query query;
+        query.text = "street lamp";
+        query.maxVertices = 3000;
+        std::vector<sketchfab::Model> found;
+        std::string next;
+        std::wstring error;
+        const bool searched = sketchfab::Search(query, found, next, error);
+        size_t withinBudget = 0;
+        for (const auto& m : found) withinBudget += (m.glbVertices ? m.glbVertices : m.vertices) <= 3000;
+        LOG_INFO("online selftest: search %s, %zu results, %zu within 3000 vertices, next page %s; %S",
+                 searched ? "ok" : "FAILED", found.size(), withinBudget, next.empty() ? "no" : "yes", error.c_str());
+        const std::wstring source(glb, glb + std::strlen(glb));
+        const std::wstring obj = source.substr(0, source.find_last_of(L'.')) + L".obj";
+        GlbConversion conversion;
+        const bool converted = ConvertGlbToObj(source, obj, "SELFTEST_DUCK", 4.0f, conversion);
+        LOG_INFO("online selftest: convert %s -- %zu vertices, %zu triangles, %zu textures, scale %.3f, %.2f tall; %S",
+                 converted ? "ok" : "FAILED", conversion.vertices, conversion.triangles, conversion.textures,
+                 conversion.scale, conversion.height, conversion.error.c_str());
+        if (converted) {
+            const Vec3 origin{ 1707.7f, -933.8f, 24.0f };
+            ImportPlan plan;
+            const bool planned = PlanImport(*world, obj, plan, &origin);
+            LOG_INFO("online selftest: import plan %s -- %zu new objects (%s, %zu vertices, %zu triangles, in %s)",
+                     planned ? "ok" : "FAILED", plan.created.size(),
+                     plan.created.empty() ? "-" : plan.created[0].model.c_str(),
+                     plan.created.empty() ? 0 : plan.created[0].vertices,
+                     plan.created.empty() ? 0 : plan.created[0].triangles,
+                     plan.created.empty() ? "-" : plan.created[0].section.c_str());
+        }
+    }
 
     // FRS_UI_DEMO=1: a street light selected and in view, for a look at the
     // panels (with FRS_CAPTURE, a picture of them).

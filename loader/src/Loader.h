@@ -72,6 +72,8 @@ bool PlayerPose(Pose& out);
 void StartFileEdits();      // from DllMain: the file replacements must be early
 void LogFileEditTotals();   // on the way out
 void StartRecorder();
+void StartRouteProbe();     // [RouteProbe] in the .ini; off by default
+void RouteProbeFrame();
 
 // Parts linked in from elsewhere: installed from DllMain on v1.2 only, then
 // called on the game thread every frame.

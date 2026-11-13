@@ -610,26 +610,40 @@ void PlacePoles(const Segment& segment, const std::vector<Station>& stations, st
 // every lamp in reach, falling off smoothly to nothing at its radius. Alpha
 // is 0x82, as on every shipped road surface.
 void LightPieces(std::vector<MeshPiece>& pieces, const std::vector<Pole>& poles,
-                 const std::function<const RoadProfile*(const MeshPiece&)>& profileOf) {
+                 const std::function<const RoadProfile*(const MeshPiece&)>& profileOf,
+                 const Network::LightSources* sources) {
     for (MeshPiece& piece : pieces) {
         const RoadProfile* profile = profileOf(piece);
         const u32 ambient = profile ? profile->ambient : 0x383C42;
         const Aabb box = piece.Bounds();
-        std::vector<const Pole*> near;
-        for (const Pole& pole : poles) {
-            const float r = pole.radius;
-            if (pole.lamp.x + r < box.min.x || pole.lamp.x - r > box.max.x || pole.lamp.y + r < box.min.y ||
-                pole.lamp.y - r > box.max.y)
-                continue;
-            near.push_back(&pole);
-        }
+        const auto reaching = [&](const std::vector<Pole>& list) {
+            std::vector<const Pole*> out;
+            for (const Pole& pole : list) {
+                const float r = pole.radius;
+                if (pole.strength <= 0.0f || pole.lamp.x + r < box.min.x || pole.lamp.x - r > box.max.x ||
+                    pole.lamp.y + r < box.min.y || pole.lamp.y - r > box.max.y)
+                    continue;
+                out.push_back(&pole);
+            }
+            return out;
+        };
+        const std::vector<const Pole*> near = reaching(poles);
+        const std::vector<const Pole*> gameLamps = sources ? reaching(sources->lamps) : std::vector<const Pole*>{};
         for (MeshGroup& group : piece.groups)
             for (MeshVertex& v : group.vertices) {
+                // The light the game baked into its own ground under this
+                // point, when there is ground of its there: its street lights
+                // are in it already. Elsewhere the night ambient, and the
+                // game's street lights in reach.
+                u32 base = ambient;
+                const bool sampled = sources && sources->sample && sources->sample(v.position, base);
+                float c[3] = { (float)((base >> 16) & 0xFF), (float)((base >> 8) & 0xFF), (float)(base & 0xFF) };
+                std::vector<const Pole*> lights = near;
+                if (!sampled) lights.insert(lights.end(), gameLamps.begin(), gameLamps.end());
                 // Lamps combine like light on a screen, never past their own
                 // colour: under one the road reaches about 0xB0 as the game's
                 // do, and overlapping pools do not burn out to white.
-                float c[3] = { (float)((ambient >> 16) & 0xFF), (float)((ambient >> 8) & 0xFF), (float)(ambient & 0xFF) };
-                for (const Pole* pole : near) {
+                for (const Pole* pole : lights) {
                     const float dx = v.position.x - pole->lamp.x, dy = v.position.y - pole->lamp.y;
                     const float d2 = (dx * dx + dy * dy) / (pole->radius * pole->radius);
                     if (d2 >= 1.0f) continue;
@@ -645,6 +659,145 @@ void LightPieces(std::vector<MeshPiece>& pieces, const std::vector<Pole>& poles,
                     out |= (u32)std::clamp((int)std::lround(c[k]), 0, 255) << (16 - 8 * k);
                 v.color = out;
             }
+    }
+}
+
+// The box of a junction made into one of the game's roads, in the box's own
+// terms: `a` along the game's road, `y` across it towards the new road.
+void BuildGameJunction(const GameJunction& j, float mouthHalf, float branchWalk, MeshPiece& piece) {
+    const float L = j.HalfLength(mouthHalf, branchWalk);
+    const float half = j.halfRoad, wn = j.walkNear, wf = j.walkFar, h = j.walkHeight;
+    const u32 color = Grey(0.5f);   // lit afterwards
+    const Vec3 up{ 0.0f, 0.0f, 1.0f };
+    const auto P = [&](float a, float y, float lift = 0.0f) { return j.At(a, y, L, lift); };
+    const auto walkUv = [&](const UvMap& map, const Vec3& p, float a, float y) {
+        if (map.valid) return map.At(p);
+        return Vec2{ y / std::max(0.5f, wn + wf) , a / 8.0f };
+    };
+    const auto faceUp = [&](MeshGroup& g, const std::vector<Vec3>& fan, const std::vector<Vec2>& uvs) {
+        // A fan from fan[0], each triangle turned to face up.
+        const u32 base = (u32)g.vertices.size();
+        for (size_t k = 0; k < fan.size(); ++k) g.vertices.push_back(Vertex(fan[k], up, uvs[k].x, uvs[k].y, color));
+        for (size_t k = 1; k + 1 < fan.size(); ++k) {
+            const Vec3 n = Cross(fan[k] - fan[0], fan[k + 1] - fan[0]);
+            if (Length(n) < 1e-5f) continue;
+            g.indices.push_back(base);
+            if (n.z >= 0.0f) { g.indices.push_back(base + (u32)k); g.indices.push_back(base + (u32)k + 1); }
+            else { g.indices.push_back(base + (u32)k + 1); g.indices.push_back(base + (u32)k); }
+        }
+    };
+
+    // The junction surface: kerb to kerb across the game's road, and out
+    // into the mouth of the new road between the curving kerbs.
+    std::vector<Vec2> outline;   // (a, y)
+    outline.push_back({ -L, -half });
+    outline.push_back({ L, -half });
+    outline.push_back({ L, half });
+    std::vector<std::vector<Vec2>> corners(2);
+    for (int s = 1; s >= -1; s -= 2) {
+        // The kerb from the game's road edge round to the new road's edge.
+        const Vec2 start{ s * L, half }, end{ s * mouthHalf, half + wn }, control{ s * mouthHalf, half };
+        std::vector<Vec2>& curve = corners[s > 0 ? 0 : 1];
+        const int steps = 10;
+        for (int k = 0; k <= steps; ++k) {
+            const float t = (float)k / steps, u = 1.0f - t;
+            curve.push_back({ start.x * u * u + control.x * 2 * u * t + end.x * t * t,
+                              start.y * u * u + control.y * 2 * u * t + end.y * t * t });
+        }
+        if (s > 0) {
+            for (size_t k = 1; k < curve.size(); ++k) outline.push_back(curve[k]);
+        } else {
+            for (size_t k = 0; k < curve.size(); ++k) outline.push_back(curve[curve.size() - 1 - k]);
+        }
+    }
+    {
+        MeshGroup& g = piece.Group("RDP_INTERSECTMIDTILE");
+        std::vector<Vec3> fan{ P(0.0f, 0.0f) };
+        std::vector<Vec2> uvs{ { 0.0f, 0.0f } };
+        for (const Vec2& o : outline) {
+            fan.push_back(P(o.x, o.y));
+            uvs.push_back({ o.y / 16.0f, o.x / 16.0f });
+        }
+        fan.push_back(fan[1]);
+        uvs.push_back(uvs[1]);
+        faceUp(g, fan, uvs);
+        CollisionArea area;
+        for (const Vec2& o : outline) area.outline.push_back(P(o.x, o.y));
+        area.surface = kSurfaceRoad;
+        piece.areas.push_back(std::move(area));
+    }
+
+    // The far sidewalk, straight on, and its kerb.
+    if (wf > 0.01f && !j.walkTextureFar.empty()) {
+        MeshGroup& g = piece.Group(j.walkTextureFar);
+        const int steps = std::max(2, (int)std::ceil(2.0f * L / 2.0f));
+        CollisionStrip top;
+        std::vector<Vec3> kerbLine;
+        for (int k = 0; k < steps; ++k) {
+            const float a0 = -L + 2.0f * L * k / steps, a1 = -L + 2.0f * L * (k + 1) / steps;
+            const Vec3 i0 = P(a0, -half, h), o0 = P(a0, -half - wf, h), o1 = P(a1, -half - wf, h), i1 = P(a1, -half, h);
+            const Vec2 ui0 = walkUv(j.uvFar, i0, a0, 0), uo0 = walkUv(j.uvFar, o0, a0, wf);
+            const Vec2 uo1 = walkUv(j.uvFar, o1, a1, wf), ui1 = walkUv(j.uvFar, i1, a1, 0);
+            AddQuad(g, Vertex(i0, up, ui0.x, ui0.y, color), Vertex(o0, up, uo0.x, uo0.y, color),
+                    Vertex(o1, up, uo1.x, uo1.y, color), Vertex(i1, up, ui1.x, ui1.y, color), up);
+            const Vec3 face = j.Out();     // the kerb faces the road
+            const Vec3 b0 = P(a0, -half), b1 = P(a1, -half);
+            AddQuad(g, Vertex(b0, face, ui0.x, ui0.y, color), Vertex(i0, face, ui0.x, ui0.y + 0.02f, color),
+                    Vertex(i1, face, ui1.x, ui1.y + 0.02f, color), Vertex(b1, face, ui1.x, ui1.y, color), face);
+            if (k == 0) { top.left.push_back(o0); top.right.push_back(i0); kerbLine.push_back(b0); }
+            top.left.push_back(o1);
+            top.right.push_back(i1);
+            kerbLine.push_back(b1);
+        }
+        top.surface = kSurfaceSidewalk;
+        piece.strips.push_back(std::move(top));
+        CollisionWall kerb;
+        kerb.points = std::move(kerbLine);
+        kerb.barrier = false;
+        kerb.height = h;
+        kerb.surface = kSurfaceSidewalk;
+        piece.walls.push_back(std::move(kerb));
+    }
+
+    // The near corners: the sidewalk between the curving kerb and the cut's
+    // straight edges, fanned from the corner of the box.
+    if (wn > 0.01f && !j.walkTextureNear.empty()) {
+        MeshGroup& g = piece.Group(j.walkTextureNear);
+        for (int s = 1; s >= -1; s -= 2) {
+            const std::vector<Vec2>& curve = corners[s > 0 ? 0 : 1];
+            std::vector<Vec2> ring{ { s * L, half + wn } };            // the box's corner
+            for (const Vec2& c : curve) ring.push_back(c);
+            std::vector<Vec3> fan;
+            std::vector<Vec2> uvs;
+            CollisionArea area;
+            for (const Vec2& r : ring) {
+                const Vec3 p = P(r.x, r.y, h);
+                fan.push_back(p);
+                uvs.push_back(walkUv(j.uvNear, p, r.x, r.y - half));
+                area.outline.push_back(p);
+            }
+            faceUp(g, fan, uvs);
+            area.surface = kSurfaceSidewalk;
+            piece.areas.push_back(std::move(area));
+            // The kerb face along the curve, facing the road.
+            CollisionWall kerb;
+            kerb.barrier = false;
+            kerb.height = h;
+            kerb.surface = kSurfaceSidewalk;
+            for (size_t k = 0; k + 1 < curve.size(); ++k) {
+                const Vec3 a0 = P(curve[k].x, curve[k].y), a1 = P(curve[k + 1].x, curve[k + 1].y);
+                const Vec3 t0 = P(curve[k].x, curve[k].y, h), t1 = P(curve[k + 1].x, curve[k + 1].y, h);
+                const Vec3 mid = (a0 + a1) * 0.5f;
+                Vec3 n = HorizontalDirection(Cross(a1 - a0, up), up);
+                if (Dot(n, P(0.0f, 0.0f) - mid) < 0.0f) n = n * -1.0f;
+                const Vec2 u0 = walkUv(j.uvNear, t0, curve[k].x, 0), u1 = walkUv(j.uvNear, t1, curve[k + 1].x, 0);
+                AddQuad(g, Vertex(a0, n, u0.x, u0.y, color), Vertex(t0, n, u0.x, u0.y + 0.02f, color),
+                        Vertex(t1, n, u1.x, u1.y + 0.02f, color), Vertex(a1, n, u1.x, u1.y, color), n);
+                if (k == 0) kerb.points.push_back(a0);
+                kerb.points.push_back(a1);
+            }
+            piece.walls.push_back(std::move(kerb));
+        }
     }
 }
 
@@ -772,6 +925,9 @@ void Network::RemoveNode(u32 id) {
                  nodes_.end());
     cuts_.erase(std::remove_if(cuts_.begin(), cuts_.end(), [&](const GameCut& c) { return c.node == id; }),
                 cuts_.end());
+    gameJunctions_.erase(std::remove_if(gameJunctions_.begin(), gameJunctions_.end(),
+                                        [&](const GameJunction& j) { return j.node == id; }),
+                         gameJunctions_.end());
     for (u32 end : ends)
         if (SegmentsAt(end).empty())
             nodes_.erase(std::remove_if(nodes_.begin(), nodes_.end(), [&](const Node& n) { return n.id == end; }),
@@ -779,8 +935,44 @@ void Network::RemoveNode(u32 id) {
     SetDirty();
 }
 
+std::vector<GameCut> Network::Cuts() const {
+    std::vector<GameCut> out = cuts_;
+    for (const GameJunction& j : gameJunctions_) {
+        float mouthHalf = 0.0f, branchWalk = 0.0f;
+        MouthOf(j, mouthHalf, branchWalk);
+        out.push_back(j.Cut(j.HalfLength(mouthHalf, branchWalk)));
+    }
+    return out;
+}
+
+void Network::MouthOf(const GameJunction& j, float& half, float& walk) const {
+    half = 4.0f;
+    walk = j.walkNear;
+    for (u32 id : SegmentsAt(j.node)) {
+        const Segment* s = FindSegment(id);
+        if (!s) continue;
+        half = s->profile.HalfRoad();
+        walk = s->profile.sidewalkWidth > 0.01f ? s->profile.sidewalkWidth : 0.0f;
+        break;
+    }
+}
+
 bool Network::UpdateFollowers() {
     bool moved = false;
+    // A new road leaving one of the game's roads starts at the junction's
+    // mouth, square to the road.
+    for (const GameJunction& j : gameJunctions_) {
+        Node* node = FindNode(j.node);
+        if (!node) continue;
+        const Vec3 out = j.Out();
+        const Vec3 at = j.At(0.0f, j.halfRoad + j.walkNear, 1.0f);
+        const float heading = Degrees(std::atan2(out.y, out.x));
+        if (Length(at - node->position) > 1e-4f || !node->hasHeading || std::fabs(node->heading - heading) > 1e-3f)
+            moved = true;
+        node->position = at;
+        node->hasHeading = true;
+        node->heading = heading;
+    }
     for (Node& node : nodes_) {
         if (!node.follow) continue;
         const Node* leader = FindNode(node.follow);
@@ -817,6 +1009,8 @@ void Network::MergeNodes(u32 from, u32 into) {
     }
     for (GameCut& c : cuts_)
         if (c.node == from) c.node = into;
+    for (GameJunction& j : gameJunctions_)
+        if (j.node == from) j.node = into;
     // Loops, and second segments between the same two nodes, go.
     std::vector<Segment> kept;
     for (const Segment& s : segments_) {
@@ -1083,6 +1277,19 @@ std::vector<MeshPiece> Network::BuildMesh(std::vector<Pole>* polesOut) const {
         }
     }
 
+    // ---- junctions made into the game's roads ---------------------------------
+    for (const GameJunction& j : gameJunctions_) {
+        float mouthHalf = 0.0f, branchWalk = 0.0f;
+        MouthOf(j, mouthHalf, branchWalk);
+        MeshPiece piece;
+        char name[64];
+        std::snprintf(name, sizeof(name), "ROAD_G%u", j.node);
+        piece.name = name;
+        piece.node = j.node;
+        BuildGameJunction(j, mouthHalf, branchWalk, piece);
+        pieces.push_back(std::move(piece));
+    }
+
     // ---- junction surfaces -------------------------------------------------
     for (const auto& [nodeId, ends] : junctions) {
         const Node& node = *FindNode(nodeId);
@@ -1252,7 +1459,7 @@ std::vector<MeshPiece> Network::BuildMesh(std::vector<Pole>* polesOut) const {
         for (const Segment& segment : segments_)
             if (segment.a == piece.node || segment.b == piece.node) return &segment.profile;
         return nullptr;
-    });
+    }, light_.get());
     if (polesOut) *polesOut = std::move(poles);
     return pieces;
 }
@@ -1306,6 +1513,21 @@ bool Network::Save(const std::wstring& path) const {
                       p.wallModelTurn);
         out << text << banking << "\n";
     }
+    for (const GameJunction& j : gameJunctions_) {
+        std::snprintf(line, sizeof(line),
+                      "gjunction %u %.4f %.4f %.4f %.5f %.5f %d %.4f %.4f %.4f %.4f %.4f %.4f %s %s %d",
+                      j.node, j.centre.x, j.centre.y, j.centre.z, j.forward.x, j.forward.y, j.side, j.halfRoad,
+                      j.walkNear, j.walkFar, j.walkHeight, j.zStart, j.zEnd, Token(j.walkTextureNear).c_str(),
+                      Token(j.walkTextureFar).c_str(), j.crosswalks ? 1 : 0);
+        out << line;
+        for (const UvMap* map : { &j.uvNear, &j.uvFar }) {
+            std::snprintf(line, sizeof(line), " %d %.4f %.4f %.6f %.6f %.6f %.6f %.6f %.6f", map->valid ? 1 : 0,
+                          map->origin.x, map->origin.y, map->uv.x, map->uv.y, map->gu.x, map->gu.y, map->gv.x,
+                          map->gv.y);
+            out << line;
+        }
+        out << "\n";
+    }
     for (const GameCut& c : cuts_) {
         std::snprintf(line, sizeof(line), "cut %u %.4f %.4f %.4f %.5f %.5f %.4f %.4f\n", c.node, c.centre.x, c.centre.y,
                       c.centre.z, c.forward.x, c.forward.y, c.halfLength, c.halfWidth);
@@ -1337,6 +1559,23 @@ bool Network::Load(const std::wstring& path) {
             line >> n.follow >> n.followOffset;
             nodes_.push_back(n);
             highest = std::max(highest, n.id);
+        } else if (kind == "gjunction") {
+            GameJunction j;
+            std::string nearTexture, farTexture;
+            int crosswalks = 0;
+            line >> j.node >> j.centre.x >> j.centre.y >> j.centre.z >> j.forward.x >> j.forward.y >> j.side >>
+                j.halfRoad >> j.walkNear >> j.walkFar >> j.walkHeight >> j.zStart >> j.zEnd >> nearTexture >> farTexture >> crosswalks;
+            for (UvMap* map : { &j.uvNear, &j.uvFar }) {
+                int valid = 0;
+                line >> valid >> map->origin.x >> map->origin.y >> map->uv.x >> map->uv.y >> map->gu.x >> map->gu.y >>
+                    map->gv.x >> map->gv.y;
+                map->valid = valid != 0;
+            }
+            if (!line) continue;
+            j.walkTextureNear = Untoken(nearTexture);
+            j.walkTextureFar = Untoken(farTexture);
+            j.crosswalks = crosswalks != 0;
+            gameJunctions_.push_back(j);
         } else if (kind == "cut") {
             GameCut c;
             line >> c.node >> c.centre.x >> c.centre.y >> c.centre.z >> c.forward.x >> c.forward.y >> c.halfLength >>
@@ -1419,10 +1658,11 @@ bool Network::Load(const std::wstring& path) {
 
 // ---------------------------------------------------------------------------
 
-void ApplyLighting(std::vector<MeshPiece>& pieces, const std::vector<Pole>& poles, u32 ambient) {
+void ApplyLighting(std::vector<MeshPiece>& pieces, const std::vector<Pole>& poles, u32 ambient,
+                   const Network::LightSources* sources) {
     RoadProfile profile;
     profile.ambient = ambient;
-    LightPieces(pieces, poles, [&](const MeshPiece&) { return &profile; });
+    LightPieces(pieces, poles, [&](const MeshPiece&) { return &profile; }, sources);
 }
 
 void RoadField::Build(const Network& network, const std::function<bool(const Segment&)>& include) {

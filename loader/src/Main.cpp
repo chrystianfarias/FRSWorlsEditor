@@ -307,6 +307,7 @@ void __cdecl Frame() {
     }
     ExtensionsFrame();
     LaunchPoseFrame();
+    RouteProbeFrame();
 }
 
 bool HookMainLoop() {
@@ -357,5 +358,6 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
     Log(HookMainLoop() ? "frame: main loop hooked at 0x581475"
                        : "frame: 0x581475 is not a call; the launch pose stays off");
     StartRecorder();
+    StartRouteProbe();
     return TRUE;
 }

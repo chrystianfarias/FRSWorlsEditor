@@ -230,7 +230,8 @@ bool Terrain::Apply(Patch& patch, Brush brush, const Vec3& centre, float radius,
 }
 
 std::vector<roads::MeshPiece> Terrain::BuildMesh(const Patch& patch, const roads::RoadField* roads,
-                                                 const std::vector<roads::Pole>& poles) const {
+                                                 const std::vector<roads::Pole>& poles,
+                                                 const roads::Network::LightSources* light) const {
     std::vector<roads::MeshPiece> pieces;
     if (patch.layers.empty()) return pieces;
     const int stride = patch.columns + 1;
@@ -308,7 +309,7 @@ std::vector<roads::MeshPiece> Terrain::BuildMesh(const Patch& patch, const roads
                 }
             if (piece.VertexCount()) pieces.push_back(std::move(piece));
         }
-    roads::ApplyLighting(pieces, poles, patch.ambient);
+    roads::ApplyLighting(pieces, poles, patch.ambient, light);
     return pieces;
 }
 

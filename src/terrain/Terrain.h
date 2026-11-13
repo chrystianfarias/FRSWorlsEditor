@@ -88,7 +88,8 @@ public:
     // The generated ground, in pieces of 16 x 16 cells (ROAD_T<patch>_<n>,
     // so they bake, hide and are removed with the roads), lit by `poles`.
     std::vector<roads::MeshPiece> BuildMesh(const Patch& patch, const roads::RoadField* roads,
-                                            const std::vector<roads::Pole>& poles) const;
+                                            const std::vector<roads::Pole>& poles,
+                                            const roads::Network::LightSources* light = nullptr) const;
 
     bool Save(const std::wstring& path) const;
     bool Load(const std::wstring& path);

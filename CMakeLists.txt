@@ -62,6 +62,11 @@ add_executable(FRSWorldEditor WIN32
     src/ui/EmbeddedGame.cpp
     src/ui/MainWindow.cpp
     src/ui/MainWindowShell.cpp
+    src/ui/OnlineLibrary.cpp
+    src/online/Sketchfab.cpp
+    src/net/Http.cpp
+    src/io/GlbToObj.cpp
+    src/io/LightBake.cpp
     src/ui/OverlayBrowser.cpp
     src/ui/PlacementDialogs.cpp
     src/ui/PropertiesPanel.cpp
@@ -146,7 +151,10 @@ if(MSVC)
 endif()
 
 # Dear ImGui (docking branch, MIT): the panels over the viewport.
-target_include_directories(FRSWorldEditor PRIVATE third_party/imgui third_party/phosphor)
+target_include_directories(FRSWorldEditor PRIVATE third_party/imgui third_party/phosphor
+    third_party/cgltf third_party/json)
+# Sketchfab: HTTPS, the login's local callback, the token kept with DPAPI.
+target_link_libraries(FRSWorldEditor PRIVATE winhttp ws2_32 crypt32)
 target_link_libraries(FRSWorldEditor PRIVATE imm32 dwmapi)
 set_source_files_properties(third_party/imgui/imgui.cpp third_party/imgui/imgui_draw.cpp
     third_party/imgui/imgui_tables.cpp third_party/imgui/imgui_widgets.cpp

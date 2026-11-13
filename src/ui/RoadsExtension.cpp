@@ -27,6 +27,7 @@
 #include "ui/EditorExtension.h"
 #include "ui/MainWindow.h"
 #include "ui/Resource.h"
+#include "ui/UndoRegistry.h"
 #include "ui/Viewport.h"
 
 #include <shlobj.h>
@@ -221,9 +222,92 @@ struct DrawBatch {
     u32 owner = 0;            // segment or node id, for picking
 };
 
-class RoadsExtension : public EditorExtension, public RenderExtension, public ViewportTool {
+class RoadsExtension : public EditorExtension, public RenderExtension, public ViewportTool, public UndoParticipant {
 public:
     explicit RoadsExtension(MainWindow& window) : app_(window) {}
+    ~RoadsExtension() override { undo::Unregister(this); }
+
+    // ---- undo (ui/UndoRegistry.h)
+    //
+    // Every change to the roads, the terrain patches and the sculpting of the
+    // game's ground is one step: the whole of that state as it was before,
+    // which is small next to what it describes. Ctrl+Z takes back the most
+    // recent step of the editor, this one's or another part's.
+
+    struct UndoState {
+        roads::Network network;
+        terrain::Terrain terrain;
+        terrain::GroundDeform ground;
+        std::set<std::string> fitted;
+        bool fitGround = true;
+        u64 stamp = 0;
+        std::wstring label;
+    };
+
+    UndoState Capture() const {
+        UndoState state;
+        state.network = network_;
+        state.terrain = terrain_;
+        state.ground = ground_;
+        state.fitted = fitted_;
+        state.fitGround = fitGround_;
+        return state;
+    }
+
+    // After a change is made: what was there before becomes a step.
+    void Commit(const wchar_t* label) {
+        if (!historyReady_) return;
+        UndoState before = std::move(settled_);
+        before.stamp = undo::NextStamp();
+        before.label = label;
+        undo_.push_back(std::move(before));
+        if (undo_.size() > 100) undo_.erase(undo_.begin());
+        settled_ = Capture();
+    }
+
+    void ResetHistory() {
+        undo_.clear();
+        settled_ = Capture();
+        historyReady_ = true;
+    }
+
+    u64 LatestUndoStamp() const override { return undo_.empty() ? 0 : undo_.back().stamp; }
+
+    bool UndoLatest() override {
+        if (undo_.empty()) return false;
+        UndoState state = std::move(undo_.back());
+        undo_.pop_back();
+        const std::wstring label = state.label;
+        network_ = std::move(state.network);
+        terrain_ = std::move(state.terrain);
+        ground_ = std::move(state.ground);
+        fitted_ = std::move(state.fitted);
+        fitGround_ = state.fitGround;
+        if (light_) network_.SetLightSources(light_);
+        network_.SetDirty();
+        meshRevision_ = 0;
+        terrainBuilt_ = 0;
+        groundFieldRevision_ = 0;
+        terrainBatches_.clear();
+        stroking_ = strokeGround_ = false;
+        drawing_ = false;
+        outline_.clear();
+        // What a selection pointed at may be gone.
+        const int selected = Selected();
+        if (selected >= 0 && !network_.FindNode((u32)(selected & ~kHandleBits)) &&
+            !network_.FindSegment((u32)(selected & ~kHandleBits)) &&
+            !terrain_.Find((u32)(selected & ~kTerrainBit)))
+            app_.Renderer().ClearSelection();
+        SaveNetwork();
+        SaveTerrain();
+        SaveGround();
+        SaveFitted();
+        settled_ = Capture();
+        app_.RebuildTree();
+        app_.UpdateMenuChecks();
+        app_.Status(L"Undone: " + label);
+        return true;
+    }
 
     void OnCreate() override {
         app_.Renderer().AddExtension(this);
@@ -239,9 +323,15 @@ public:
         AddMenu();
         AddAccelerators();
         PropertiesPanel::SetImageProvider([this](const std::wstring& name, int size) { return Picture(name, size); });
+        undo::Register(this);
     }
 
     bool OnCommand(int id) override {
+        // Ctrl+Z: ours when our step is the editor's most recent one.
+        if (id == CollisionTools::kUndoCommand) {
+            if (undo::Latest() != this) return false;
+            return UndoLatest();
+        }
         switch (id) {
             case ID_VIEW_ROADS:
                 visible_ = !visible_;
@@ -264,11 +354,13 @@ public:
                 fitGround_ = !fitGround_;
                 groundFieldRevision_ = 0;
                 app_.UpdateMenuChecks();
+                Commit(L"fit the game's ground to the roads");
                 return true;
             case ID_GROUND_DISCARD:
                 ground_.Clear();
                 SaveGround();
                 RefreshGround(nullptr);
+                Commit(L"discard the ground sculpting");
                 app_.Status(L"Unbaked sculpting of the game's ground thrown away");
                 return true;
             default:
@@ -296,9 +388,16 @@ public:
         ground_.Load(GroundPath());
         LoadFitted();
         CollectGroundModels(*world);
+        SetGameLight(*world);
         groundFieldRevision_ = 0;
         meshRevision_ = 0;
         CollectTextureChoices(*world);
+        if (world->Region() != historyRegion_) {
+            historyRegion_ = world->Region();
+            ResetHistory();
+        } else {
+            settled_ = Capture();
+        }
     }
 
     void OnRegionClosed() override {
@@ -466,10 +565,12 @@ public:
             if (strokeGround_) {
                 strokeGround_ = false;
                 SaveGround();
+                Commit(L"sculpt the game's ground");
                 app_.Status(L"Game ground sculpted -- shown here now; Roads > Bake writes it into the region");
                 return;
             }
             SaveTerrain();
+            Commit(L"terrain brush");
             app_.Status(Fmt(L"Terrain %s -- Roads > Bake hands it to the game", terrain::BrushName(brush_)));
             return;
         }
@@ -620,6 +721,7 @@ public:
             if (!groundTextures_.empty()) patch->layers[0].texture = Narrow(groundTextures_.front());
         terrainBuilt_ = 0;
         SaveTerrain();
+        Commit(L"new terrain");
         app_.RebuildTree();
         Select(kTerrainBit | (int)id);
         app_.Status(L"Terrain made: sculpt it with the brushes, grow or trim it with Add/Erase Area, move it with "
@@ -699,6 +801,7 @@ public:
             terrainBatches_.clear();
             app_.Renderer().ClearSelection();
             SaveTerrain();
+            Commit(L"delete terrain");
             app_.RebuildTree();
             return true;
         }
@@ -757,6 +860,7 @@ public:
             terrain_.Move(*patch, position - now);
             if (commit) {
                 SaveTerrain();
+                Commit(L"move terrain");
                 app_.Status(L"Terrain patch moved");
             }
             return true;
@@ -953,7 +1057,10 @@ private:
     void Changed(bool save) {
         network_.UpdateFollowers();
         network_.SetDirty();
-        if (save) SaveNetwork();
+        if (save) {
+            SaveNetwork();
+            Commit(L"road edit");
+        }
         const int selected = Selected();
         app_.RebuildTree();
         if (selected >= 0 && (network_.FindNode((u32)selected) || network_.FindSegment((u32)selected)))
@@ -1239,7 +1346,7 @@ private:
     void RebuildTerrain(const terrain::Patch& patch) {
         std::vector<DrawBatch>& list = terrainBatches_[patch.id];
         list.clear();
-        for (const roads::MeshPiece& piece : terrain_.BuildMesh(patch, &field_, poles_))
+        for (const roads::MeshPiece& piece : terrain_.BuildMesh(patch, &field_, poles_, network_.Light()))
             AddBatches(piece, kTerrainBit | patch.id, list, *this);
     }
 
@@ -1247,6 +1354,7 @@ private:
         RebuildRoads();
         if (groundFieldRevision_ != meshRevision_) {
             groundFieldRevision_ = meshRevision_;
+            cutsCache_ = network_.Cuts();
             BuildGroundField();
             RefreshGround(nullptr);
         }
@@ -1494,6 +1602,7 @@ private:
         }
         visible_ = true;
         const u32 id = terrain_.Add(point, 128.0f, 4.0f);
+        struct CommitLater { RoadsExtension* self; ~CommitLater() { self->SaveTerrain(); self->Commit(L"new terrain"); } } later{ this };
         if (terrain::Patch* patch = terrain_.Find(id)) {
             // The first layer: a texture the region's own ground uses most.
             if (!groundTextures_.empty()) patch->layers[0].texture = Narrow(groundTextures_.front());
@@ -1588,14 +1697,38 @@ private:
                     L"(Esc cancels)");
     }
 
+    // A texture mapping read off the game's triangle under a point.
+    static roads::UvMap MappingAt(const std::vector<GroundTriangle>& triangles, const Vec3& p, bool (*accept)(const std::string&),
+                                  std::string* texture) {
+        roads::UvMap map;
+        float h = 0.0f;
+        const GroundTriangle* t = SurfaceAt(triangles, p.x, p.y, p.z, h);
+        if (!t || (accept && !accept(t->texture))) return map;
+        const float det = (t->b.x - t->a.x) * (t->c.y - t->a.y) - (t->c.x - t->a.x) * (t->b.y - t->a.y);
+        if (std::fabs(det) < 1e-6f) return map;
+        const auto gradient = [&](float fa, float fb, float fc) {
+            const float d1 = fb - fa, d2 = fc - fa;
+            return Vec2{ (d1 * (t->c.y - t->a.y) - d2 * (t->b.y - t->a.y)) / det,
+                         (d2 * (t->b.x - t->a.x) - d1 * (t->c.x - t->a.x)) / det };
+        };
+        map.gu = gradient(t->ua.x, t->ub.x, t->uc.x);
+        map.gv = gradient(t->ua.y, t->ub.y, t->uc.y);
+        map.origin = t->a;
+        map.uv = t->ua;
+        map.valid = true;
+        if (texture) *texture = t->texture;
+        return map;
+    }
+
     // Reads the game's road under `point` -- its direction from the way its
-    // lane textures run, its width from where they end, the sidewalk beyond --
-    // and puts a procedural stretch of the same road there, with a junction
-    // node in its middle and a cut that takes the game's road out under it.
+    // lane textures run, its width from where they end, the sidewalks beyond
+    // and how they are mapped -- and makes a junction into it on the side
+    // that was clicked: the road stays the game's, a box across it is rebuilt
+    // and a new road leaves from its mouth.
     void JunctionOnGameRoad(const Vec3& point) {
-        const std::vector<GroundTriangle> triangles = GroundTrianglesNear(point, 40.0f);
+        const std::vector<GroundTriangle> triangles = GroundTrianglesNear(point, 45.0f);
         // The direction: where the lane textures' V runs, averaged as an axis
-        // (the doubled angle), weighted by area.
+        // (the doubled angle), weighted by area and by nearness.
         float sx = 0.0f, sy = 0.0f;
         u32 r = 0, g = 0, b = 0, n = 0;
         for (const GroundTriangle& t : triangles) {
@@ -1605,19 +1738,17 @@ private:
             const float dv1 = t.ub.y - t.ua.y, dv2 = t.uc.y - t.ua.y;
             const float gx = (dv1 * (t.c.y - t.a.y) - dv2 * (t.b.y - t.a.y)) / det;
             const float gy = (dv2 * (t.b.x - t.a.x) - dv1 * (t.c.x - t.a.x)) / det;
-            const float length = std::sqrt(gx * gx + gy * gy);
-            if (length < 1e-5f) continue;
+            if (std::sqrt(gx * gx + gy * gy) < 1e-5f) continue;
             const float angle = std::atan2(gy, gx);
-            const float weight = std::fabs(det);
             const Vec3 middle = (t.a + t.b + t.c) * (1.0f / 3.0f);
-            const float closeness = 1.0f / (1.0f + Length(Vec3{ middle.x - point.x, middle.y - point.y, 0 }) / 8.0f);
-            sx += std::cos(2.0f * angle) * weight * closeness;
-            sy += std::sin(2.0f * angle) * weight * closeness;
+            const float weight = std::fabs(det) / (1.0f + Length(Vec3{ middle.x - point.x, middle.y - point.y, 0 }) / 8.0f);
+            sx += std::cos(2.0f * angle) * weight;
+            sy += std::sin(2.0f * angle) * weight;
             r += (t.colour >> 16) & 0xFF; g += (t.colour >> 8) & 0xFF; b += t.colour & 0xFF; ++n;
         }
         if (std::fabs(sx) + std::fabs(sy) < 1e-6f) {
-            app_.Message(L"No lane markings of the game's roads were found there. Click the middle of a street "
-                         L"(its lane texture), on a terrain mesh the editor can change.");
+            app_.Message(L"No lane markings of the game's roads were found there. Click on a street (its lane "
+                         L"texture), on the side the new road should leave from.");
             return;
         }
         const float angle = 0.5f * std::atan2(sy, sx);
@@ -1646,68 +1777,84 @@ private:
         const float walkRight = walk(1.0f, IsWalkTexture, rightEdge + 0.5f, rightEdge + 10.0f, wr) - rightEdge;
         const float width = left + rightEdge;
         if (width < 3.0f) {
-            app_.Message(L"The road there is too narrow to read; click nearer its middle.");
+            app_.Message(L"The road there is too narrow to read; click on its surface.");
             return;
         }
-        const float sidewalk = std::max(0.0f, std::min(walkLeft, walkRight) > 0.6f ? std::min(walkLeft, walkRight) : 0.0f);
         Vec3 centre = point + right * ((rightEdge - left) * 0.5f);
         {
             float h = 0.0f;
             if (SurfaceAt(triangles, centre.x, centre.y, point.z, h)) centre.z = h;
         }
+        // The new road leaves from the side that was clicked.
+        const int side = Dot(point - centre, right) >= 0.0f ? 1 : -1;
+        const float half = width * 0.5f;
+        roads::GameJunction j;
+        j.centre = centre;
+        j.forward = forward;
+        j.side = side;
+        j.halfRoad = half;
+        j.walkNear = std::max(0.0f, side > 0 ? walkRight : walkLeft);
+        j.walkFar = std::max(0.0f, side > 0 ? walkLeft : walkRight);
+        if (j.walkNear < 0.6f) j.walkNear = 0.0f;
+        if (j.walkFar < 0.6f) j.walkFar = 0.0f;
+        const float walkTop = j.walkNear > 0 ? (side > 0 ? wr : wl) : (side > 0 ? wl : wr);
+        j.walkHeight = std::clamp(walkTop - centre.z, 0.05f, 0.5f);
 
+        // The new road: two lanes the width of the game's, sidewalks like the
+        // ones it leaves from.
         roads::RoadProfile profile = lastProfile_;
         const int lanes = std::max(1, (int)std::lround(width / 4.0f));
-        profile.laneWidth = width / lanes;
-        profile.lanesBackward = lanes / 2;
-        profile.lanesForward = lanes - profile.lanesBackward;
-        profile.sidewalkWidth = sidewalk;
-        profile.sidewalkHeight = sidewalk > 0.0f ? std::clamp((wl + wr) * 0.5f - centre.z, 0.05f, 0.5f) : 0.2f;
+        profile.laneWidth = std::clamp(width / lanes, 2.5f, 6.0f);
+        profile.lanesForward = 1;
+        profile.lanesBackward = 1;
+        profile.medianType = 0;
+        profile.sidewalkWidth = j.walkNear;
+        profile.sidewalkLeft = profile.sidewalkRight = true;
+        profile.sidewalkHeight = j.walkHeight;
         profile.wallLeft = profile.wallRight = false;
         profile.poleModel.clear();
         profile.bridge = false;
-        profile.keepGround = true;
+        profile.bankMode = 0;
+        profile.keepGround = false;
         if (n) profile.ambient = ((r / n) << 16) | ((g / n) << 8) | (b / n);
 
-        // Long enough for a junction and the roads leaving it.
-        const float half = profile.HalfWidth();
-        const float reach = std::max(18.0f, half * 2.0f + 8.0f);
-        const auto ground = [&](const Vec3& p) {
-            Vec3 q = p;
+        const float L = j.HalfLength(profile.HalfRoad(), profile.sidewalkWidth);
+        {
             float h = 0.0f;
-            if (SurfaceAt(GroundTrianglesNear(p, 6.0f), p.x, p.y, centre.z, h)) q.z = h;
-            return q;
-        };
-        const Vec3 a = ground(centre - forward * reach);
-        const Vec3 b2 = ground(centre + forward * reach);
-
-        const float heading = Degrees(angle);
-        const u32 na = network_.AddNode(a), nm = network_.AddNode(centre), nb = network_.AddNode(b2);
-        for (u32 id : { na, nm, nb }) {
-            roads::Node* node = network_.FindNode(id);
-            node->hasHeading = true;
-            node->heading = heading;
+            const Vec3 a = centre - forward * L, z = centre + forward * L;
+            j.zStart = SurfaceAt(GroundTrianglesNear(a, 6.0f), a.x, a.y, centre.z, h) ? h : centre.z;
+            j.zEnd = SurfaceAt(GroundTrianglesNear(z, 6.0f), z.x, z.y, centre.z, h) ? h : centre.z;
         }
-        // The stubs' handles straight along the road, so their ends meet it square.
-        if (roads::Segment* s = network_.AddSegment(na, nm, profile)) s->handleA = s->handleB = reach / 3.0f;
-        if (roads::Segment* s = network_.AddSegment(nm, nb, profile)) s->handleA = s->handleB = reach / 3.0f;
+        // The sidewalks' own texture mapping, read just past the box.
+        const Vec3 out = j.Out();
+        if (j.walkNear > 0.0f) {
+            const Vec3 p = centre - forward * (L + 0.6f) + out * (half + j.walkNear * 0.5f) + Vec3{ 0, 0, j.walkHeight };
+            j.uvNear = MappingAt(triangles, p, IsWalkTexture, &j.walkTextureNear);
+            if (!j.uvNear.valid) j.walkTextureNear = profile.sidewalkTexture;
+            else profile.sidewalkTexture = j.walkTextureNear;
+        }
+        if (j.walkFar > 0.0f) {
+            const Vec3 p = centre - forward * (L + 0.6f) - out * (half + j.walkFar * 0.5f) + Vec3{ 0, 0, j.walkHeight };
+            j.uvFar = MappingAt(triangles, p, IsWalkTexture, &j.walkTextureFar);
+            if (!j.uvFar.valid) j.walkTextureFar = profile.sidewalkTexture;
+        }
 
-        roads::GameCut cut;
-        cut.node = nm;
-        cut.centre = centre;
-        cut.forward = forward;
-        cut.halfLength = reach;
-        cut.halfWidth = half + 0.3f;
-        network_.AddCut(cut);
-
+        // The mouth node, placed by the junction, and the first stretch of the new road.
+        const Vec3 mouth = j.At(0.0f, half + j.walkNear, 1.0f);
+        const u32 start = network_.AddNode(mouth);
+        const u32 tip = network_.AddNode(mouth + out * 30.0f);
+        network_.AddSegment(start, tip, profile);
+        j.node = start;
+        network_.AddGameJunction(j);
         Changed(true);
-        Select((int)nm);
-        LOG_INFO("roads: junction on the game's road at (%.1f, %.1f, %.1f), heading %.1f, %d lanes of %.2f, "
-                 "sidewalk %.2f, cut %.1f x %.1f", centre.x, centre.y, centre.z, heading, lanes, profile.laneWidth,
-                 sidewalk, reach * 2.0f, cut.halfWidth * 2.0f);
-        app_.Status(Fmt(L"Junction made on the game's road (%d lanes, %.1f wide): Ctrl+Shift+R pulls the new road "
-                        L"out of it. The game's road under it is cut when the roads are baked.",
-                        lanes, width));
+        Select((int)tip);
+        LOG_INFO("roads: junction into the game's road at (%.1f, %.1f, %.1f), heading %.1f, road %.2f wide, "
+                 "sidewalks %.2f near / %.2f far (%s / %s), box %.1f long", centre.x, centre.y, centre.z,
+                 Degrees(angle), width, j.walkNear, j.walkFar, j.walkTextureNear.c_str(), j.walkTextureFar.c_str(),
+                 L * 2.0f);
+        app_.Status(Fmt(L"Junction made into the game's road (%.1f wide): its box is rebuilt with the game's own "
+                        L"sidewalks; drag the new road's end with the gizmo, Ctrl+Shift+R pulls more road.",
+                        width));
     }
 
     // ---- the game's own ground
@@ -1768,6 +1915,8 @@ private:
     // only, so moving its vertices moves nothing somewhere else.
     void CollectGroundModels(const nfs::World& world) {
         groundModels_.clear();
+        lightGrid_.clear();
+        lightGridBuilt_ = false;
         std::unordered_map<u32, int> placements;
         for (const auto& loaded : world.Loaded())
             for (const nfs::SceneryInstance& instance : loaded->scenery.instances)
@@ -1794,10 +1943,100 @@ private:
                  groundModels_.size(), shared);
     }
 
+    // The light the game baked into its ground: the vertex colours of the
+    // triangle under a point, found through a grid of the terrain's triangles.
+    struct TriangleRef { u32 model, first; };
+    static constexpr float kLightCell = 8.0f;
+    static long long LightKey(int x, int y) { return ((long long)x << 32) ^ (long long)(u32)y; }
+
+    void BuildLightGrid() const {
+        lightGrid_.clear();
+        for (u32 m = 0; m < groundModels_.size(); ++m) {
+            const GroundModel& g = groundModels_[m];
+            const auto& indices = g.model->indices;
+            for (u32 k = 0; k + 2 < indices.size(); k += 3) {
+                const Vec3& a = g.world[indices[k]];
+                const Vec3& b = g.world[indices[k + 1]];
+                const Vec3& c = g.world[indices[k + 2]];
+                const int x0 = (int)std::floor(std::min({ a.x, b.x, c.x }) / kLightCell);
+                const int x1 = (int)std::floor(std::max({ a.x, b.x, c.x }) / kLightCell);
+                const int y0 = (int)std::floor(std::min({ a.y, b.y, c.y }) / kLightCell);
+                const int y1 = (int)std::floor(std::max({ a.y, b.y, c.y }) / kLightCell);
+                if (x1 - x0 > 16 || y1 - y0 > 16) continue;   // a huge backdrop triangle
+                for (int y = y0; y <= y1; ++y)
+                    for (int x = x0; x <= x1; ++x) lightGrid_[LightKey(x, y)].push_back({ m, k });
+            }
+        }
+        lightGridBuilt_ = true;
+    }
+
+    bool GameLightAt(const Vec3& p, u32& colour) const {
+        if (!lightGridBuilt_) BuildLightGrid();
+        const auto cell = lightGrid_.find(LightKey((int)std::floor(p.x / kLightCell), (int)std::floor(p.y / kLightCell)));
+        if (cell == lightGrid_.end()) return false;
+        float bestGap = 2.5f;
+        bool found = false;
+        for (const TriangleRef& ref : cell->second) {
+            if (ref.model >= groundModels_.size()) continue;
+            const GroundModel& g = groundModels_[ref.model];
+            const auto& indices = g.model->indices;
+            const u32 ia = indices[ref.first], ib = indices[ref.first + 1], ic = indices[ref.first + 2];
+            const Vec3& a = g.world[ia];
+            const Vec3& b = g.world[ib];
+            const Vec3& c = g.world[ic];
+            const float d = (b.y - c.y) * (a.x - c.x) + (c.x - b.x) * (a.y - c.y);
+            if (std::fabs(d) < 1e-6f) continue;
+            const float l1 = ((b.y - c.y) * (p.x - c.x) + (c.x - b.x) * (p.y - c.y)) / d;
+            const float l2 = ((c.y - a.y) * (p.x - c.x) + (a.x - c.x) * (p.y - c.y)) / d;
+            const float l3 = 1.0f - l1 - l2;
+            if (l1 < -1e-3f || l2 < -1e-3f || l3 < -1e-3f) continue;
+            const float z = a.z * l1 + b.z * l2 + c.z * l3;
+            const float gap = std::fabs(z - p.z);
+            if (gap > bestGap) continue;
+            bestGap = gap;
+            const u32 ca = g.model->vertices[ia].color, cb = g.model->vertices[ib].color, cc = g.model->vertices[ic].color;
+            colour = 0;
+            for (int shift = 0; shift <= 16; shift += 8) {
+                const float v = ((ca >> shift) & 0xFF) * l1 + ((cb >> shift) & 0xFF) * l2 + ((cc >> shift) & 0xFF) * l3;
+                colour |= (u32)std::clamp((int)std::lround(v), 0, 255) << shift;
+            }
+            found = true;
+        }
+        return found;
+    }
+
+    // The network's light: the game's ground under it, and the game's street
+    // lights where there is none.
+    void SetGameLight(const nfs::World& world) {
+        auto sources = std::make_shared<roads::Network::LightSources>();
+        sources->sample = [this](const Vec3& p, u32& colour) { return GameLightAt(p, colour); };
+        for (const auto& loaded : world.Loaded())
+            for (const nfs::SceneryInstance& instance : loaded->scenery.instances) {
+                const nfs::SolidObject* model = world.FindModel(loaded->scenery.ModelHash(instance));
+                if (!model) continue;
+                const std::string& name = model->name;
+                if (name.find("STREETLIGHT") == std::string::npos && name.find("LAMP") == std::string::npos) continue;
+                roads::Pole lamp;
+                lamp.model = name;
+                lamp.position = { instance.transform.m[3][0], instance.transform.m[3][1], instance.transform.m[3][2] };
+                lamp.lamp = lamp.position + Vec3{ 0.0f, 0.0f, 7.0f };
+                lamp.color = 0xFFD9A0;
+                lamp.radius = 14.0f;
+                lamp.strength = 1.0f;
+                sources->lamps.push_back(lamp);
+            }
+        LOG_INFO("roads: lit by the game's baked ground light, and %zu of its street lights where there is no "
+                 "ground of its under them", sources->lamps.size());
+        network_.SetLightSources(sources);
+        light_ = sources;
+    }
+
     // Where the game's ground ends up: its height, the brushes' offset, and
     // fitted to the roads it has not been fitted to yet.
     float GroundAt(float x, float y, float z) const {
         float h = z + ground_.At(x, y);
+        for (const roads::GameCut& cut : cutsCache_)
+            if (cut.Inside({ x, y, h }, -kGroundShoulder)) return h;
         float roadZ = 0.0f, outside = 0.0f;
         if (fitGround_ && !groundField_.Empty() && groundField_.Query(x, y, kGroundShoulder, roadZ, outside) &&
             std::fabs(h - roadZ) < 12.0f) {
@@ -1813,7 +2052,7 @@ private:
 
     // Draws the moved ground: every mesh in `area` (all when null).
     void RefreshGround(const Aabb* area) {
-        const auto& cuts = network_.Cuts();
+        const auto& cuts = cutsCache_;
         const bool any = !ground_.Empty() || (fitGround_ && !groundField_.Empty()) || !cuts.empty();
         for (GroundModel& g : groundModels_) {
             if (area && (g.bounds.max.x < area->min.x || g.bounds.min.x > area->max.x ||
@@ -1989,6 +2228,11 @@ private:
     roads::Network network_;
     roads::RoadProfile lastProfile_;
     std::vector<DrawBatch> batches_;
+    std::vector<UndoState> undo_;
+    UndoState settled_;
+    bool historyReady_ = false;
+    std::wstring historyRegion_;
+    std::shared_ptr<const roads::Network::LightSources> light_;
     terrain::Terrain terrain_;
     roads::RoadField field_;
     std::map<u32, std::vector<DrawBatch>> terrainBatches_;
@@ -2014,6 +2258,9 @@ private:
     bool  patchDragging_ = false;
     terrain::GroundDeform ground_;
     std::vector<GroundModel> groundModels_;
+    mutable std::unordered_map<long long, std::vector<TriangleRef>> lightGrid_;
+    mutable bool lightGridBuilt_ = false;
+    std::vector<roads::GameCut> cutsCache_;
     roads::RoadField groundField_;
     u64 groundFieldRevision_ = 0;
     std::set<std::string> fitted_;
@@ -2277,6 +2524,7 @@ bool RoadsExtension::ApplyProperties() {
         if (properties.ReadText(kTerrainAmbient, value)) patch->ambient = ParseColour(value, patch->ambient);
         terrain_.Touch();
         SaveTerrain();
+        Commit(L"terrain settings");
         return true;
     }
     float x = 0.0f, y = 0.0f, z = 0.0f;
@@ -2702,7 +2950,8 @@ bool RoadsExtension::BakeGroundCollision(size_t& moved) {
     nfs::World* world = app_.World();
     CollisionTools* tools = app_.Collision();
     if (!world || !tools) return false;
-    const auto& cuts = network_.Cuts();
+    cutsCache_ = network_.Cuts();
+    const auto& cuts = cutsCache_;
     if (ground_.Empty() && !(fitGround_ && !groundField_.Empty()) && cuts.empty()) return true;
     collision::Editor& editor = tools->Editor();
     if (editor.World() != world) editor.SetWorld(world);
@@ -2835,7 +3084,8 @@ bool RoadsExtension::BakeGroundModels(size_t& moved, std::wstring& error) {
     if (!world) return false;
     CollectGroundModels(*world);
     BuildGroundField();
-    const auto& cuts = network_.Cuts();
+    cutsCache_ = network_.Cuts();
+    const auto& cuts = cutsCache_;
 
     std::vector<PickResult> selection;
     std::vector<const GroundModel*> chosen;
@@ -3146,6 +3396,7 @@ void RoadsExtension::Unbake() {
     }
     app_.Status(Fmt(L"%zu baked road pieces and %zu collision polygons removed from the game; the road network "
                     L"is kept in the editor", removed, collisionRemoved));
+    ResetHistory();
 }
 
 void RoadsExtension::Bake() {
@@ -3166,7 +3417,7 @@ void RoadsExtension::Bake() {
         roads::RoadField field;
         field.Build(network_, [](const roads::Segment& segment) { return !segment.profile.bridge; });
         for (const terrain::Patch& patch : terrain_.Patches())
-            for (roads::MeshPiece& piece : terrain_.BuildMesh(patch, &field, poles)) pieces.push_back(std::move(piece));
+            for (roads::MeshPiece& piece : terrain_.BuildMesh(patch, &field, poles, network_.Light())) pieces.push_back(std::move(piece));
     }
 
     // Street lights and collision first, written by the edits' save, which
@@ -3259,6 +3510,9 @@ void RoadsExtension::Bake() {
                     baked, pieces.size(), removed, collisionAdded, collisionRemoved, polesAdded, groundMeshes,
                     groundPolygons));
     LOG_INFO("roads: baked %zu of %zu pieces from %S", baked, pieces.size(), obj.c_str());
+    // What was baked is in the game's files now: the history starts again
+    // from here (Region Edits or Remove Baked Roads take a bake back).
+    ResetHistory();
     if (baked < pieces.size())
         app_.Message(Fmt(L"%zu of %zu road pieces could not be made into models (the log has why: usually a "
                          L"section with no object of its own to build from).",

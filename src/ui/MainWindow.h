@@ -6,6 +6,7 @@
 #include "ui/BlenderLink.h"
 #include "ui/EditorExtension.h"
 #include "ui/ModelCatalog.h"
+#include "ui/OnlineLibrary.h"
 #include "ui/EditsPanel.h"
 #include "ui/EmbeddedGame.h"
 #include "ui/OverlayBrowser.h"
@@ -16,6 +17,7 @@
 #include <windows.h>
 #include <commctrl.h>
 
+#include <map>
 #include <memory>
 #include <unordered_map>
 #include <string>
@@ -84,7 +86,14 @@ private:
     void ExportSelectedObjects();
     void ExportSelectedCollision();
     void GenerateMinimapBuildings();   // MINIMAP PREVIEW (temporary)
-    void ImportEditedCollision(const std::wstring& path);
+    // `quick`: a save in a Blender session -- laid on the packs as they were
+    // when the session began, reported in the status bar, not in a dialog.
+    void ImportEditedCollision(const std::wstring& path, bool quick = false);
+    // Edit in Blender with collision polygons selected: they go over, with
+    // the drawn world around them as a reference to model against.
+    void EditCollisionInBlender();
+    bool blenderCollision_ = false;
+    std::map<std::string, nfs::CollisionPack> blenderBases_;
 
     // Scenery placement: a model from the region, by name, at the point the
     // view is centred on. Placements live in the editor until written.
@@ -201,6 +210,24 @@ private:
     // Object / Edit mode, floating in a corner of the view.
     void DrawViewModes();
     class MeshTools* meshTools_ = nullptr;   // one of extensions_
+    // The Explorer's Online tab: Sketchfab models (ui/OnlineLibrary.h).
+    std::unique_ptr<OnlineLibrary> online_;
+    void PlaceOnlineModel();
+
+    // Night lighting baked into the selected objects' vertex colours
+    // (io/LightBake.h): a dialog drawn with the panels, a preview on screen,
+    // and the write, which goes the way an edit from Blender comes back.
+    void DrawBakeDialog();
+    void ApplyBake(bool preview);
+    void RestoreBake();
+    void WriteBake();
+    bool bakeOpen_ = false;
+    bool bakeNatives_ = false;
+    bool bakeMeasured_ = false;
+    float bakeAmbient_ = 1.0f, bakeLamps_ = 1.0f, bakeRadius_ = 24.0f;
+    std::vector<PickResult> bakeTargets_;
+    std::map<u32, std::vector<u32>> bakeOriginal_;   // model hash -> colours before the preview
+    static constexpr UINT kBakeWriteMessage = WM_APP + 0x54;
     void UpdateShellDrag();
     void HideNativeShell();
     void* ShellThumbnail(int image);
@@ -209,6 +236,7 @@ private:
     std::unordered_map<int, void*> thumbTextures_;
     bool shellDragging_ = false;
     int  shellDragItem_ = -1;
+    int  shownTab_ = -1;
     static constexpr UINT kShellTreeActivate = WM_APP + 0x51;
     static constexpr UINT kShellLibraryActivate = WM_APP + 0x52;
 

@@ -3,7 +3,9 @@
 #include "core/Math.h"
 #include "core/Types.h"
 
+#include <algorithm>
 #include <cmath>
+#include <string>
 #include <vector>
 
 // A stretch of one of the game's own roads that a procedural road replaces:
@@ -44,6 +46,63 @@ struct GameCut {
             for (int b = -1; b <= 1; b += 2)
                 box.Add(centre + forward * (halfLength * a) + r * (halfWidth * b));
         return box;
+    }
+};
+
+// A texture mapping read off one of the game's triangles: the coordinates at
+// a point and how they change across the ground, so a new surface beside it
+// carries the same texture on without a seam.
+struct UvMap {
+    bool valid = false;
+    Vec3 origin;
+    Vec2 uv;
+    Vec2 gu, gv;    // d(u)/d(x, y), d(v)/d(x, y)
+    Vec2 At(const Vec3& p) const {
+        const float dx = p.x - origin.x, dy = p.y - origin.y;
+        return { uv.x + gu.x * dx + gu.y * dy, uv.y + gv.x * dx + gv.y * dy };
+    }
+};
+
+// A junction made into one of the game's own roads. The road stays the
+// game's: only a box across it is rebuilt -- the junction surface, the far
+// sidewalk carried straight on, and on the side the new road leaves from,
+// kerbs curving round into the new road's sidewalks. Sidewalks continue the
+// game's own texture mapping, read where they were cut; heights come from the
+// game's road at the box's ends.
+struct GameJunction {
+    u32   node = 0;           // the new road's first node, at the mouth
+    Vec3  centre;             // on the road's middle line
+    Vec3  forward{ 1, 0, 0 }; // along the game's road
+    int   side = 1;           // +1: the new road leaves to the right of `forward`
+    float halfRoad = 4.0f;    // the game's road, kerb to kerb, halved
+    float walkNear = 0.0f, walkFar = 0.0f, walkHeight = 0.2f;
+    float zStart = 0.0f, zEnd = 0.0f;   // road height at the box's two ends
+    std::string walkTextureNear, walkTextureFar;
+    UvMap uvNear, uvFar;
+    bool  crosswalks = false;
+
+    // Across the road, towards the new road.
+    Vec3 Out() const { return Vec3{ forward.y, -forward.x, 0.0f } * (float)side; }
+    // The box's half length along the road, for a new road `mouthHalf` wide
+    // (kerb to kerb, halved) with `branchWalk` sidewalks.
+    float HalfLength(float mouthHalf, float branchWalk) const {
+        return mouthHalf + std::max(std::max(walkNear, branchWalk), 0.5f) + 1.5f;
+    }
+    // A point of the box: `along` the road, `across` towards the new road.
+    Vec3 At(float along, float across, float halfLength, float lift = 0.0f) const {
+        const float t = halfLength > 1e-3f ? (along + halfLength) / (2.0f * halfLength) : 0.5f;
+        const Vec3 p = centre + forward * along + Out() * across;
+        return { p.x, p.y, zStart + (zEnd - zStart) * std::clamp(t, 0.0f, 1.0f) + lift };
+    }
+    // The stretch of the game's road it replaces.
+    GameCut Cut(float halfLength) const {
+        GameCut c;
+        c.node = node;
+        c.forward = forward;
+        c.halfLength = halfLength;
+        c.halfWidth = halfRoad + (walkNear + walkFar) * 0.5f + 0.05f;
+        c.centre = centre + Out() * ((walkNear - walkFar) * 0.5f);
+        return c;
     }
 };
 

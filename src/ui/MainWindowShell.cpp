@@ -13,7 +13,10 @@
 
 #include "core/Log.h"
 #include "ui/ImGuiLayer.h"
+#include "io/LightBake.h"
+#include "io/SelectionExport.h"
 #include "ui/MeshTools.h"
+#include "ui/OnlineLibrary.h"
 #include "ui/Resource.h"
 
 #include "imgui.h"
@@ -22,6 +25,7 @@
 #include <commctrl.h>
 
 #include <algorithm>
+#include <set>
 #include <cstring>
 #include <cwchar>
 #include <string>
@@ -549,8 +553,179 @@ void MainWindow::DrawViewModes() {
     ImGui::PopStyleVar(3);
 }
 
+// ---------------------------------------------------------------------------
+// Night lighting
+// ---------------------------------------------------------------------------
+
+namespace {
+lightbake::Environment g_bakeEnvironment;   // measured when the dialog opens
+}
+
+void MainWindow::ApplyBake(bool preview) {
+    (void)preview;
+    if (!world_) return;
+    lightbake::Settings settings;
+    settings.ambientScale = bakeAmbient_;
+    settings.lampScale = bakeLamps_;
+    settings.lampRadius = bakeRadius_;
+    std::set<u32> done;
+    for (const PickResult& picked : bakeTargets_) {
+        if (!picked.object || !done.insert(picked.object->hash).second) continue;
+        const u32 hash = picked.object->hash;
+        if (!bakeOriginal_.count(hash)) {
+            std::vector<u32> original;
+            for (const auto& v : picked.object->vertices) original.push_back(v.color);
+            bakeOriginal_[hash] = std::move(original);
+        }
+        const std::vector<u32> colours = lightbake::Bake(*picked.object, picked.transform, g_bakeEnvironment, settings);
+        // Every stored copy of the model, and what the GPU draws.
+        for (size_t s = 0; s < world_->Loaded().size(); ++s)
+            for (nfs::SolidList& list : world_->MutableLoaded(s)->solidLists)
+                for (nfs::SolidObject& object : list.objects)
+                    if (object.hash == hash && object.vertices.size() == colours.size())
+                        for (size_t i = 0; i < colours.size(); ++i) object.vertices[i].color = colours[i];
+        viewport_.GetRenderer().UpdateModelColours(hash, colours);
+    }
+}
+
+void MainWindow::RestoreBake() {
+    if (!world_) { bakeOriginal_.clear(); return; }
+    for (const auto& [hash, colours] : bakeOriginal_) {
+        for (size_t s = 0; s < world_->Loaded().size(); ++s)
+            for (nfs::SolidList& list : world_->MutableLoaded(s)->solidLists)
+                for (nfs::SolidObject& object : list.objects)
+                    if (object.hash == hash && object.vertices.size() == colours.size())
+                        for (size_t i = 0; i < colours.size(); ++i) object.vertices[i].color = colours[i];
+        viewport_.GetRenderer().UpdateModelColours(hash, colours);
+    }
+    bakeOriginal_.clear();
+}
+
+void MainWindow::WriteBake() {
+    if (!world_ || bakeTargets_.empty()) return;
+    ApplyBake(false);
+    // Written as an edit from Blender comes back: exported with the new
+    // colours, read back quietly.
+    wchar_t base[MAX_PATH] = {};
+    if (!::GetEnvironmentVariableW(L"LOCALAPPDATA", base, MAX_PATH)) return;
+    std::wstring folder = std::wstring(base) + L"\\FRSWorldEditor";
+    ::CreateDirectoryW(folder.c_str(), nullptr);
+    folder += L"\\bake";
+    ::CreateDirectoryW(folder.c_str(), nullptr);
+    SYSTEMTIME now{};
+    ::GetLocalTime(&now);
+    wchar_t name[64];
+    ::_snwprintf_s(name, _TRUNCATE, L"\\bake-%04u%02u%02u-%02u%02u%02u.obj", now.wYear, now.wMonth, now.wDay,
+                   now.wHour, now.wMinute, now.wSecond);
+    const std::wstring objPath = folder + name;
+    ExportSummary summary;
+    if (!ExportSelection(*world_, bakeTargets_, objPath, world_->Region(), summary)) {
+        SetStatusText(2, L"The lighting could not be written: the export failed (see the log)");
+        return;
+    }
+    bakeOriginal_.clear();
+    bakeTargets_.clear();
+    LOG_INFO("light bake: writing %zu models through %S", summary.objects, objPath.c_str());
+    ImportObj(objPath, true);
+    SetStatusText(2, L"Night lighting baked into " + std::to_wstring(summary.objects) + L" models and written");
+}
+
+void MainWindow::DrawBakeDialog() {
+    if (bakeOpen_) {
+        bakeOpen_ = false;
+        bakeMeasured_ = false;
+        bakeOriginal_.clear();
+        ImGui::OpenPopup("Bake night lighting");
+    }
+    ImGui::SetNextWindowSize(ImVec2(470, 0), ImGuiCond_Appearing);
+    if (!ImGui::BeginPopupModal("Bake night lighting", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) return;
+
+    // What it applies to: the selection -- by default the objects made in
+    // this editor, whose models nothing else shares.
+    std::vector<PickResult> targets;
+    size_t shared = 0;
+    for (const PickResult& picked : viewport_.GetRenderer().Selection()) {
+        if (!picked.object) continue;
+        const bool mine = picked.object->name.rfind("FRS_", 0) == 0;
+        if (!mine && !bakeNatives_) { ++shared; continue; }
+        targets.push_back(picked);
+    }
+    if (!bakeMeasured_ && world_ && !targets.empty()) {
+        Aabb area;
+        for (const PickResult& picked : targets)
+            if (picked.object->bounds.Valid()) area.Add(Transform(picked.object->bounds, picked.transform));
+        lightbake::Settings settings;
+        settings.lampRadius = bakeRadius_;
+        g_bakeEnvironment = lightbake::Measure(*world_, area, settings);
+        bakeMeasured_ = true;
+    }
+    bakeTargets_ = targets;
+
+    ImGui::TextWrapped("The game lights its world at night through vertex colours. This gives the selected "
+                       "objects the light of where they stand: the street's own darkness, and the glow of the "
+                       "street lights around them.");
+    ImGui::Spacing();
+    if (targets.empty()) {
+        ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.4f, 1.0f), "Select objects made in the editor (FRS_...) first.");
+    } else {
+        ImGui::Text(ICON_PH_CUBE "  %zu objects", targets.size());
+        const lightbake::Environment& e = g_bakeEnvironment;
+        ImGui::SameLine();
+        ImGui::TextDisabled("|  %zu street lights in reach", e.lamps.size());
+        const ImVec4 ambient(std::min(1.0f, e.ambient.x * 0.5f), std::min(1.0f, e.ambient.y * 0.5f),
+                             std::min(1.0f, e.ambient.z * 0.5f), 1.0f);
+        const ImVec4 lamp(std::min(1.0f, e.lampColour.x * 0.5f), std::min(1.0f, e.lampColour.y * 0.5f),
+                          std::min(1.0f, e.lampColour.z * 0.5f), 1.0f);
+        ImGui::ColorButton("##ambient", ambient, ImGuiColorEditFlags_NoTooltip, ImVec2(18, 18));
+        ImGui::SameLine();
+        ImGui::Text("Ambient, from %zu vertices of the map around", e.ambientSamples);
+        ImGui::ColorButton("##lamp", lamp, ImGuiColorEditFlags_NoTooltip, ImVec2(18, 18));
+        ImGui::SameLine();
+        ImGui::Text("Street light, from %zu vertices of the pools under them", e.poolSamples);
+    }
+    if (shared)
+        ImGui::TextDisabled("%zu of the map's own objects in the selection are left out", shared);
+    if (ImGui::Checkbox("Also the map's own models (they are shared: every placement changes)", &bakeNatives_))
+        bakeMeasured_ = false;
+
+    ImGui::SeparatorText("Strength");
+    bool changed = false;
+    changed |= ImGui::SliderFloat("Ambient", &bakeAmbient_, 0.0f, 2.5f, "x %.2f");
+    changed |= ImGui::SliderFloat("Street lights", &bakeLamps_, 0.0f, 3.0f, "x %.2f");
+    if (ImGui::SliderFloat("Reach", &bakeRadius_, 6.0f, 60.0f, "%.0f m")) changed = true;
+    if (ImGui::IsItemDeactivatedAfterEdit()) bakeMeasured_ = false;   // a new reach finds other lamps
+    if (changed && !bakeOriginal_.empty()) ApplyBake(true);   // a preview follows the sliders
+
+    ImGui::Spacing();
+    ImGui::BeginDisabled(targets.empty());
+    if (ImGui::Button(ICON_PH_EYE "  Preview", ImVec2(140, 0))) ApplyBake(true);
+    ImGui::SameLine();
+    if (ImGui::Button(ICON_PH_FLOPPY_DISK "  Bake and write", ImVec2(160, 0))) {
+        ::PostMessageW(window_, kBakeWriteMessage, 0, 0);
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel", ImVec2(-FLT_MIN, 0))) {
+        RestoreBake();
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndPopup();
+}
+
 void MainWindow::DrawShellPanels() {
     UpdateShellDrag();
+    DrawBakeDialog();
+    // FRS_UI_DEMO=online: the Online tab, searching, for a look at it.
+    static bool demoOnline = [] {
+        char value[16] = {};
+        return ::GetEnvironmentVariableA("FRS_UI_DEMO", value, sizeof(value)) && std::string(value) == "online";
+    }();
+    if (demoOnline && online_) {
+        demoOnline = false;
+        sideTab_ = 3;
+        online_->Search("street lamp");
+    }
     DrawViewModes();
 
     const std::string title = std::string(ICON_PH_TREE_STRUCTURE) + "  Explorer###Explorer";
@@ -583,16 +758,34 @@ void MainWindow::DrawShellPanels() {
         const bool tabs = ImGui::BeginTabBar("##sidetabs", ImGuiTabBarFlags_FittingPolicyResizeDown);
         ImGui::PopStyleVar();
         if (tabs) {
-            const std::string editsLabel = "Edits " + std::to_string(edits_.Count()) + "###edits";
-            if (ImGui::BeginTabItem(ICON_PH_TREE_STRUCTURE "  Scene###scene")) { wanted = 0; ImGui::EndTabItem(); }
-            if (ImGui::BeginTabItem(ICON_PH_CUBE "  Library###library")) { wanted = 1; ImGui::EndTabItem(); }
-            if (ImGui::BeginTabItem((std::string(ICON_PH_LIST_CHECKS) + "  " + editsLabel).c_str())) { wanted = 2; ImGui::EndTabItem(); }
+            // A narrow panel shows the icons alone; the name is in the tooltip.
+            const bool narrow = ImGui::GetContentRegionAvail().x < 360.0f;
+            struct Tab { int index; const char* icon; std::string name; const char* id; };
+            const Tab tabsList[] = {
+                { 0, ICON_PH_TREE_STRUCTURE, "Scene", "###scene" },
+                { 1, ICON_PH_CUBE, "Library", "###library" },
+                { 3, ICON_PH_GLOBE, "Online", "###online" },
+                { 2, ICON_PH_LIST_CHECKS, "Edits " + std::to_string(edits_.Count()), "###edits" },
+            };
+            for (const Tab& tab : tabsList) {
+                const std::string label = std::string(tab.icon) +
+                                          (narrow ? (tab.index == 2 ? " " + std::to_string(edits_.Count()) : std::string())
+                                                  : "  " + tab.name) + tab.id;
+                // Follow a tab chosen elsewhere (a menu, the code) as well as a click.
+                const ImGuiTabItemFlags flags = tab.index == sideTab_ && shownTab_ != sideTab_
+                                                    ? ImGuiTabItemFlags_SetSelected : 0;
+                const bool open = ImGui::BeginTabItem(label.c_str(), nullptr, flags);
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tab.name.c_str());
+                if (open) { wanted = tab.index; ImGui::EndTabItem(); }
+            }
             ImGui::EndTabBar();
         }
-        if (wanted != sideTab_) ShowSideTab(wanted);
+        if (shownTab_ != sideTab_) wanted = sideTab_;   // this frame selected it
+        shownTab_ = sideTab_;
+        if (wanted != sideTab_) { ShowSideTab(wanted); shownTab_ = sideTab_; }
 
         // The shared search box drives the native one, which filters.
-        if (sideTab_ != 2) {
+        if (sideTab_ != 2 && sideTab_ != 3) {
             char search[256] = {};
             const std::string current = Utf8(WindowText(sideSearch_));
             std::memcpy(search, current.c_str(), std::min(current.size(), sizeof(search) - 1));
@@ -609,11 +802,34 @@ void MainWindow::DrawShellPanels() {
             ImGui::EndChild();
         } else if (sideTab_ == 1) {
             DrawShellLibrary();
+        } else if (sideTab_ == 3) {
+            if (online_)
+                online_->Draw(viewport_.GetRenderer().Context() ? viewport_.GetRenderer().Context()->Device() : nullptr);
         } else {
             DrawShellEdits();
         }
     }
     ImGui::End();
+}
+
+void MainWindow::PlaceOnlineModel() {
+    std::wstring obj;
+    std::string credit;
+    if (!online_ || !online_->TakeReady(obj, credit) || !world_) return;
+    Vec3 point;
+    if (!ViewCentrePoint(point)) {
+        online_->SetStatus(L"Point the middle of the view at the ground where it should stand, and place it again.");
+        return;
+    }
+    // The author is credited beside the edits, as the licence asks.
+    const std::wstring credits = modelsFolder_ + L"\\CREDITS.txt";
+    if (FILE* file = _wfopen(credits.c_str(), L"ab")) {
+        const std::string line = "Sketchfab: " + credit + "\r\n";
+        std::fwrite(line.data(), 1, line.size(), file);
+        std::fclose(file);
+    }
+    LOG_INFO("placing a Sketchfab model: %s", credit.c_str());
+    ImportObj(obj, false, &point);
 }
 
 void MainWindow::HideNativeShell() {

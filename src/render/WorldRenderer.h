@@ -220,6 +220,8 @@ public:
     // is stored in, one per vertex -- written straight into the GPU buffers,
     // for an edit seen as it is made. The caller keeps the parsed model in step.
     void UpdateModelPositions(u32 modelHash, const std::vector<Vec3>& positions);
+    // The same for vertex colours (D3DCOLOR), for baked lighting seen as it is made.
+    void UpdateModelColours(u32 modelHash, const std::vector<u32>& colours);
 
     float StreamRadius() const { return streamRadius_; }
     void  SetStreamRadius(float radius) { streamRadius_ = radius < 50.0f ? 50.0f : radius; }

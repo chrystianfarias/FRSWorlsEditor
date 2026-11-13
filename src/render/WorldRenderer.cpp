@@ -1107,6 +1107,24 @@ void WorldRenderer::DrawToolOverlay(IDirect3DDevice9* device) {
     EndOverlay(device);
 }
 
+void WorldRenderer::UpdateModelColours(u32 modelHash, const std::vector<u32>& colours) {
+    for (SectionRender& section : sections_) {
+        if (!section.gpu) continue;
+        for (const GpuObject& object : section.gpu->Objects()) {
+            if (!object.source || object.source->hash != modelHash) continue;
+            const size_t count = std::min(colours.size(), object.source->vertices.size());
+            IDirect3DVertexBuffer9* buffer = section.gpu->VertexBuffer();
+            void* data = nullptr;
+            const UINT offset = (UINT)(object.baseVertex * sizeof(nfs::SolidVertex));
+            const UINT bytes = (UINT)(count * sizeof(nfs::SolidVertex));
+            if (!buffer || !count || FAILED(buffer->Lock(offset, bytes, &data, 0))) continue;
+            auto* vertices = (nfs::SolidVertex*)data;
+            for (size_t i = 0; i < count; ++i) vertices[i].color = colours[i];
+            buffer->Unlock();
+        }
+    }
+}
+
 void WorldRenderer::UpdateModelPositions(u32 modelHash, const std::vector<Vec3>& positions) {
     for (SectionRender& section : sections_) {
         if (!section.gpu) continue;

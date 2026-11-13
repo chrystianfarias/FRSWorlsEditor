@@ -25,6 +25,8 @@ namespace nfs { class World; }
 // The manifest lists, per object, which polygons of the pack were exported,
 // in face order. That is what an import replaces.
 struct CollisionExportSummary {
+    Vec3   origin{};          // what the OBJ was moved by
+    Aabb   bounds;            // of what was written, in the world
     size_t sections  = 0;
     size_t polygons  = 0;
     size_t barriers  = 0;
@@ -37,3 +39,11 @@ bool ExportCollision(const nfs::World& world,
                      const std::wstring& objPath,
                      const std::wstring& region,
                      CollisionExportSummary& summary);
+
+// The drawn world within `area`, as one OBJ object "reference" moved by
+// `origin` and turned Y-up like the collision beside it: something to model
+// the collision against in Blender, never read back. Placed instances and the
+// positioned sections' own meshes; backdrops left out. Returns the triangles
+// written (capped at `limit`).
+size_t ExportReferenceMeshes(const nfs::World& world, const Aabb& area, const Vec3& origin,
+                             const std::wstring& objPath, size_t limit = 400000);

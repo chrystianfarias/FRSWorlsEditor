@@ -443,7 +443,8 @@ bool IsCollisionObj(const std::wstring& objPath) {
 }
 
 bool PlanCollisionImport(const nfs::World& world, const std::wstring& objPath,
-                         const std::wstring& modelsFolder, CollisionImportPlan& plan) {
+                         const std::wstring& modelsFolder, CollisionImportPlan& plan,
+                         const std::map<std::string, nfs::CollisionPack>* bases) {
     std::wostringstream report;
 
     std::vector<ObjCollisionObject> objects;
@@ -494,7 +495,9 @@ bool PlanCollisionImport(const nfs::World& world, const std::wstring& objPath,
         nfs::CollisionPack shipped;
         bool replacesEarlierEdit = false;
 
-        if (matches(loaded->collision[entry->pack])) {
+        if (bases && bases->count(object.name)) {
+            base = &bases->at(object.name);
+        } else if (matches(loaded->collision[entry->pack])) {
             base = &loaded->collision[entry->pack];
         } else if (section->originalStreamOffset + (u64)section->originalStreamSize <= stream.size) {
             const ByteSpan original =

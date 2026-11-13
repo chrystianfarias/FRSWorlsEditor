@@ -384,7 +384,9 @@ void Viewport::Tick(float deltaSeconds) {
     if (!captured_ && world_) {
         captureClock_ += deltaSeconds;
         wchar_t path[MAX_PATH] = {};
-        if (captureClock_ > 6.0f && ::GetEnvironmentVariableW(L"FRS_CAPTURE", path, MAX_PATH)) {
+        wchar_t wait[16] = L"6";
+        ::GetEnvironmentVariableW(L"FRS_CAPTURE_DELAY", wait, 16);
+        if (captureClock_ > (float)_wtof(wait) && ::GetEnvironmentVariableW(L"FRS_CAPTURE", path, MAX_PATH)) {
             captured_ = true;
             context_.Device()->EndScene();
             LOG_INFO("capture %S: %s", path, context_.SaveBackBuffer(path) ? "saved" : "failed");
