@@ -38,6 +38,11 @@ public:
     void SetShown(bool shown);
     bool Shown() const { return shown_; }
 
+    // Ends the game: asks its window to close, and after `graceMs` without
+    // it going, ends the process. The caller keeps calling Running() to see it
+    // gone (the editor's game timer does).
+    void Stop(DWORD graceMs = 3000);
+
     // Gives the window its frame and independence back, and forgets the game.
     // Must run before the editor's window is destroyed: owned windows go with
     // their owner.

@@ -117,6 +117,13 @@ bool Preculler::Contains(const Zone& zone, float x, float y) const {
     return inside;
 }
 
+bool Preculler::Listed(u32 sectionNumber) const {
+    for (const auto& [zone, sections] : visible_)
+        for (u32 number : sections)
+            if (number == sectionNumber) return true;
+    return false;
+}
+
 bool Preculler::VisibleAt(const Vec3& point, std::vector<u32>& sections) const {
     sections.clear();
     if (zones_.empty()) return false;

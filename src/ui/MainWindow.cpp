@@ -46,7 +46,7 @@ const wchar_t* kSupportUrl = L"https://buymeacoffee.com/chrystianfarias";
 constexpr DWORD kSetupVersion = 1;
 // Asks for the setup once the window is up, on the first run.
 constexpr UINT kRunSetupMessage = WM_APP + 1;
-// FRSFastBoot reads its switch when the game starts; this long after the
+// FRSFastTest reads its switch when the game starts; this long after the
 // launch it certainly has, and the switch goes back off.
 constexpr DWORD kFastBootRestoreMs = 15000;
 
@@ -401,6 +401,10 @@ LRESULT MainWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
 
         case kRunSetupMessage:
             RunSetup();
+            return 0;
+
+        case kStopGameMessage:
+            StopGame();
             return 0;
 
         case kBakeWriteMessage:
@@ -1345,12 +1349,18 @@ void MainWindow::LaunchGame() {
         return;
     }
 
-    // The loader puts the car at the camera, FRSFastBoot takes the game there
+    // An old FRSFastBoot beside FRSFastTest crashes the game as it starts.
+    if (const size_t retired = RetireOldFastBoot(gameFolder_)) {
+        LOG_INFO("launch: retired the old FRSFastBoot (%zu files) -- FRSFastTest replaces it", retired);
+        SetStatusText(2, L"The old FRSFastBoot was moved to scripts\\retired-FRSFastBoot: FRSFastTest replaces it");
+    }
+
+    // The loader puts the car at the camera, FRSFastTest takes the game there
     // without the menus: without them this is only starting the game.
     if (!WorldLoaderInstalled(gameFolder_) || !FastBootInstalled(gameFolder_)) {
         const int answer = ::MessageBoxW(
             window_,
-            L"The game plugins are not installed (FRS World Loader and FRSFastBoot): the game would "
+            L"The game plugins are not installed (FRS World Loader and FRSFastTest): the game would "
             L"start at its menus and without the editor's work.\n\nRun the setup now?",
             kWindowTitle, MB_ICONQUESTION | MB_YESNOCANCEL);
         if (answer == IDYES) { RunSetup(); return; }
@@ -1359,7 +1369,7 @@ void MainWindow::LaunchGame() {
 
     WriteLaunchPose();
 
-    // FRSFastBoot reads its switch once, as the game starts. Unless the player
+    // FRSFastTest reads its switch once, as the game starts. Unless the player
     // keeps it on for every start, it is on for this launch only.
     fastBootRestore_ = false;
     if (FastBootInstalled(gameFolder_) && !FastBootEnabled(gameFolder_)) {
@@ -1367,7 +1377,7 @@ void MainWindow::LaunchGame() {
             fastBootRestore_ = true;
             fastBootSince_ = ::GetTickCount();
         } else {
-            LOG_WARN("launch: could not switch FRSFastBoot on in %S", FastBootIni(gameFolder_).c_str());
+            LOG_WARN("launch: could not switch FRSFastTest on in %S", FastBootIni(gameFolder_).c_str());
         }
     }
 
@@ -1382,7 +1392,7 @@ void MainWindow::LaunchGame() {
     SetStatusText(2, L"Game launched -- it opens over the view once its window is up");
 }
 
-// Puts FRSFastBoot's switch back off once the game has read it: its window is
+// Puts FRSFastTest's switch back off once the game has read it: its window is
 // up, it is gone, or long enough has passed.
 void MainWindow::RestoreFastBoot(bool onlyWhenRead) {
     if (!fastBootRestore_) return;
@@ -1394,7 +1404,7 @@ void MainWindow::RestoreFastBoot(bool onlyWhenRead) {
 }
 
 // The ground under the camera, facing the way it looks: where FRSWorldLoader
-// puts the car once the session is in gameplay. FRSFastBoot takes the game
+// puts the car once the session is in gameplay. FRSFastTest takes the game
 // straight to free roam; without it the pose waits for the player to get there.
 void MainWindow::WriteLaunchPose() {
     const std::wstring path = gameFolder_ + L"\\models\\launch-pose.txt";
@@ -1416,6 +1426,17 @@ void MainWindow::WriteLaunchPose() {
     LOG_INFO("launch pose (%.1f, %.1f, %.1f) heading %.1f", eye.x, eye.y, ground, heading);
 }
 
+void MainWindow::StopGame() {
+    if (!game_.Running()) return;
+    SetStatusText(2, L"Closing the game...");
+    game_.Stop();
+    RestoreFastBoot();
+    // The timer sees it gone and gives the view back (UpdateGameView).
+    UpdateGameView();
+    ::SetFocus(viewport_.Handle());
+    SetStatusText(2, L"Game closed");
+}
+
 void MainWindow::UpdateGameView() {
     RestoreFastBoot(true);
     if (!game_.Running()) {
@@ -1427,6 +1448,8 @@ void MainWindow::UpdateGameView() {
     }
     RECT area{};
     ::GetWindowRect(viewport_.Handle(), &area);
+    // With the panels drawn in the viewport, only its middle is the view.
+    if (shell_ && gameArea_.right - gameArea_.left > 64 && gameArea_.bottom - gameArea_.top > 64) area = gameArea_;
     game_.Update(area);
     RestoreFastBoot(true);
     if (game_.Fullscreen()) {
@@ -2656,7 +2679,9 @@ void MainWindow::UpdateStatusBar() {
 
 void MainWindow::Tick(float deltaSeconds) {
     // Under the game the map is not seen: no point drawing it.
-    if (!(game_.Embedded() && game_.Shown())) viewport_.Tick(deltaSeconds);
+    // Under the game the map is not seen -- but the panels round it are,
+    // and they are drawn by the viewport.
+    if (shell_ || !(game_.Embedded() && game_.Shown())) viewport_.Tick(deltaSeconds);
 
     // The status bar only needs to keep up with the eye, not with the frame rate.
     lastStatusUpdate_ += deltaSeconds;

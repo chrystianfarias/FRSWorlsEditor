@@ -174,6 +174,16 @@ void MainWindow::DrawShellBars() {
                 ::PostMessageW(window_, WM_COMMAND, MAKEWPARAM(button.idCommand, BN_CLICKED), (LPARAM)toolbar_);
             ImGui::EndDisabled();
             ImGui::PopStyleColor();
+            // Beside the game's own button, while it runs: end it.
+            if (button.idCommand == IDC_LAUNCH_GAME && game_.Running()) {
+                ImGui::SameLine();
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.55f, 0.16f, 0.16f, 1.0f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.72f, 0.22f, 0.22f, 1.0f));
+                if (ImGui::Button(ICON_PH_STOP "  Stop game"))
+                    ::PostMessageW(window_, kStopGameMessage, 0, 0);
+                ImGui::PopStyleColor(2);
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Close the game and go back to the map");
+            }
         }
     }
     ImGui::End();
@@ -714,6 +724,12 @@ void MainWindow::DrawBakeDialog() {
 }
 
 void MainWindow::DrawShellPanels() {
+    // The middle of the dock space, in screen pixels, for the game's window.
+    if (ImGuiDockNode* centre = ImGui::DockBuilderGetCentralNode(ImGui::GetID("EditorDockSpace"))) {
+        POINT corner{ (LONG)centre->Pos.x, (LONG)centre->Pos.y };
+        ::ClientToScreen(viewport_.Handle(), &corner);
+        gameArea_ = RECT{ corner.x, corner.y, corner.x + (LONG)centre->Size.x, corner.y + (LONG)centre->Size.y };
+    }
     UpdateShellDrag();
     DrawBakeDialog();
     // FRS_UI_DEMO=online: the Online tab, searching, for a look at it.

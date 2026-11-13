@@ -20,6 +20,7 @@
 #include "render/RenderExtension.h"
 #include "roads/RoadBake.h"
 #include "roads/RoadNetwork.h"
+#include "roads/RoadRoutes.h"
 #include "terrain/GroundDeform.h"
 #include "terrain/Terrain.h"
 #include "io/SelectionExport.h"
@@ -57,6 +58,7 @@ struct RoadsAccess {
     EditsPanel& Edits() const { return w.edits_; }
     nfs::World* World() const { return w.world_.get(); }
     const std::wstring& ModelsFolder() const { return w.modelsFolder_; }
+    const std::wstring& GameFolder() const { return w.gameFolder_; }
     void Status(const std::wstring& text) const { w.SetStatusText(2, text); }
     void RebuildTree() const { w.PopulateSectionTree(); }
     void UpdateMenuChecks() const { w.UpdateMenuChecks(); }
@@ -103,9 +105,12 @@ constexpr int ID_TERRAIN_OUTLINE    = ID_ROADS_FIRST + 32;
 constexpr int ID_TERRAIN_ALONG      = ID_ROADS_FIRST + 33;
 constexpr int ID_ROAD_JUNCTION_GAME = ID_ROADS_FIRST + 34;
 constexpr int ID_ROAD_SPLIT_WAYS    = ID_ROADS_FIRST + 35;
+constexpr int ID_VIEW_ROAD_GRAPH    = ID_ROADS_FIRST + 36;
 
 // A terrain patch's selection id: the patch's id with this bit.
 constexpr int kTerrainBit = 0x40000000;
+// A node of the game's road graph: (route id << 12 | node index) with this bit.
+constexpr int kGraphBit = 0x04000000;
 
 // Properties rows.
 enum Field {
@@ -119,6 +124,7 @@ enum Field {
     kTerrainAmbient, kMargin,
     kBridge = 90, kDeckThickness, kPillarSpacing, kPillarWidth, kDeckTexture, kPillarTexture,
     kBankMode = 96, kBankMax, kDesignSpeed, kBankAngle,
+    kTraffic = 150, kGps, kSpeedLimit,
     kMedianType = 130, kMedianWidth, kMedianHeight, kMedianTexture, kWalkLeft, kWalkRight,
     kWallStyle, kWallModel, kWallModelSpacing, kWallModelTurn,
     kLayerTexture = 100,     // + layer * 4: texture, tile, surface
@@ -350,6 +356,15 @@ public:
             case ID_TERRAIN_ALONG:     TerrainAlongRoad(); return true;
             case ID_ROAD_JUNCTION_GAME: StartJunctionPick(); return true;
             case ID_ROAD_SPLIT_WAYS:   SplitCarriageways(); return true;
+            case ID_VIEW_ROAD_GRAPH:
+                graphView_ = !graphView_;
+                graphBuilt_ = 0;
+                app_.UpdateMenuChecks();
+                app_.Status(graphView_ ? L"Road graph shown: white routes (yellow: the nearest), green the ones the "
+                                         L"editor adds; blue lanes forward, orange backward, red the road's edges; "
+                                         L"links green (all), purple (GPS and racers only), grey (closed); click a node"
+                                       : L"Road graph hidden");
+                return true;
             case ID_GROUND_FIT:
                 fitGround_ = !fitGround_;
                 groundFieldRevision_ = 0;
@@ -374,6 +389,7 @@ public:
 
     void UpdateMenuChecks(HMENU menu) override {
         ::CheckMenuItem(menu, ID_VIEW_ROADS, MF_BYCOMMAND | (visible_ ? MF_CHECKED : MF_UNCHECKED));
+        ::CheckMenuItem(menu, ID_VIEW_ROAD_GRAPH, MF_BYCOMMAND | (graphView_ ? MF_CHECKED : MF_UNCHECKED));
         ::CheckMenuItem(menu, ID_GROUND_FIT, MF_BYCOMMAND | (fitGround_ ? MF_CHECKED : MF_UNCHECKED));
         for (int b = 0; b < terrain::kBrushCount; ++b)
             ::CheckMenuItem(menu, ID_TERRAIN_BRUSH + b, MF_BYCOMMAND | ((int)brush_ == b ? MF_CHECKED : MF_UNCHECKED));
@@ -761,6 +777,12 @@ public:
     // ---- the selection
 
     bool StatusText(std::wstring& text) const override {
+        if (const nfs::routes::Node* n = SelectedGraphNode()) {
+            const int id = Selected() & ~kGraphBit;
+            text = Fmt(L"Road graph: route %d node %d at %.1f, %.1f, %.1f%s", id >> 12, id & 0xFFF, n->x, n->y,
+                       n->height8 / 8.0f, ourRoutes_.count((u16)(id >> 12)) ? L" (made by the editor)" : L"");
+            return true;
+        }
         if (const terrain::Patch* patch = SelectedPatch()) {
             text = Fmt(L"Terrain patch %u: %d x %d cells of %.1f   [brush %s, size %.0f: Terrain menu or Properties; "
                        L"hold the left button to sculpt   [ ] size   Del delete]",
@@ -796,6 +818,7 @@ public:
     bool DeleteSelection() override {
         const int id = Selected();
         if (id < 0) return false;
+        if (id & kGraphBit) return true;   // the game's graph is shown, not edited
         if (const terrain::Patch* patch = SelectedPatch()) {
             terrain_.Remove(patch->id);
             terrainBatches_.clear();
@@ -931,6 +954,10 @@ public:
     void DrawOverlay(IDirect3DDevice9* device, const Camera& camera, WorldRenderer& renderer) override;
 
     bool Pick(const Ray& ray, int& index, float& distance) const override {
+        if (graphView_ && PickGraphNode(ray, index)) {
+            distance = 0.0f;
+            return true;
+        }
         if (!visible_) return false;
         index = -1;
         // The curve handles on show come first, then the nodes: small, and
@@ -2146,6 +2173,102 @@ private:
         return found;
     }
 
+    // The game's road graph with the network's roads in it: always built from
+    // the game's own file, written where the loader serves it in its place.
+    bool WriteRoutes(std::wstring& summary) {
+        nfs::World* world = app_.World();
+        if (!world) return false;
+        const std::wstring region = world->Region();
+        const std::wstring shipped = app_.GameFolder() + L"\\TRACKS\\ROUTES" + region + L"\\RoutesFreeRoam.bin";
+        const std::wstring folder = app_.ModelsFolder() + L"\\files\\TRACKS\\ROUTES" + region;
+        const std::wstring served = folder + L"\\RoutesFreeRoam.bin";
+        std::vector<u8> bytes;
+        {
+            std::ifstream in(shipped, std::ios::binary);
+            if (!in) { summary = L"the game's road graph " + shipped + L" could not be read"; return false; }
+            bytes.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+        }
+        nfs::routes::Graph graph;
+        std::wstring error;
+        if (!graph.Parse(bytes, error)) { summary = L"the game's road graph: " + error; return false; }
+        roads::RouteReport report;
+        const bool ok = roads::AddRoutes(network_, graph, report);
+        if (!ok) {
+            summary = L"traffic and GPS were not written: " + report.problems;
+            return false;
+        }
+        if (!report.routes) {
+            // Nothing of ours: the game reads its own file again.
+            ::DeleteFileW(served.c_str());
+            summary = L"no roads for traffic";
+            return true;
+        }
+        ::SHCreateDirectoryExW(nullptr, folder.c_str(), nullptr);
+        const std::vector<u8> out = graph.Write();
+        std::ofstream file(served, std::ios::binary | std::ios::trunc);
+        file.write((const char*)out.data(), (std::streamsize)out.size());
+        if (!file) { summary = L"could not write " + served; return false; }
+        summary = Fmt(L"%zu roads in the game's road graph (%zu links among them, %zu into the game's roads)",
+                      report.routes, report.links, report.gameLinks);
+        if (!report.problems.empty()) summary += L"; " + report.problems;
+        return true;
+    }
+
+    // ---- the road graph view: what the game will be handed, the game's own
+    // routes with the network's added, rebuilt when the network changes.
+    void RefreshGraph() {
+        nfs::World* world = app_.World();
+        if (!world) return;
+        if (graphBuilt_ == network_.Revision() && graphRegion_ == world->Region()) return;
+        if (graphRegion_ != world->Region() || graphShipped_.empty()) {
+            graphShipped_.clear();
+            std::ifstream in(app_.GameFolder() + L"\\TRACKS\\ROUTES" + world->Region() + L"\\RoutesFreeRoam.bin",
+                             std::ios::binary);
+            if (in) graphShipped_.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+            graphRegion_ = world->Region();
+        }
+        graphBuilt_ = network_.Revision();
+        graph_ = nfs::routes::Graph{};
+        ourRoutes_.clear();
+        std::wstring error;
+        if (graphShipped_.empty() || !graph_.Parse(graphShipped_, error)) return;
+        std::set<u16> before;
+        for (const auto& r : graph_.Routes()) before.insert(r.header.id);
+        roads::RouteReport report;
+        roads::AddRoutes(network_, graph_, report);
+        for (const auto& r : graph_.Routes())
+            if (!before.count(r.header.id)) ourRoutes_.insert(r.header.id);
+    }
+
+    const nfs::routes::Node* SelectedGraphNode() const {
+        const int id = Selected();
+        if (id < 0 || !(id & kGraphBit)) return nullptr;
+        const int value = id & ~kGraphBit;
+        const nfs::routes::Route* r = graph_.Find((u16)(value >> 12));
+        const int k = value & 0xFFF;
+        return r && k < (int)r->nodes.size() ? &r->nodes[(size_t)k] : nullptr;
+    }
+
+    bool PickGraphNode(const Ray& ray, int& index) const {
+        float best = 1e30f;
+        index = -1;
+        for (const nfs::routes::Route& r : graph_.Routes())
+            for (size_t k = 0; k < r.nodes.size() && k < 4096; ++k) {
+                const nfs::routes::Node& n = r.nodes[k];
+                const Vec3 p{ n.x, n.y, n.height8 / 8.0f + 0.6f };
+                Aabb box;
+                box.Add(p - Vec3{ 1.2f, 1.2f, 1.2f });
+                box.Add(p + Vec3{ 1.2f, 1.2f, 1.2f });
+                const float hit = IntersectRayAabb(ray, box);
+                if (hit < 0.0f || hit >= best) continue;
+                best = hit;
+                index = kGraphBit | ((int)r.header.id << 12) | (int)k;
+            }
+        return index >= 0;
+    }
+
+    void DrawRouteGraph(IDirect3DDevice9* device, const Camera& camera, WorldRenderer& renderer);
+
     bool BakeGroundCollision(size_t& moved);
     bool BakeGroundModels(size_t& moved, std::wstring& error);
 
@@ -2172,6 +2295,7 @@ private:
         ::AppendMenuW(roadsMenu, MF_STRING, ID_ROAD_DELETE, L"&Delete Selected Node or Road");
         ::AppendMenuW(roadsMenu, MF_SEPARATOR, 0, nullptr);
         ::AppendMenuW(roadsMenu, MF_STRING, ID_VIEW_ROADS, L"Show &Roads (procedural)");
+        ::AppendMenuW(roadsMenu, MF_STRING, ID_VIEW_ROAD_GRAPH, L"Show the Road &Graph (traffic and GPS)");
         ::AppendMenuW(roadsMenu, MF_SEPARATOR, 0, nullptr);
         ::AppendMenuW(roadsMenu, MF_STRING, ID_ROAD_BAKE, L"&Bake Roads into the Game\tCtrl+Shift+B");
         ::AppendMenuW(roadsMenu, MF_STRING, ID_ROAD_UNBAKE, L"&Remove Baked Roads from the Game");
@@ -2228,6 +2352,12 @@ private:
     roads::Network network_;
     roads::RoadProfile lastProfile_;
     std::vector<DrawBatch> batches_;
+    bool graphView_ = false;
+    u64 graphBuilt_ = 0;
+    std::wstring graphRegion_;
+    std::vector<u8> graphShipped_;
+    nfs::routes::Graph graph_;
+    std::set<u16> ourRoutes_;
     std::vector<UndoState> undo_;
     UndoState settled_;
     bool historyReady_ = false;
@@ -2289,6 +2419,61 @@ private:
 bool RoadsExtension::Bridged(const roads::Segment& segment) const { return segment.profile.bridge; }
 
 bool RoadsExtension::FillProperties(PropertiesPanel::View& view) {
+    if (const nfs::routes::Node* n = SelectedGraphNode()) {
+        const int id = Selected() & ~kGraphBit;
+        const u16 routeId = (u16)(id >> 12);
+        const int index = id & 0xFFF;
+        const nfs::routes::Route* route = graph_.Find(routeId);
+        view.title = Fmt(L"Road graph: route %u, node %d", routeId, index);
+        view.moveLabel = L"";
+        view.removeLabel = L"";
+        AddRow(view, L"Route", L"Route", Fmt(L"%u%s", routeId, ourRoutes_.count(routeId) ? L" (the editor's)" : L""),
+               L"Its id in the game's road graph.", 0);
+        if (route) {
+            AddRow(view, L"Route", L"Nodes", std::to_wstring(route->nodes.size()), L"", 0);
+            AddRow(view, L"Route", L"Length", Number(route->header.length), L"", 0);
+        }
+        AddRow(view, L"Node", L"Index", std::to_wstring(index), L"0 is where the route starts.", 0);
+        AddRow(view, L"Node", L"Position", Fmt(L"%.1f, %.1f, %.1f", n->x, n->y, n->height8 / 8.0f), L"", 0);
+        AddRow(view, L"Node", L"Half widths", Fmt(L"left %.2f, right %.2f", n->halfLeft256 / 256.0f, n->halfRight256 / 256.0f),
+               L"The road's edges either side.", 0);
+        const auto perm = [&](u32 f, u32 b) {
+            return std::wstring((n->flags & f) ? L"forward" : L"") + ((n->flags & f) && (n->flags & b) ? L" and " : L"") +
+                   ((n->flags & b) ? L"backward" : L"") + (!(n->flags & (f | b)) ? L"no" : L"");
+        };
+        AddRow(view, L"Who drives it", L"GPS (player)", perm(nfs::routes::kGpsForward, nfs::routes::kGpsBackward), L"", 0);
+        AddRow(view, L"Who drives it", L"Traffic", perm(nfs::routes::kTrafficForward, nfs::routes::kTrafficBackward), L"", 0);
+        AddRow(view, L"Who drives it", L"Racers", perm(nfs::routes::kRacersForward, nfs::routes::kRacersBackward), L"", 0);
+        const float maxHalf = std::max(n->halfLeft256, n->halfRight256) / 256.0f;
+        for (int j = 0; j < 8; ++j) {
+            if (n->lanes[j] == -1) continue;
+            AddRow(view, L"Lanes", Fmt(L"%s lane %d", j < 4 ? L"Forward" : L"Backward", j % 4 + 1).c_str(),
+                   Fmt(L"%.2f right of travel, %u m/s (%.0f km/h)", n->lanes[j] / 128.0f * maxHalf, n->speeds[2 + j],
+                       n->speeds[2 + j] * 3.6f),
+                   L"", 0);
+        }
+        const auto& signposts = graph_.Signposts();
+        for (int k = 0; k < 2; ++k) {
+            const u16 slot = n->slots[k];
+            if (slot == nfs::routes::kNoSlot || slot >= signposts.size()) continue;
+            const nfs::routes::Signpost& sp = signposts[slot];
+            const auto typeName = [](u32 t) {
+                switch (t) {
+                    case 2: return L"follow";
+                    case 3: return L"end";
+                    case 4: return L"optional";
+                    case 7: return L"closed";
+                    default: return L"other";
+                }
+            };
+            AddRow(view, L"Links", Fmt(L"Link %d", k + 1).c_str(),
+                   Fmt(L"to route %u node %u, %s; GPS/racers %s, traffic %s%s", sp.dstRoute, sp.dstNode,
+                       (sp.flags >> 18 & 1) ? L"travelling backward" : L"travelling forward", typeName(sp.flags & 0xF),
+                       typeName(sp.flags >> 4 & 0xF), (sp.flags >> 23 & 1) ? L", turns round" : L""),
+                   L"", 0);
+        }
+        return true;
+    }
     if (const terrain::Patch* patch = SelectedPatch()) {
         view.title = Fmt(L"Terrain patch %u", patch->id);
         view.moveLabel = L"";
@@ -2392,6 +2577,13 @@ bool RoadsExtension::FillProperties(PropertiesPanel::View& view) {
     AddRow(view, L"Lanes", L"Other lanes texture", Widen(p.laneInner), L"Every other lane.", kLaneInner, lanes_, true);
     AddRow(view, L"Lanes", L"Texture length", Number(p.textureLength),
            L"How much road one repeat of a lane texture covers.", kTextureLength);
+    AddRow(view, L"Traffic", L"Traffic", p.traffic ? L"yes" : L"no",
+           L"The game's traffic drives this road, in the directions its lanes run. Joined to the game's own "
+           L"roads at the junctions made into them, written at every bake.", kTraffic, yesNo);
+    AddRow(view, L"Traffic", L"GPS", p.gps ? L"yes" : L"no",
+           L"The player's GPS (and the racers) may route over this road.", kGps, yesNo);
+    AddRow(view, L"Traffic", L"Speed limit (km/h)", Number(p.speedLimit),
+           L"The speed traffic keeps on the straights; it slows on bends by itself.", kSpeedLimit);
     AddRow(view, L"Median", L"Median", kMedianNames[std::clamp(p.medianType, 0, 4)],
            L"Between the two directions: painted stripes, a raised concrete or grass island, or a concrete "
            L"barrier. It opens out before junctions. Street lights can stand on it (Sides: median).",
@@ -2631,6 +2823,9 @@ bool RoadsExtension::ApplyProperties() {
         const std::string name = Narrow(text);
         if (!name.empty() && name != p.MedianTexture()) p.medianTexture = name;
     }
+    if (properties.ReadText(kTraffic, text)) p.traffic = !text.empty() && (text[0] == L'y' || text[0] == L'Y');
+    if (properties.ReadText(kGps, text)) p.gps = !text.empty() && (text[0] == L'y' || text[0] == L'Y');
+    if (properties.ReadNumber(kSpeedLimit, value)) p.speedLimit = std::clamp(value, 10.0f, 300.0f);
     if (properties.ReadText(kWalkLeft, text)) p.sidewalkLeft = !text.empty() && (text[0] == L'y' || text[0] == L'Y');
     if (properties.ReadText(kWalkRight, text)) p.sidewalkRight = !text.empty() && (text[0] == L'y' || text[0] == L'Y');
     if (properties.ReadText(kWallStyle, text))
@@ -2658,8 +2853,125 @@ bool RoadsExtension::ApplyProperties() {
     return true;
 }
 
+void RoadsExtension::DrawRouteGraph(IDirect3DDevice9* device, const Camera& camera, WorldRenderer& renderer) {
+    RefreshGraph();
+    struct Vertex { float x, y, z; D3DCOLOR colour; };
+    std::vector<Vertex> lines;
+    const auto line = [&](float x0, float y0, float z0, float x1, float y1, float z1, D3DCOLOR c) {
+        lines.push_back({ x0, y0, z0, c });
+        lines.push_back({ x1, y1, z1, c });
+    };
+    const Vec3 eye = camera.Position();
+    const float reach = 700.0f;
+    const int selected = Selected();
+    const int selectedRoute = selected >= 0 && (selected & kGraphBit) ? (selected & ~kGraphBit) >> 12 : -1;
+
+    // The route nearest the middle of the view, in yellow.
+    int nearest = -1;
+    {
+        Vec3 centre;
+        if (app_.ViewCentre(centre)) {
+            float best = 30.0f;
+            for (const nfs::routes::Route& r : graph_.Routes()) {
+                int k = 0;
+                float t = 0.0f, d = 0.0f;
+                if (graph_.Project(r, centre.x, centre.y, k, t, d) && d < best) { best = d; nearest = r.header.id; }
+            }
+        }
+    }
+    const float lift = 0.6f;
+    for (const nfs::routes::Route& r : graph_.Routes()) {
+        const float* box = r.header.bbox;
+        if (box[2] < eye.x - reach || box[0] > eye.x + reach || box[3] < eye.y - reach || box[1] > eye.y + reach) continue;
+        const bool ours = ourRoutes_.count(r.header.id) != 0;
+        const bool chosen = r.header.id == selectedRoute || r.header.id == nearest;
+        const D3DCOLOR centreColour = chosen ? 0xFFFFE030 : ours ? 0xFF40FF80 : 0xFFF0F0F0;
+        for (size_t k = 0; k < r.nodes.size(); ++k) {
+            const nfs::routes::Node& n = r.nodes[k];
+            const float z = n.height8 / 8.0f + lift;
+            const float dx = n.dirX / 32767.0f, dy = n.dirY / 32767.0f;
+            const float maxHalf = std::max(n.halfLeft256, n.halfRight256) / 256.0f;
+            // The node: a short cross mark.
+            line(n.x - 0.6f, n.y, z, n.x + 0.6f, n.y, z, centreColour);
+            line(n.x, n.y - 0.6f, z, n.x, n.y + 0.6f, z, centreColour);
+            if (n.flags >> 19 & 0x3F) {
+                if ((n.flags >> 19 & 0x3F) != nfs::routes::kNoIntersection) {
+                    // A traffic-light crossing: a red diamond.
+                    const float s = 2.5f;
+                    line(n.x - s, n.y, z, n.x, n.y + s, z, 0xFFFF3030);
+                    line(n.x, n.y + s, z, n.x + s, n.y, z, 0xFFFF3030);
+                    line(n.x + s, n.y, z, n.x, n.y - s, z, 0xFFFF3030);
+                    line(n.x, n.y - s, z, n.x - s, n.y, z, 0xFFFF3030);
+                }
+            }
+            if (k + 1 >= r.nodes.size()) continue;
+            const nfs::routes::Node& m = r.nodes[k + 1];
+            const float zm = m.height8 / 8.0f + lift;
+            const float mdx = m.dirX / 32767.0f, mdy = m.dirY / 32767.0f;
+            line(n.x, n.y, z, m.x, m.y, zm, centreColour);
+            // The road's edges.
+            const float hl = n.halfLeft256 / 256.0f, hr = n.halfRight256 / 256.0f;
+            const float mhl = m.halfLeft256 / 256.0f, mhr = m.halfRight256 / 256.0f;
+            line(n.x + dy * hr, n.y - dx * hr, z, m.x + mdy * mhr, m.y - mdx * mhr, zm, 0xC0FF4040);
+            line(n.x - dy * hl, n.y + dx * hl, z, m.x - mdy * mhl, m.y + mdx * mhl, zm, 0xC0FF4040);
+            // The lanes: blue forward, orange backward, each with an arrow the way it is driven.
+            const float mMaxHalf = std::max(m.halfLeft256, m.halfRight256) / 256.0f;
+            for (int j = 0; j < 8; ++j) {
+                if (n.lanes[j] == -1 || m.lanes[j] == -1) continue;
+                const bool back = j >= 4;
+                const float o0 = n.lanes[j] / 128.0f * maxHalf, o1 = m.lanes[j] / 128.0f * mMaxHalf;
+                const float sgn = back ? -1.0f : 1.0f;
+                const float x0 = n.x + dy * o0 * sgn, y0 = n.y - dx * o0 * sgn;
+                const float x1 = m.x + mdy * o1 * sgn, y1 = m.y - mdx * o1 * sgn;
+                const bool traffic = (n.flags & (back ? nfs::routes::kTrafficBackward : nfs::routes::kTrafficForward)) != 0;
+                const D3DCOLOR c = back ? (traffic ? 0xFFFF9020 : 0x80FF9020) : (traffic ? 0xFF4090FF : 0x804090FF);
+                line(x0, y0, z, x1, y1, zm, c);
+                // The arrow, halfway, pointing the way the lane is driven.
+                const float mx = (x0 + x1) * 0.5f, my = (y0 + y1) * 0.5f, mz = (z + zm) * 0.5f;
+                const float ax = back ? -dx : dx, ay = back ? -dy : dy;
+                const float hx = mx + ax * 1.2f, hy = my + ay * 1.2f;
+                line(hx, hy, mz, hx - ax * 1.2f + ay * 0.7f, hy - ay * 1.2f - ax * 0.7f, mz, c);
+                line(hx, hy, mz, hx - ax * 1.2f - ay * 0.7f, hy - ay * 1.2f + ax * 0.7f, mz, c);
+            }
+        }
+    }
+    // The links: from a node to where they lead.
+    for (const nfs::routes::Signpost& sp : graph_.Signposts()) {
+        const nfs::routes::Route* a = graph_.Find(sp.srcRoute);
+        const nfs::routes::Route* b = graph_.Find(sp.dstRoute);
+        if (!a || !b || sp.srcNode >= a->nodes.size() || sp.dstNode >= b->nodes.size()) continue;
+        const nfs::routes::Node& n = a->nodes[sp.srcNode];
+        const nfs::routes::Node& m = b->nodes[sp.dstNode];
+        if (std::fabs(n.x - eye.x) > reach || std::fabs(n.y - eye.y) > reach) continue;
+        const u32 ta = sp.flags & 0xF, tb = sp.flags >> 4 & 0xF;
+        const D3DCOLOR c = ta == 7 && tb == 7 ? 0xFF808080 : (ta == 2 || ta == 4) && (tb == 2 || tb == 4) ? 0xFF30FF30 : 0xFFC040FF;
+        const float z0 = n.height8 / 8.0f + lift + 0.8f, z1 = m.height8 / 8.0f + lift + 0.8f;
+        if (std::fabs(n.x - m.x) + std::fabs(n.y - m.y) < 0.3f) {
+            line(n.x, n.y, z0 - 0.8f, n.x, n.y, z0 + 1.5f, c);   // a link to the same spot: a short post
+        } else {
+            line(n.x, n.y, z0, m.x, m.y, z1, c);
+        }
+    }
+    if (selected >= 0 && (selected & kGraphBit)) {
+        if (const nfs::routes::Node* n = SelectedGraphNode()) {
+            const float z = n->height8 / 8.0f + lift;
+            line(n->x, n->y, z, n->x, n->y, z + 6.0f, 0xFFFFFFFF);
+        }
+    }
+    if (lines.empty()) return;
+    renderer.BeginOverlay(device);
+    device->SetRenderState(D3DRS_ZENABLE, FALSE);
+    device->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+    const size_t batch = 60000;
+    for (size_t at = 0; at < lines.size(); at += batch) {
+        const size_t count = std::min(batch, lines.size() - at);
+        device->DrawPrimitiveUP(D3DPT_LINELIST, (UINT)(count / 2), lines.data() + at, sizeof(Vertex));
+    }
+    renderer.EndOverlay(device);
+}
+
 void RoadsExtension::DrawOverlay(IDirect3DDevice9* device, const Camera& camera, WorldRenderer& renderer) {
-    (void)camera;
+    if (graphView_) DrawRouteGraph(device, camera, renderer);
     if (!visible_ || (network_.Nodes().empty() && brush_ == terrain::Brush::None && !drawing_)) return;
     struct Vertex { float x, y, z; D3DCOLOR colour; };
     std::vector<Vertex> solid, lines;
@@ -3410,6 +3722,13 @@ void RoadsExtension::Bake() {
     const std::wstring region = world->Region();
 
     SaveTerrain();
+    std::wstring routes;
+    if (!WriteRoutes(routes)) {
+        app_.Message(L"The roads' traffic and GPS could not be written, so nothing was baked: " + routes,
+                     MB_ICONWARNING);
+        return;
+    }
+    LOG_INFO("roads: %S", routes.c_str());
     std::vector<roads::Pole> poles;
     std::vector<roads::MeshPiece> pieces = network_.BuildMesh(&poles);
     // The terrain bakes with the roads: the same prefix, the same removal.
@@ -3506,9 +3825,9 @@ void RoadsExtension::Bake() {
             baked += model && roads::IsBakedRoadModel(model->name);
     app_.Status(Fmt(L"Roads baked: %zu of %zu pieces are in the game now (%zu old ones replaced), "
                     L"%zu collision polygons (%zu old removed), %zu street lights, ground: %zu meshes and %zu "
-                    L"polygons moved",
+                    L"polygons moved; %s",
                     baked, pieces.size(), removed, collisionAdded, collisionRemoved, polesAdded, groundMeshes,
-                    groundPolygons));
+                    groundPolygons, routes.c_str()));
     LOG_INFO("roads: baked %zu of %zu pieces from %S", baked, pieces.size(), obj.c_str());
     // What was baked is in the game's files now: the history starts again
     // from here (Region Edits or Remove Baked Roads take a bake back).

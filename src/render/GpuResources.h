@@ -30,6 +30,9 @@ struct GpuObject {
     Mat4                 transform;
     Aabb                 worldBounds;
     bool                 isBackdrop = false;
+    // Shown by the game only during the races that use it: the track
+    // barriers (XO_TRACKBARRIER*) and the start / finish lines (ZPM_<race>_*).
+    bool                 raceProp = false;
     u32                  baseVertex = 0;
     std::vector<GpuDraw> draws;
 };

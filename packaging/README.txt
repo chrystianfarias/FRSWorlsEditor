@@ -32,9 +32,11 @@ Into the game folder (the one with SPEED2.EXE):
                                   when the game already has an ASI loader.
     scripts\FRSWorldLoader.asi    The editor's end in the game: placed and
     scripts\FRSWorldLoader.ini    edited objects, collision, textures.
-    scripts\FRSFastBoot.asi       "Launch game" goes straight into free roam.
-    scripts\FRSFastBoot.ini       By default only when the editor launches
-    scripts\FRSFastBoot-Tracks.txt  the game; the setup can make it always.
+    scripts\FRSFastTest.asi       "Launch game" goes straight into free roam.
+    scripts\FRSFastTest.ini       By default only when the editor launches
+    scripts\FRSFastTest-Tracks.txt  the game; the setup can make it always.
+                                  (It replaces FRSFastBoot: an old copy is
+                                  moved to scripts\retired-FRSFastBoot.)
 
 Older copies of the plugins (FRSModelLoader.asi, SpawnCar.asi,
 FRSCameraBridge.asi) are renamed to .off, since FRSWorldLoader.asi does
@@ -69,7 +71,7 @@ https://buymeacoffee.com/chrystianfarias
 LICENSE
 -------
 
-FRS World Editor, FRS World Loader and FRSFastBoot: (c) 2026 Chrystian Farias,
+FRS World Editor, FRS World Loader and FRSFastTest: (c) 2026 Chrystian Farias,
 licensed under Creative Commons Attribution-NonCommercial 4.0 International
 (CC BY-NC 4.0). You may share and adapt them, crediting Chrystian Farias, for
 non-commercial purposes only -- they may not be sold.

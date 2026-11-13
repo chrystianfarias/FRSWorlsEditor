@@ -4,13 +4,13 @@
 #       FRSWorldEditor.exe               the editor; its setup installs the game side
 #       game\dinput8.dll                 Ultimate ASI Loader (ThirteenAG, MIT)
 #       game\scripts\FRSWorldLoader.asi  the editor's end in the game
-#       game\scripts\FRSFastBoot.asi     Launch Game straight into free roam
+#       game\scripts\FRSFastTest.asi     Launch Game straight into free roam
 #       README.txt, LICENSE.txt
 #   dist\FRSWorldEditor-<version>.zip    the same, zipped
 #
 #   .\package.ps1
 #   .\package.ps1 -Version 0.2.0
-#   .\package.ps1 -FastBoot D:\path\to\FRSFastBoot   # its repository, built here
+#   .\package.ps1 -FastTest D:\path\to\FRSFastTest   # its repository, built here
 #   .\package.ps1 -WithExtensions                    # a private build, see README
 #
 # The release is built in folders of its own (build-release, loader\build-release)
@@ -18,14 +18,15 @@
 # repository and nothing else. -WithExtensions builds them in instead and
 # names the package -private, for your own use.
 #
-# FRSFastBoot lives in its own repository (by default the folder beside this
-# one) and is built from there. Ultimate ASI Loader is downloaded once, at the
+# FRSFastTest (FRSFastBoot's successor, one plugin for several games) lives in
+# its own repository, by default D:\Outros\FRSFastTest beside the Underground2
+# folder, and is built from there; its Underground 2 build is what ships. Ultimate ASI Loader is downloaded once, at the
 # version pinned below, into third_party\asi-loader.
 
 param(
     [string]$Version = "0.1.0",
     [switch]$WithExtensions,
-    [string]$FastBoot = (Join-Path (Split-Path $PSScriptRoot -Parent) "fastloader"),
+    [string]$FastTest = (Join-Path (Split-Path (Split-Path $PSScriptRoot -Parent) -Parent) "FRSFastTest"),
     [string]$AsiLoaderVersion = "v9.7.4"
 )
 
@@ -56,11 +57,11 @@ function Build([string]$source, [string]$binary, [string]$arch, [string[]]$optio
 Build $root (Join-Path $root "build-release") "x64" @("-DFRS_WITH_EXTENSIONS=$extensions")
 "[..] building FRS World Loader"
 Build (Join-Path $root "loader") (Join-Path $root "loader\build-release") "Win32" @("-DFRS_WITH_EXTENSIONS=$extensions")
-if (-not (Test-Path (Join-Path $FastBoot "CMakeLists.txt"))) {
-    throw "FRSFastBoot's repository is not at $FastBoot (pass -FastBoot <folder>)"
+if (-not (Test-Path (Join-Path $FastTest "CMakeLists.txt"))) {
+    throw "FRSFastTest's repository is not at $FastTest (pass -FastTest <folder>)"
 }
-"[..] building FRSFastBoot from $FastBoot"
-Build $FastBoot (Join-Path $FastBoot "build") "Win32"
+"[..] building FRSFastTest from $FastTest"
+Build $FastTest (Join-Path $FastTest "build") "Win32"
 
 # ---- the ASI loader, once
 $stamp = Join-Path $asiLoader ".version"
@@ -89,9 +90,9 @@ Copy-Item (Join-Path $root "packaging\README.txt") $stage
 Copy-Item (Join-Path $asiLoader "dinput8.dll") (Join-Path $stage "game")
 Copy-Item (Join-Path $root "loader\build-release\Release\FRSWorldLoader.asi") $scripts
 Copy-Item (Join-Path $root "loader\FRSWorldLoader.ini") $scripts
-Copy-Item (Join-Path $FastBoot "build\Release\FRSFastBoot.asi") $scripts
-Copy-Item (Join-Path $FastBoot "dist\FRSFastBoot.ini") $scripts
-Copy-Item (Join-Path $FastBoot "dist\FRSFastBoot-Tracks.txt") $scripts
+Copy-Item (Join-Path $FastTest "build\nfsu2\FRSFastTest.asi") $scripts
+Copy-Item (Join-Path $FastTest "games\nfsu2\FRSFastTest.ini") $scripts
+Copy-Item (Join-Path $FastTest "games\nfsu2\FRSFastTest-Tracks.txt") $scripts
 
 $rule = "=" * 76
 $license = @(
@@ -101,7 +102,7 @@ $license = @(
     "",
     $rule,
     "1. FRS World Editor (FRSWorldEditor.exe), FRS World Loader",
-    "   (game\scripts\FRSWorldLoader.asi) and FRSFastBoot (game\scripts\FRSFastBoot.asi),",
+    "   (game\scripts\FRSWorldLoader.asi) and FRSFastTest (game\scripts\FRSFastTest.asi),",
     "   by Chrystian Farias -- https://buymeacoffee.com/chrystianfarias",
     "   Creative Commons Attribution-NonCommercial 4.0 International (CC BY-NC 4.0)",
     "   You may share and adapt them, crediting Chrystian Farias, for non-commercial",

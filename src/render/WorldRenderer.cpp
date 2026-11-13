@@ -75,7 +75,7 @@ void WorldRenderer::SyncWithWorld(const nfs::World& world) {
 
     for (size_t i = uploadedSections_; i < loaded.size(); ++i) {
         SectionRender& target = sections_[i];
-        target.alternate = loaded[i]->info && loaded[i]->info->IsAlternate();
+        target.alternate = loaded[i]->info && world.IsUnusedAlternate(*loaded[i]->info);
         if (loaded[i]->info) {
             target.name = loaded[i]->info->name;
             target.number = loaded[i]->info->number;

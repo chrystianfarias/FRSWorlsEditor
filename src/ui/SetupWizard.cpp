@@ -20,7 +20,7 @@ namespace {
 const wchar_t* kTitle = L"FRS World Editor Setup";
 const wchar_t* kSupportUrl = L"https://buymeacoffee.com/chrystianfarias";
 
-// The executable the loader and FRSFastBoot were written against: SPEED2.EXE
+// The executable the loader and FRSFastTest were written against: SPEED2.EXE
 // v1.2, 4 800 512 bytes. Any other build still opens in the editor, but the
 // plugins leave the game alone.
 const char* kSupportedMd5 = "6445adbf4e8d64be51e96a69bba168a4";
@@ -181,7 +181,7 @@ bool RunningElevated() {
 
 // Lets every user of the machine change `path` (and, for a folder, what is
 // made in it later): the editor runs without elevation and writes its edits
-// to <game>\models, and it turns FRSFastBoot on and off in its .ini.
+// to <game>\models, and it turns FRSFastTest on and off in its .ini.
 void GrantUsersModify(const std::wstring& path, bool folder) {
     PSID users = nullptr;
     SID_IDENTIFIER_AUTHORITY nt = SECURITY_NT_AUTHORITY;
@@ -233,22 +233,23 @@ InstallStatus Install(const SetupChoices& choices, std::wstring& report) {
     in.Copy(payload + L"\\scripts\\FRSWorldLoader.ini", scripts + L"\\FRSWorldLoader.ini",
             L"FRSWorldLoader.ini", true);
 
+    // FRSFastTest replaced FRSFastBoot: the two must never load together.
+    RetireOldFastBoot(game, &in.report);
+
     if (choices.fastBoot) {
-        const bool haveIni = FileExists(FastBootIni(game));
-        in.Copy(payload + L"\\scripts\\FRSFastBoot.asi", scripts + L"\\FRSFastBoot.asi",
-                L"FRSFastBoot (scripts\\FRSFastBoot.asi)");
-        in.Copy(payload + L"\\scripts\\FRSFastBoot.ini", FastBootIni(game), L"FRSFastBoot.ini", true);
-        in.Copy(payload + L"\\scripts\\FRSFastBoot-Tracks.txt", scripts + L"\\FRSFastBoot-Tracks.txt",
-                L"FRSFastBoot-Tracks.txt");
+        in.Copy(payload + L"\\scripts\\FRSFastTest.asi", scripts + L"\\FRSFastTest.asi",
+                L"FRSFastTest (scripts\\FRSFastTest.asi)");
+        in.Copy(payload + L"\\scripts\\FRSFastTest.ini", FastBootIni(game), L"FRSFastTest.ini", true);
+        in.Copy(payload + L"\\scripts\\FRSFastTest-Tracks.txt", scripts + L"\\FRSFastTest-Tracks.txt",
+                L"FRSFastTest-Tracks.txt");
         if (FileExists(FastBootIni(game))) {
             if (!SetFastBootEnabled(game, choices.fastBootAlways))
-                in.Fail(L"setting FRSFastBoot.ini", ::GetLastError());
+                in.Fail(L"setting FRSFastTest.ini", ::GetLastError());
             else
                 in.report += choices.fastBootAlways
-                                 ? L"FRSFastBoot: on for every start of the game\r\n"
-                                 : L"FRSFastBoot: only when the editor launches the game\r\n";
+                                 ? L"FRSFastTest: on for every start of the game\r\n"
+                                 : L"FRSFastTest: only when the editor launches the game\r\n";
         }
-        (void)haveIni;
     }
 
     if (choices.disableOld) {
@@ -373,7 +374,7 @@ void DescribeFolder(HWND dialog) {
         const std::wstring loader = AsiLoaderIn(folder);
         if (!loader.empty()) present.push_back(L"an ASI loader (" + loader + L")");
         if (WorldLoaderInstalled(folder)) present.push_back(L"FRS World Loader");
-        if (FastBootInstalled(folder)) present.push_back(L"FRSFastBoot");
+        if (FastBootInstalled(folder)) present.push_back(L"FRSFastTest");
         if (!present.empty()) text += L"Already installed: " + Joined(present) + L".";
     }
     SetText(dialog, IDC_SETUP_FOLDER_STATUS, text);
@@ -459,7 +460,7 @@ void DescribeParts(HWND dialog) {
     Check(dialog, IDC_SETUP_LOADER, true);
     Enable(dialog, IDC_SETUP_LOADER, false);
 
-    const bool haveFastBoot = PayloadHas(L"scripts\\FRSFastBoot.asi");
+    const bool haveFastBoot = PayloadHas(L"scripts\\FRSFastTest.asi");
     Check(dialog, IDC_SETUP_FASTBOOT, haveFastBoot);
     Enable(dialog, IDC_SETUP_FASTBOOT, haveFastBoot);
     Check(dialog, IDC_SETUP_FASTBOOT_ALWAYS, FastBootInstalled(folder) && FastBootEnabled(folder));
@@ -686,10 +687,32 @@ bool RunInstallCommand(int& exitCode) {
     return true;
 }
 
-std::wstring FastBootIni(const std::wstring& gameFolder) { return gameFolder + L"\\scripts\\FRSFastBoot.ini"; }
+std::wstring FastBootIni(const std::wstring& gameFolder) { return gameFolder + L"\\scripts\\FRSFastTest.ini"; }
 
 bool FastBootInstalled(const std::wstring& gameFolder) {
-    return FileExists(gameFolder + L"\\scripts\\FRSFastBoot.asi");
+    return FileExists(gameFolder + L"\\scripts\\FRSFastTest.asi");
+}
+
+size_t RetireOldFastBoot(const std::wstring& gameFolder, std::wstring* report) {
+    // FRSFastBoot was FRSFastTest's first name. Both hook the game's main loop
+    // to boot straight into free roam; loaded together each calls the other
+    // until the stack runs out, a crash within a second of starting.
+    const std::wstring scripts = gameFolder + L"\\scripts";
+    if (!FileExists(scripts + L"\\FRSFastBoot.asi")) return 0;
+    const std::wstring retired = scripts + L"\\retired-FRSFastBoot";
+    ::CreateDirectoryW(retired.c_str(), nullptr);
+    size_t moved = 0;
+    for (const wchar_t* name : { L"FRSFastBoot.asi", L"FRSFastBoot.ini", L"FRSFastBoot-Tracks.txt", L"FRSFastBoot.log" }) {
+        const std::wstring from = scripts + L"\\" + name;
+        if (!FileExists(from)) continue;
+        // The .asi keeps a name no loader picks up, wherever it looks.
+        std::wstring to = retired + L"\\" + name;
+        if (std::wstring(name) == L"FRSFastBoot.asi") to += L".retired";
+        if (::MoveFileExW(from.c_str(), to.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED)) ++moved;
+    }
+    if (report && moved)
+        *report += L"Retired the older FRSFastBoot (replaced by FRSFastTest) to scripts\\retired-FRSFastBoot\r\n";
+    return moved;
 }
 
 bool WorldLoaderInstalled(const std::wstring& gameFolder) {
@@ -697,10 +720,10 @@ bool WorldLoaderInstalled(const std::wstring& gameFolder) {
 }
 
 bool FastBootEnabled(const std::wstring& gameFolder) {
-    return ::GetPrivateProfileIntW(L"FastBoot", L"Enabled", 1, FastBootIni(gameFolder).c_str()) != 0;
+    return ::GetPrivateProfileIntW(L"FastTest", L"Enabled", 1, FastBootIni(gameFolder).c_str()) != 0;
 }
 
 bool SetFastBootEnabled(const std::wstring& gameFolder, bool enabled) {
-    return ::WritePrivateProfileStringW(L"FastBoot", L"Enabled", enabled ? L"1" : L"0",
+    return ::WritePrivateProfileStringW(L"FastTest", L"Enabled", enabled ? L"1" : L"0",
                                         FastBootIni(gameFolder).c_str()) != FALSE;
 }

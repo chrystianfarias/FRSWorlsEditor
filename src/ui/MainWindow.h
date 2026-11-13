@@ -201,6 +201,9 @@ private:
     // The frame drawn with ImGui (ui/MainWindowShell.cpp): the native
     // controls stay, hidden, as what everything writes to.
     bool shell_ = false;
+    // Where the 3D view is, on screen, between the docked panels: the game
+    // opens there, the panels and bars stay usable round it.
+    RECT gameArea_{};
     void DrawShellBars();
     void DrawShellPanels();
     void DrawShellMenu(HMENU menu, bool top);
@@ -238,6 +241,8 @@ private:
     int  shellDragItem_ = -1;
     int  shownTab_ = -1;
     static constexpr UINT kShellTreeActivate = WM_APP + 0x51;
+    static constexpr UINT kStopGameMessage = WM_APP + 0x55;
+    void StopGame();
     static constexpr UINT kShellLibraryActivate = WM_APP + 0x52;
 
     std::wstring LoadStoredGameFolder() const;
@@ -287,7 +292,7 @@ private:
     double lastStatusUpdate_ = 0.0;
 
     EmbeddedGame game_;
-    // FRSFastBoot was switched on for the launch in flight, at this tick.
+    // FRSFastTest was switched on for the launch in flight, at this tick.
     bool  fastBootRestore_ = false;
     DWORD fastBootSince_ = 0;
 

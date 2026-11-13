@@ -46,11 +46,12 @@ struct Section {
     bool HasTexturePack() const { return geometrySize != streamSize; }
 
     // A region ships two sets of sections. The ordering key separates them:
-    // 10000-19999 is one set of 255 sections, 20000-29999 another of 112, and
-    // where they cover the same ground they are alternatives, not neighbours --
-    // M32 (11332) and M12 (21312) are listed at the identical world position.
-    // Drawing both stacks two versions of the same district on top of each
-    // other, which reads as identical objects side by side.
+    // 10000-19999 is one set of 255 sections, 20000-29999 another of 112.
+    // The second set is NOT simply an alternative to the first: the game's
+    // visibility lists load many of them alongside -- M42 carries the scenery
+    // of the Arco tower, whose windows are in M31 -- so a section of the
+    // second set is only an alternative when no list ever loads it
+    // (World::IsUnusedAlternate, which asks the visibility lists).
     bool IsAlternate() const { return order >= 20000; }
 };
 

@@ -294,7 +294,7 @@ void CollisionTools::BuildMenu() {
 
     popup_ = ::CreatePopupMenu();
     ::AppendMenuW(popup_, MF_STRING, ID_VIEW_COLLISION, L"&Show Collision\tCtrl+K");
-    ::AppendMenuW(popup_, MF_STRING, kIdRaceGroups, L"Show &Race Barriers");
+    ::AppendMenuW(popup_, MF_STRING, kIdRaceGroups, L"Show &Race Barriers and Start Lines");
     ::AppendMenuW(popup_, MF_SEPARATOR, 0, nullptr);
     ::AppendMenuW(popup_, MF_STRING, kIdBarrier, L"Draw &Barrier (no height limit)\tCtrl+Shift+W");
     ::AppendMenuW(popup_, MF_STRING, kIdWall, L"Draw &Wall with Height\tCtrl+Shift+H");
@@ -423,6 +423,8 @@ bool CollisionTools::OnCommand(int id) {
             GenerateForSelection();
             return true;
         case kIdRaceGroups:
+            // The race's collision and its objects go together.
+            Renderer().SetRacePropsVisible(!Renderer().RaceGroupsVisible());
             Renderer().SetRaceGroupsVisible(!Renderer().RaceGroupsVisible());
             if (host_.menuChecks) host_.menuChecks();
             return true;

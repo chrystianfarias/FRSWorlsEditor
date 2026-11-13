@@ -37,6 +37,9 @@ public:
     // Returns false when no zone claims the point at all.
     bool VisibleAt(const Vec3& point, std::vector<u32>& sections) const;
 
+    // Whether any zone's list names the section: what the game ever loads.
+    bool Listed(u32 sectionNumber) const;
+
 private:
     struct Zone {
         Vec3              boundsMin;

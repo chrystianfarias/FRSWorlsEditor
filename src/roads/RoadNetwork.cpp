@@ -1506,11 +1506,11 @@ bool Network::Save(const std::wstring& path) const {
         std::string text = line;
         if (!text.empty() && text.back() == '\n') text.pop_back();
         char banking[512];
-        std::snprintf(banking, sizeof(banking), " %d %d %.3f %.3f %.3f %d %.3f %.3f %s %d %d %d %s %.3f %.3f",
+        std::snprintf(banking, sizeof(banking), " %d %d %.3f %.3f %.3f %d %.3f %.3f %s %d %d %d %s %.3f %.3f %d %d %.3f",
                       p.keepGround ? 1 : 0, p.bankMode, p.bankMax, p.designSpeed, p.bankAngle, p.medianType,
                       p.medianWidth, p.medianHeight, Token(p.medianTexture).c_str(), p.sidewalkLeft ? 1 : 0,
                       p.sidewalkRight ? 1 : 0, p.wallStyle, Token(p.wallModel).c_str(), p.wallModelSpacing,
-                      p.wallModelTurn);
+                      p.wallModelTurn, p.traffic ? 1 : 0, p.gps ? 1 : 0, p.speedLimit);
         out << text << banking << "\n";
     }
     for (const GameJunction& j : gameJunctions_) {
@@ -1624,6 +1624,11 @@ bool Network::Load(const std::wstring& path) {
                         p.sidewalkRight = walkRight != 0;
                         p.wallStyle = std::clamp(p.wallStyle, 0, 2);
                         p.wallModel = Untoken(wallModel);
+                        int traffic = 1, gps = 1;
+                        if (line >> traffic >> gps >> p.speedLimit) {
+                            p.traffic = traffic != 0;
+                            p.gps = gps != 0;
+                        }
                     }
                 }
             } else {

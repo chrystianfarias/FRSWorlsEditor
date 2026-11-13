@@ -469,7 +469,7 @@ size_t World::SectionForPlacement(const Vec3& point) const {
 
     for (size_t i = 0; i < loaded_.size(); ++i) {
         const LoadedSection& candidate = *loaded_[i];
-        if (!candidate.info || IsLibrary(candidate) || candidate.info->IsAlternate()) continue;
+        if (!candidate.info || IsLibrary(candidate) || IsUnusedAlternate(*candidate.info)) continue;
         if (std::find(candidate.sceneryNumbers.begin(), candidate.sceneryNumbers.end(),
                       candidate.info->number) == candidate.sceneryNumbers.end())
             continue;

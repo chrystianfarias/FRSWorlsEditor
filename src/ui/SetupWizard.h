@@ -15,8 +15,9 @@
 //                                game already has an ASI loader
 //   scripts\FRSWorldLoader.asi   the editor's end in the game: edited meshes,
 //                                sections and replaced files
-//   scripts\FRSFastBoot.asi      Launch Game from the editor boots straight
-//                                into free roam
+//   scripts\FRSFastTest.asi      Launch Game from the editor boots straight
+//                                into free roam (it replaced FRSFastBoot, which
+//                                is retired wherever it is found)
 //
 // They come from the "game" folder beside the editor, as the release package
 // lays them out. A game under Program Files is not writable without
@@ -46,10 +47,16 @@ std::wstring DetectGameFolder();
 // when it all went in. Returns false when the command line is not an install.
 bool RunInstallCommand(int& exitCode);
 
-// The FRSFastBoot switch: the editor turns it on for the launch it makes and
-// back off once the game has read it, unless the player wants it always.
+// The FRSFastTest switch ([FastTest] Enabled in scripts\FRSFastTest.ini): the
+// editor turns it on for the launch it makes and back off once the game has
+// read it, unless the player wants it always. (Named after FRSFastBoot, the
+// plugin's first name.)
 std::wstring FastBootIni(const std::wstring& gameFolder);
 bool FastBootInstalled(const std::wstring& gameFolder);
 bool WorldLoaderInstalled(const std::wstring& gameFolder);
 bool FastBootEnabled(const std::wstring& gameFolder);
 bool SetFastBootEnabled(const std::wstring& gameFolder, bool enabled);
+// Moves an old FRSFastBoot out of scripts\ (into scripts\retired-FRSFastBoot):
+// with FRSFastTest beside it the game crashes as it starts. Returns the
+// files moved, and notes it in `report` when given.
+size_t RetireOldFastBoot(const std::wstring& gameFolder, std::wstring* report = nullptr);

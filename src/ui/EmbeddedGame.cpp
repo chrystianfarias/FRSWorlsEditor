@@ -102,6 +102,25 @@ void EmbeddedGame::SetShown(bool shown) {
     placed_ = RECT{};   // placed again on the next update
 }
 
+void EmbeddedGame::Stop(DWORD graceMs) {
+    if (!Running()) return;
+    HWND window = window_;
+    if (!window) {
+        Search search{ processId_, nullptr };
+        ::EnumWindows(&FindGameWindow, (LPARAM)&search);
+        window = search.found;
+    }
+    if (window && ::IsWindow(window)) ::PostMessageW(window, WM_CLOSE, 0, 0);
+    // The game asks nothing on WM_CLOSE but can take a moment; one that hangs
+    // (a crash dialog, a loading screen) is ended.
+    if (::WaitForSingleObject(process_, graceMs) == WAIT_TIMEOUT) {
+        LOG_WARN("game: still running %lu ms after being asked to close; ending it", graceMs);
+        ::TerminateProcess(process_, 0);
+        ::WaitForSingleObject(process_, 2000);
+    }
+    LOG_INFO("game stopped");
+}
+
 void EmbeddedGame::Release() {
     if (window_ && ::IsWindow(window_)) {
         ::SetWindowLongPtrW(window_, GWLP_HWNDPARENT, 0);

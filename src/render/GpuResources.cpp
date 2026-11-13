@@ -150,6 +150,8 @@ bool GpuSection::Upload(IDirect3DDevice9* device, const nfs::LoadedSection& sect
             gpuObject.transform   = object.transform;
             gpuObject.worldBounds = object.WorldBounds();
             gpuObject.isBackdrop  = object.IsBackdrop();
+            gpuObject.raceProp    = object.name.rfind("ZPM_", 0) == 0 ||
+                                    object.name.find("TRACKBARRIER") != std::string::npos;
             gpuObject.baseVertex  = vertexCursor;
 
             std::memcpy(vertices + vertexCursor, object.vertices.data(),

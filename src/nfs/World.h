@@ -184,6 +184,13 @@ public:
     // happened to be streamed in.
     bool IsLibrary(const LoadedSection& section) const;
 
+    // A section of the second set (Section::IsAlternate) that no visibility
+    // list of the game loads: a true alternative, hidden unless asked for.
+    // Without visibility lists, the second set as a whole.
+    bool IsUnusedAlternate(const Section& section) const {
+        return section.IsAlternate() && (preculler_.IsEmpty() || !preculler_.Listed(section.number));
+    }
+
     // The positioned section a placement at `point` belongs in: the one whose
     // ground covers it, else the nearest. SIZE_MAX when none can take scenery.
     size_t SectionForPlacement(const Vec3& point) const;

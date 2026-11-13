@@ -71,7 +71,8 @@ If the editor helps you, you can [buy me a coffee](https://buymeacoffee.com/chry
      `SPEED2.EXE`;
    - installs the game-side plugins: Ultimate ASI Loader (`dinput8.dll`,
      skipped if the game already has an ASI loader), `FRSWorldLoader.asi` and
-     `FRSFastBoot.asi`;
+     `FRSFastTest.asi` (it replaces the older `FRSFastBoot.asi`, which is moved
+     aside: the two together crash the game as it starts);
    - asks for administrator rights once if the game is under Program Files.
 3. Pick a region at the top left. Right mouse to look, `W` `A` `S` `D` to
    move, `Q` / `E` down / up, Shift faster, Ctrl slower.
@@ -128,8 +129,8 @@ cmake -S loader -B loader/build -G "Visual Studio 17 2022" -A Win32
 cmake --build loader/build --config Release
 ```
 
-`package.ps1` builds everything, FRSFastBoot included (from its own
-repository, by default the folder beside this one), downloads Ultimate ASI
+`package.ps1` builds everything, FRSFastTest included (from its own
+repository, by default `D:\Outros\FRSFastTest`), downloads Ultimate ASI
 Loader and writes the release folder and zip to `dist\`.
 
 ### Extensions

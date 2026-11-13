@@ -292,7 +292,7 @@ BEGIN
     AUTOCHECKBOX    "FRS World Loader -- required", IDC_SETUP_LOADER, 0, 28, 300, 12
     LTEXT           "Puts the editor's work into the game: placed and edited objects, collision, textures.",
                     -1, 12, 41, 288, 18
-    AUTOCHECKBOX    "FRSFastBoot", IDC_SETUP_FASTBOOT, 0, 62, 300, 12
+    AUTOCHECKBOX    "FRSFastTest", IDC_SETUP_FASTBOOT, 0, 62, 300, 12
     LTEXT           "Launch Game in the editor goes straight into free roam, with the car where the camera is.",
                     -1, 12, 75, 288, 18
     AUTOCHECKBOX    "Also boot straight into free roam when the game is started normally", IDC_SETUP_FASTBOOT_ALWAYS,

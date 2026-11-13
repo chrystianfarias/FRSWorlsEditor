@@ -199,6 +199,10 @@ public:
     // Race barrier groups (polygon byte 0 != 0) exist only during the races
     // that use them. Hidden, they are neither drawn nor picked.
     bool RaceGroupsVisible() const { return showRaceGroups_; }
+    // The race-only objects -- track barriers, start and finish lines -- which
+    // free roam never shows. Hidden by default, like the race collision.
+    bool RacePropsVisible() const { return showRaceProps_; }
+    void SetRacePropsVisible(bool visible) { showRaceProps_ = visible; }
     void SetRaceGroupsVisible(bool visible);
 
     // Rebuilds the drawn collision of one loaded section after it was edited.
@@ -459,7 +463,8 @@ private:
     bool       showLibrary_ = false;
     bool       showAlternate_ = false;
     bool       showCollision_ = false;
-    bool       showRaceGroups_ = true;
+    bool       showRaceGroups_ = false;
+    bool       showRaceProps_ = false;
     struct ToolLayer { std::vector<OverlayVertex> triangles, lines; };
     std::unordered_map<const void*, ToolLayer> toolLayers_;
     void DrawToolOverlay(IDirect3DDevice9* device);
@@ -496,7 +501,8 @@ private:
 
     std::function<bool(const nfs::SolidObject&)> hiddenModels_;
     bool HiddenModel(const GpuObject& object) const {
-        return hiddenModels_ && object.source && hiddenModels_(*object.source);
+        return (object.raceProp && !showRaceProps_) ||
+               (hiddenModels_ && object.source && hiddenModels_(*object.source));
     }
 
     // The sections whose collision was drawn last frame, so picking only finds

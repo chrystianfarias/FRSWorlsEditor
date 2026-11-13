@@ -577,6 +577,77 @@ void MeshTools::OnRegionLoaded() {
     static const bool selfTest = std::getenv("FRS_MESH_TOOLS_SELFTEST") != nullptr;
     nfs::World* world = World();
 
+    // FRS_FIND_MODEL=<part of a model name>: where such models are stored, what
+    // places them, and whether the renderer has them -- for a missing object.
+    if (const char* wanted = std::getenv("FRS_FIND_MODEL"); wanted && world) {
+        std::string key = wanted;
+        for (char& c : key) c = (char)std::toupper((unsigned char)c);
+        const auto matches = [&](const std::string& name) {
+            std::string upper = name;
+            for (char& c : upper) c = (char)std::toupper((unsigned char)c);
+            return upper.find(key) != std::string::npos;
+        };
+        const auto& loaded = world->Loaded();
+        for (size_t s = 0; s < loaded.size(); ++s) {
+            const auto& section = *loaded[s];
+            const char* sname = section.info ? section.info->name.c_str() : "?";
+            for (const auto& list : section.solidLists)
+                for (const auto& object : list.objects)
+                    if (matches(object.name)) {
+                        const GpuSection* gpu = nullptr;
+                        const GpuObject* gpuObject = nullptr;
+                        const bool onGpu = Renderer().FindGpuModel(object.hash, gpu, gpuObject);
+                        LOG_INFO("find model: %s (%08X) stored in %s%s%s, %zu vertices, %zu indices, %zu materials, "
+                                 "duplicate %d, backdrop %d, header at (%.1f %.1f %.1f), on the GPU %d (findModel %d)",
+                                 object.name.c_str(), object.hash, sname, world->IsLibrary(section) ? " [library]" : "",
+                                 section.info && section.info->IsAlternate() ? " [alternate]" : "",
+                                 object.vertices.size(), object.indices.size(), object.materials.size(),
+                                 object.duplicatePlacement, object.IsBackdrop(), object.transform.m[3][0],
+                                 object.transform.m[3][1], object.transform.m[3][2], onGpu,
+                                 world->FindModel(object.hash) == &object);
+                    }
+            for (size_t i = 0; i < section.scenery.infos.size(); ++i) {
+                const auto& info = section.scenery.infos[i];
+                if (!matches(info.name)) continue;
+                size_t uses = 0;
+                for (const auto& instance : section.scenery.instances)
+                    if (instance.infoIndex == i) {
+                        ++uses;
+                        LOG_INFO("find model: instance of info '%s' (hash %08X) in %s, scenery %u record %u, flags %X, "
+                                 "at (%.1f %.1f %.1f), model resolves %d",
+                                 info.name.c_str(), info.solidHash, sname, instance.sceneryNumber, instance.record,
+                                 instance.flags, instance.transform.m[3][0], instance.transform.m[3][1],
+                                 instance.transform.m[3][2], world->FindModel(info.solidHash) != nullptr);
+                    }
+                if (!uses) LOG_INFO("find model: info '%s' in %s has no instance", info.name.c_str(), sname);
+            }
+        }
+        size_t second = 0, unused = 0;
+        std::string unusedNames;
+        for (const auto& section : loaded) {
+            if (!section->info || !section->info->IsAlternate()) continue;
+            ++second;
+            if (world->IsUnusedAlternate(*section->info)) {
+                ++unused;
+                if (unusedNames.size() < 300) unusedNames += section->info->name + " ";
+            }
+        }
+        LOG_INFO("find model: second set %zu sections, %zu loaded by the game's lists, %zu never (%s)", second,
+                 second - unused, unused, unusedNames.c_str());
+        LOG_INFO("find model: done (renderer: %zu unresolved, %zu duplicate instances)",
+                 Renderer().UnresolvedInstances(), Renderer().DuplicateInstances());
+    }
+
+    // FRS_CAMERA="x y z": the view looks at that point from a little way off,
+    // for a capture of one spot.
+    if (const char* at = std::getenv("FRS_CAMERA"); at && world) {
+        float x = 0, y = 0, z = 0;
+        if (std::sscanf(at, "%f %f %f", &x, &y, &z) == 3) {
+            host_.viewport->GetCamera().SetPosition({ x - 120.0f, y - 120.0f, z + 60.0f });
+            host_.viewport->GetCamera().SetYawPitch(Radians(45.0f), Radians(-12.0f));
+        }
+    }
+
     // FRS_BAKE_SELFTEST=1: the map's own road by a street light, baked, set
     // beside the colours the game baked into it -- nothing changed.
     if (std::getenv("FRS_BAKE_SELFTEST") && world) {

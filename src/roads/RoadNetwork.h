@@ -108,6 +108,14 @@ struct RoadProfile {
     float wallModelSpacing = 4.0f;
     float wallModelTurn = 0.0f;
 
+    // Traffic and the GPS: whether the game's traffic drives this road, whether
+    // the player's GPS (and the racers) may route over it, and the speed the
+    // traffic keeps on its straights. Written into the game's road graph at
+    // every bake, joined to the game's own roads automatically.
+    bool  traffic = true;
+    bool  gps = true;
+    float speedLimit = 60.0f;      // km/h
+
     int   Lanes() const { return lanesForward + lanesBackward; }
     float MedianWidth() const { return medianType ? medianWidth : 0.0f; }
     float HalfRoad() const { return Lanes() * laneWidth * 0.5f + MedianWidth() * 0.5f; }
