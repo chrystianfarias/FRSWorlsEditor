@@ -1,0 +1,340 @@
+#include <windows.h>
+#include <commctrl.h>
+
+#include "Resource.h"
+
+IDI_APP ICON "App.ico"
+
+// Run by Blender for Objects > Edit in Blender; written out beside each export.
+IDR_BLENDER_SCRIPT RCDATA "../../blender/frs_quickedit.py"
+
+IDR_MAIN_MENU MENU
+BEGIN
+    POPUP "&File"
+    BEGIN
+        MENUITEM "&New World...",                  ID_WORLD_NEW
+        MENUITEM "&Open World...",                 ID_WORLD_OPEN
+        MENUITEM "&Save World\tCtrl+S",           ID_WORLD_SAVE
+        MENUITEM SEPARATOR
+        MENUITEM "&Game Folder and Plugins...\tCtrl+O", ID_FILE_OPEN_GAME
+        MENUITEM "Choose &Blender...",             ID_FILE_BLENDER
+        MENUITEM "&Close Region",                 ID_WORLD_CLOSE
+        MENUITEM SEPARATOR
+        MENUITEM "E&xit",                         ID_FILE_EXIT
+    END
+
+    POPUP "&World"
+    BEGIN
+        MENUITEM "&Load All Sections\tCtrl+L",    ID_WORLD_LOAD_ALL
+        MENUITEM "Refresh Region &Edits",          ID_FILE_EDITS
+    END
+
+    POPUP "&View"
+    BEGIN
+        POPUP "&Render Mode"
+        BEGIN
+            MENUITEM "&Textured\tF1",             ID_VIEW_TEXTURED
+            MENUITEM "&Unlit\tF2",                ID_VIEW_UNLIT
+            MENUITEM "&Vertex Colours\tF3",       ID_VIEW_VERTEX_COLOR
+            MENUITEM "&Wireframe\tF4",            ID_VIEW_WIREFRAME
+        END
+        POPUP "&Show"
+        BEGIN
+            MENUITEM "&Scenery\tF7",              ID_VIEW_SCENERY
+            MENUITEM "Model &Library\tF10",       ID_VIEW_LIBRARY
+            MENUITEM "&Alternate Sections\tF11",  ID_VIEW_ALTERNATE
+            MENUITEM "&Backdrop\tF5",             ID_VIEW_BACKDROP
+            MENUITEM "&Collision\tCtrl+K",        ID_VIEW_COLLISION
+        END
+        POPUP "&Drawing"
+        BEGIN
+            MENUITEM "&Frustum Culling",          ID_VIEW_FRUSTUM_CULL
+            MENUITEM "&Stream Around Camera",     ID_VIEW_STREAMING
+            MENUITEM "&Backface Culling\tF6",     ID_VIEW_BACKFACE_CULL
+        END
+        // MINIMAP PREVIEW (temporary)
+        POPUP "&Minimap Preview (temporary)"
+        BEGIN
+            MENUITEM "&Generate Buildings...",    ID_MINIMAP_GENERATE
+            MENUITEM "&Show Minimap Buildings",   ID_MINIMAP_SHOW
+            MENUITEM "&Original Buildings",       ID_MINIMAP_ORIGINALS
+        END
+        MENUITEM SEPARATOR
+        MENUITEM "&Texture Browser\tF9",          ID_VIEW_TEXTURES
+    END
+
+    POPUP "C&amera"
+    BEGIN
+        MENUITEM "&Save Camera Position",         IDC_SAVE_CAMERA
+        MENUITEM "&Go to Saved Camera",           IDC_GO_CAMERA
+        MENUITEM SEPARATOR
+        MENUITEM "&Frame World\tHome",            ID_WORLD_FRAME
+    END
+
+    POPUP "&Objects"
+    BEGIN
+        MENUITEM "&Place Object...\tCtrl+N",      ID_OBJECT_PLACE
+        MENUITEM SEPARATOR
+        POPUP "&Gizmo"
+        BEGIN
+            MENUITEM "&Move\t1",                  ID_GIZMO_MOVE
+            MENUITEM "&Rotate\t2",                ID_GIZMO_ROTATE
+            MENUITEM "&Scale\t3",                 ID_GIZMO_SCALE
+        END
+        POPUP "&Selection"
+        BEGIN
+            MENUITEM "&Move\tG",                  ID_OBJECT_GRAB
+            MENUITEM "&Rotate\tR",                ID_OBJECT_ROTATE
+            MENUITEM "Snap to &Ground\tCtrl+G",   ID_OBJECT_SNAP
+            MENUITEM "P&roperties...\tF2",        ID_OBJECT_PROPERTIES
+            MENUITEM SEPARATOR
+            MENUITEM "&Copy\tCtrl+C",             ID_OBJECT_COPY
+            MENUITEM "&Paste at View Centre\tCtrl+V", ID_OBJECT_PASTE
+            MENUITEM SEPARATOR
+            MENUITEM "&Delete / Remove from World\tDel", ID_OBJECT_DELETE
+            MENUITEM SEPARATOR
+            MENUITEM "Edit in &Blender\tCtrl+Shift+E", ID_OBJECT_BLENDER
+        END
+        POPUP "&My Objects"
+        BEGIN
+            MENUITEM "&New Object (opens Blender)\tCtrl+Shift+N", ID_OBJECT_NEW_BLENDER
+            MENUITEM "New Object from an &OBJ File...", ID_OBJECT_NEW_OBJ
+            MENUITEM "&Place My Object...\tCtrl+Shift+P", ID_OBJECT_PLACE_MINE
+            MENUITEM SEPARATOR
+            MENUITEM "&Delete My Objects...",     ID_OBJECT_DELETE_MINE
+        END
+        POPUP "&Import / Export"
+        BEGIN
+            MENUITEM "&Export Selection to OBJ...\tCtrl+E", ID_FILE_EXPORT
+            MENUITEM "&Import Edited OBJ...\tCtrl+I", ID_FILE_IMPORT
+        END
+        MENUITEM SEPARATOR
+        MENUITEM "&Write Placements to Game\tCtrl+Shift+S", ID_OBJECT_SAVE
+    END
+
+    POPUP "&Help"
+    BEGIN
+        MENUITEM "&Read Me",                      ID_HELP_README
+        MENUITEM "&Support the Project (Buy Me a Coffee)...", ID_HELP_SUPPORT
+        MENUITEM SEPARATOR
+        MENUITEM "&About",                        ID_HELP_ABOUT
+    END
+END
+
+// The objects made in this editor, to tick and delete.
+IDD_MY_OBJECTS DIALOGEX 0, 0, 340, 220
+STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Delete my objects"
+FONT 9, "Segoe UI", 400, 0, 1
+BEGIN
+    LTEXT           "Tick the objects to delete. Each goes from every section it was placed in, with its placements and any texture nothing else uses.", -1, 6, 6, 328, 20
+    CONTROL         "", IDC_MINE_LIST, "SysListView32",
+                    LVS_REPORT | LVS_SHOWSELALWAYS | WS_BORDER | WS_TABSTOP, 6, 30, 328, 162
+    DEFPUSHBUTTON   "&Delete Ticked", IDOK, 214, 200, 66, 14
+    PUSHBUTTON      "Cancel", IDCANCEL, 284, 200, 50, 14
+END
+
+// Lists every texture in the region and shows the selected one at its real
+// size, decoded on the CPU so the preview does not depend on the renderer.
+IDD_TEXTURES DIALOGEX 0, 0, 440, 300
+STYLE DS_SETFONT | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME
+CAPTION "Texture browser"
+FONT 9, "Segoe UI", 400, 0, 1
+BEGIN
+    CONTROL         "", IDC_TEX_LIST, "SysListView32",
+                    LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | WS_BORDER |
+                    WS_TABSTOP, 6, 6, 190, 288
+    CONTROL         "", IDC_TEX_PREVIEW, "STATIC", SS_OWNERDRAW | WS_BORDER,
+                    202, 6, 232, 232
+    LTEXT           "", IDC_TEX_INFO, 202, 244, 232, 32
+    AUTOCHECKBOX    "&Actual size", IDC_TEX_ZOOM, 202, 282, 60, 12
+    PUSHBUTTON      "&Save as BMP...", IDC_TEX_SAVE, 370, 280, 64, 14
+END
+
+// The edits that are in force, and the way to take one back out.
+IDD_OVERLAYS DIALOGEX 0, 0, 340, 220
+STYLE DS_SETFONT | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME
+CAPTION "Edited meshes"
+FONT 9, "Segoe UI", 400, 0, 1
+BEGIN
+    CONTROL         "", IDC_OVERLAY_LIST, "SysListView32",
+                    LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | WS_BORDER |
+                    WS_TABSTOP, 6, 6, 328, 186
+    PUSHBUTTON      "&Remove edit", IDC_OVERLAY_REMOVE, 6, 198, 55, 14
+    DEFPUSHBUTTON   "&Close", IDC_OVERLAY_CLOSE, 294, 198, 40, 14
+END
+
+// A name for a new, empty world.
+IDD_NEW_WORLD DIALOGEX 0, 0, 240, 92
+STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "New world"
+FONT 9, "Segoe UI", 400, 0, 1
+BEGIN
+    LTEXT           "", IDC_WORLD_NOTE, 6, 6, 228, 36
+    LTEXT           "&Name:", -1, 6, 50, 24, 10
+    EDITTEXT        IDC_WORLD_NAME, 34, 48, 200, 13, ES_AUTOHSCROLL
+    DEFPUSHBUTTON   "&Create", IDOK, 130, 72, 50, 14
+    PUSHBUTTON      "Cancel", IDCANCEL, 184, 72, 50, 14
+END
+
+// The worlds put away, to open one in place of the current one.
+IDD_OPEN_WORLD DIALOGEX 0, 0, 240, 170
+STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Open world"
+FONT 9, "Segoe UI", 400, 0, 1
+BEGIN
+    LTEXT           "", IDC_WORLD_NOTE, 6, 6, 228, 20
+    LISTBOX         IDC_WORLD_LIST, 6, 28, 228, 118, LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | WS_VSCROLL | WS_BORDER | WS_TABSTOP
+    DEFPUSHBUTTON   "&Open", IDOK, 130, 150, 50, 14
+    PUSHBUTTON      "Cancel", IDCANCEL, 184, 150, 50, 14
+END
+
+// Picks a model by name to place at the point the camera looks at.
+IDD_PLACE_MODEL DIALOGEX 0, 0, 620, 390
+STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Place an object"
+FONT 9, "Segoe UI", 400, 0, 1
+BEGIN
+    LTEXT           "&Search:", -1, 6, 8, 28, 10
+    EDITTEXT        IDC_PLACE_FILTER, 36, 6, 290, 13, ES_AUTOHSCROLL
+    AUTOCHECKBOX    "Only models the map &places", IDC_PLACE_USED, 336, 7, 130, 10
+    LISTBOX         IDC_PLACE_CATEGORY, 6, 24, 140, 340, LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | WS_VSCROLL | WS_BORDER | WS_TABSTOP
+    CONTROL         "", IDC_PLACE_LIST, "SysListView32",
+                    LVS_ICON | LVS_SINGLESEL | LVS_SHOWSELALWAYS | LVS_AUTOARRANGE | LVS_SHAREIMAGELISTS |
+                    WS_BORDER | WS_TABSTOP, 150, 24, 464, 340
+    LTEXT           "", IDC_PLACE_INFO, 6, 372, 490, 10, SS_ENDELLIPSIS
+    DEFPUSHBUTTON   "&Place", IDOK, 510, 370, 50, 14
+    PUSHBUTTON      "Cancel", IDCANCEL, 564, 370, 50, 14
+END
+
+// Position and orientation of one placed object, in numbers.
+IDD_PLACEMENT DIALOGEX 0, 0, 220, 170
+STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Placed object"
+FONT 9, "Segoe UI", 400, 0, 1
+BEGIN
+    LTEXT           "", IDC_PL_INFO, 6, 6, 208, 20
+    LTEXT           "X", -1, 6, 32, 40, 10
+    EDITTEXT        IDC_PL_X, 60, 30, 70, 13, ES_AUTOHSCROLL
+    LTEXT           "Y", -1, 6, 48, 40, 10
+    EDITTEXT        IDC_PL_Y, 60, 46, 70, 13, ES_AUTOHSCROLL
+    LTEXT           "Z (height)", -1, 6, 64, 50, 10
+    EDITTEXT        IDC_PL_Z, 60, 62, 70, 13, ES_AUTOHSCROLL
+    LTEXT           "Heading", -1, 6, 84, 50, 10
+    EDITTEXT        IDC_PL_HEADING, 60, 82, 70, 13, ES_AUTOHSCROLL
+    LTEXT           "Pitch", -1, 6, 100, 50, 10
+    EDITTEXT        IDC_PL_PITCH, 60, 98, 70, 13, ES_AUTOHSCROLL
+    LTEXT           "Roll", -1, 6, 116, 50, 10
+    EDITTEXT        IDC_PL_ROLL, 60, 114, 70, 13, ES_AUTOHSCROLL
+    LTEXT           "Scale", -1, 6, 132, 50, 10
+    EDITTEXT        IDC_PL_SCALE, 60, 130, 70, 13, ES_AUTOHSCROLL
+    LTEXT           "degrees", -1, 134, 84, 40, 10
+    PUSHBUTTON      "Snap to &ground", IDC_PL_SNAP, 140, 60, 74, 14
+    DEFPUSHBUTTON   "OK", IDOK, 110, 150, 50, 14
+    PUSHBUTTON      "Cancel", IDCANCEL, 164, 150, 50, 14
+END
+
+IDR_ACCELERATORS ACCELERATORS
+BEGIN
+    "O",        ID_FILE_OPEN_GAME,   VIRTKEY, CONTROL
+    "L",        ID_WORLD_LOAD_ALL,   VIRTKEY, CONTROL
+    "E",        ID_FILE_EXPORT,      VIRTKEY, CONTROL
+    "I",        ID_FILE_IMPORT,      VIRTKEY, CONTROL
+    "S",        ID_WORLD_SAVE,       VIRTKEY, CONTROL
+    "K",        ID_VIEW_COLLISION,   VIRTKEY, CONTROL
+    "N",        ID_OBJECT_PLACE,     VIRTKEY, CONTROL
+    "C",        ID_OBJECT_COPY,      VIRTKEY, CONTROL
+    "V",        ID_OBJECT_PASTE,     VIRTKEY, CONTROL
+    "G",        ID_OBJECT_SNAP,      VIRTKEY, CONTROL
+    "S",        ID_OBJECT_SAVE,      VIRTKEY, CONTROL, SHIFT
+    "E",        ID_OBJECT_BLENDER,   VIRTKEY, CONTROL, SHIFT
+    "N",        ID_OBJECT_NEW_BLENDER, VIRTKEY, CONTROL, SHIFT
+    "1",        ID_GIZMO_MOVE,       VIRTKEY
+    "2",        ID_GIZMO_ROTATE,     VIRTKEY
+    "3",        ID_GIZMO_SCALE,      VIRTKEY
+    "P",        ID_OBJECT_PLACE_MINE, VIRTKEY, CONTROL, SHIFT
+    VK_F2,      ID_OBJECT_PROPERTIES, VIRTKEY
+    VK_DELETE,  ID_OBJECT_DELETE,    VIRTKEY
+    VK_HOME,    ID_WORLD_FRAME,      VIRTKEY
+    VK_F1,      ID_VIEW_TEXTURED,    VIRTKEY
+    VK_F2,      ID_VIEW_UNLIT,       VIRTKEY
+    VK_F3,      ID_VIEW_VERTEX_COLOR,VIRTKEY
+    VK_F4,      ID_VIEW_WIREFRAME,   VIRTKEY
+    VK_F5,      ID_VIEW_BACKDROP,    VIRTKEY
+    VK_F6,      ID_VIEW_BACKFACE_CULL, VIRTKEY
+    VK_F7,      ID_VIEW_SCENERY,     VIRTKEY
+    VK_F9,      ID_VIEW_TEXTURES,    VIRTKEY
+    VK_F10,     ID_VIEW_LIBRARY,     VIRTKEY
+    VK_F11,     ID_VIEW_ALTERNATE,   VIRTKEY
+END
+
+// ---------------------------------------------------------------------------
+// The setup wizard (ui/SetupWizard.cpp)
+
+IDD_SETUP_FOLDER DIALOGEX 0, 0, 300, 150
+STYLE DS_SETFONT | WS_CHILD | WS_DISABLED | WS_CAPTION
+FONT 9, "Segoe UI", 400, 0, 1
+BEGIN
+    LTEXT           "The editor reads the city straight from the game's own files. Point it at the folder that holds SPEED2.EXE -- nothing in the game is changed by this.",
+                    -1, 0, 0, 300, 28
+    LTEXT           "&Game folder:", -1, 0, 36, 300, 10
+    EDITTEXT        IDC_SETUP_PATH, 0, 48, 236, 14, ES_AUTOHSCROLL
+    PUSHBUTTON      "&Browse...", IDC_SETUP_BROWSE, 242, 47, 58, 16
+    LTEXT           "", IDC_SETUP_FOLDER_STATUS, 0, 72, 300, 60
+END
+
+IDD_SETUP_PARTS DIALOGEX 0, 0, 300, 170
+STYLE DS_SETFONT | WS_CHILD | WS_DISABLED | WS_CAPTION
+FONT 9, "Segoe UI", 400, 0, 1
+BEGIN
+    AUTOCHECKBOX    "Ultimate ASI Loader (dinput8.dll)", IDC_SETUP_ASILOADER, 0, 0, 300, 12
+    LTEXT           "", IDC_SETUP_ASILOADER_NOTE, 12, 13, 288, 10
+    AUTOCHECKBOX    "FRS World Loader -- required", IDC_SETUP_LOADER, 0, 28, 300, 12
+    LTEXT           "Puts the editor's work into the game: placed and edited objects, collision, textures.",
+                    -1, 12, 41, 288, 18
+    AUTOCHECKBOX    "FRSFastBoot", IDC_SETUP_FASTBOOT, 0, 62, 300, 12
+    LTEXT           "Launch Game in the editor goes straight into free roam, with the car where the camera is.",
+                    -1, 12, 75, 288, 18
+    AUTOCHECKBOX    "Also boot straight into free roam when the game is started normally", IDC_SETUP_FASTBOOT_ALWAYS,
+                    12, 94, 288, 12
+    AUTOCHECKBOX    "", IDC_SETUP_DISABLE_OLD, 0, 110, 300, 20, BS_MULTILINE | BS_TOP
+    LTEXT           "", IDC_SETUP_PARTS_NOTE, 0, 136, 300, 32
+END
+
+IDD_SETUP_DONE DIALOGEX 0, 0, 300, 170
+STYLE DS_SETFONT | WS_CHILD | WS_DISABLED | WS_CAPTION
+FONT 9, "Segoe UI", 400, 0, 1
+BEGIN
+    EDITTEXT        IDC_SETUP_RESULT, 0, 0, 300, 136,
+                    ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | NOT WS_BORDER | NOT WS_TABSTOP
+    CONTROL         "FRS World Editor is free, by Chrystian Farias. If it helps you, you can <a>buy me a coffee</a>.",
+                    IDC_SETUP_LINK, "SysLink", WS_TABSTOP | LWS_TRANSPARENT, 0, 150, 300, 12
+END
+
+// ---------------------------------------------------------------------------
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION 0,1,0,0
+ PRODUCTVERSION 0,1,0,0
+ FILEOS VOS_NT_WINDOWS32
+ FILETYPE VFT_APP
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName",      "Chrystian Farias"
+            VALUE "FileDescription",  "FRS World Editor - a map editor for Need for Speed Underground 2"
+            VALUE "FileVersion",      "0.1.0"
+            VALUE "InternalName",     "FRSWorldEditor"
+            VALUE "LegalCopyright",   "(c) 2026 Chrystian Farias. CC BY-NC 4.0"
+            VALUE "OriginalFilename", "FRSWorldEditor.exe"
+            VALUE "ProductName",      "FRS World Editor"
+            VALUE "ProductVersion",   "0.1.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

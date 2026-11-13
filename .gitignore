@@ -1,0 +1,12 @@
+build/
+build-*/
+out/
+dist/
+third_party/asi-loader/
+*.log
+*.user
+.vs/
+__pycache__/
+
+# Extensions built into private builds live in a repository of their own.
+/private/
