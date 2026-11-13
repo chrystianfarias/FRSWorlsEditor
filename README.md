@@ -1,4 +1,4 @@
-<p align="center"><img src="docs/icon.png" width="96" alt=""></p>
+<p align="center"><img src="docs/cover.png" alt="FRS World Editor: a map editor for Need for Speed Underground 2"></p>
 
 # FRS World Editor
 
