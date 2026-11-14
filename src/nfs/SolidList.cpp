@@ -30,6 +30,7 @@ constexpr size_t kMatBoundsMax      = 0x10;
 constexpr size_t kMatTextureIndex   = 0x1C;
 constexpr size_t kMatFlags          = 0x20;
 constexpr size_t kMatFirstIndex     = 0x34;
+constexpr size_t kMatStripFlags     = 0x38;
 
 // --- Vertex layouts --------------------------------------------------------
 // Only two strides occur across every shipped track stream.
@@ -88,6 +89,7 @@ void ParseMaterials(ByteSpan data, SolidObject& out) {
         material.firstIndex   = entry.read<u32>(kMatFirstIndex);
         material.textureIndex = entry.read<u32>(kMatTextureIndex);
         material.flags        = entry.read<u32>(kMatFlags);
+        material.stripFlags   = entry.read<u32>(kMatStripFlags);
         material.bounds.min   = ReadVec3(entry, kMatBoundsMin);
         material.bounds.max   = ReadVec3(entry, kMatBoundsMax);
 

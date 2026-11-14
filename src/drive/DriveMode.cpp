@@ -2,9 +2,12 @@
 
 #include "core/Log.h"
 #include "drive/CarModel.h"
+#include "drive/GameStreamingHud.h"
 #include "drive/audio/EngineSound.h"
 #include "drive/camera/GameCamera.h"
 #include "drive/cars/CarTypeInfoU2.h"
+#include "drive/fx/DriveFx.h"
+#include "drive/numerics/BWareMath.h"
 #include "drive/numerics/Speed2Image.h"
 #include "drive/physics/VehicleSim.h"
 #include "drive/world/EditorTrackWorld.h"
@@ -97,7 +100,7 @@ void DriveMode::OnCreate() {
             if (std::wstring(text).find(L"World") == std::wstring::npos) continue;
             if (HMENU world = ::GetSubMenu(host_.menu, i)) {
                 ::AppendMenuW(world, MF_SEPARATOR, 0, nullptr);
-                ::AppendMenuW(world, MF_STRING, kDriveCommand, L"&Test Drive (game physics)\tCtrl+T");
+                ::AppendMenuW(world, MF_STRING, kDriveCommand, L"&Fast Test (game physics)\tCtrl+T");
             }
             break;
         }
@@ -108,7 +111,7 @@ void DriveMode::OnCreate() {
         button.idCommand = kDriveCommand;
         button.fsState = TBSTATE_ENABLED;
         button.fsStyle = (BYTE)(BTNS_CHECK | BTNS_AUTOSIZE | BTNS_SHOWTEXT);
-        button.iString = (INT_PTR)L"Test drive";
+        button.iString = (INT_PTR)L"Fast test";
         // Right after the game's own button.
         const int count = (int)::SendMessageW(host_.toolbar, TB_BUTTONCOUNT, 0, 0);
         int at = count;
@@ -136,11 +139,18 @@ void DriveMode::UpdateMenuChecks(HMENU menu) {
 
 void DriveMode::OnRegionLoaded() {
     if (active_) Stop();
+    // FRS_STREAM_SELFTEST=1: the game's streaming model against docs/STREAMING-STUDY.md, logged.
+    if (std::getenv("FRS_STREAM_SELFTEST") && host_.world && host_.world() && host_.gameFolder)
+        bb::RunGameStreamingSelfTest(*host_.world(), host_.gameFolder());
+    if (fx_) fx_->ForgetWorld();
 }
 
 void DriveMode::OnRegionClosed() {
     if (active_) Stop();
     track_.reset();
+    shadowTopology_ = nullptr;
+    shadowTrack_ = nullptr;
+    if (fx_) fx_->ForgetWorld();
 }
 
 bool DriveMode::Held(int key) const {
@@ -248,6 +258,7 @@ bool DriveMode::EnsureCar(std::wstring& error) {
     const bb::CarTypeInfoU2& car = cars_[car_];
     if (model_ && modelLoaded_ && modelFor_ == car.CollectionName) return true;
     if (model_) model_->Release();
+    if (fx_) fx_->ForgetCar();
     model_ = std::make_unique<bb::CarModel>();
     modelLoaded_ = false;
     IDirect3DDevice9* device = host_.viewport->Device();
@@ -269,22 +280,23 @@ bool DriveMode::EnsureCar(std::wstring& error) {
 bool DriveMode::Start() {
     nfs::World* world = host_.world ? host_.world() : nullptr;
     if (!world) {
-        Status(L"Test drive: open a region first.");
+        Status(L"Fast test: open a region first.");
         return false;
     }
     std::wstring error;
     if (!EnsureGame(error)) {
-        Status(L"Test drive: " + error);
-        ::MessageBoxW(host_.window, error.c_str(), L"Test drive", MB_ICONWARNING | MB_OK);
+        Status(L"Fast test: " + error);
+        ::MessageBoxW(host_.window, error.c_str(), L"Fast test", MB_ICONWARNING | MB_OK);
         return false;
     }
 
     // The collision is read as it is edited right now, every time.
     const auto began = std::chrono::steady_clock::now();
     track_ = bb::BuildTrackWorld(*world, *exe_, error, loadedFolder_);
+    shadowTrack_ = nullptr;   // a new track: the shadow's TopologyCoordinate is made again
     if (!track_) {
-        Status(L"Test drive: " + error);
-        ::MessageBoxW(host_.window, error.c_str(), L"Test drive", MB_ICONWARNING | MB_OK);
+        Status(L"Fast test: " + error);
+        ::MessageBoxW(host_.window, error.c_str(), L"Fast test", MB_ICONWARNING | MB_OK);
         return false;
     }
     const float buildMs =
@@ -298,10 +310,18 @@ bool DriveMode::Start() {
         Vec3 centre;
         if (host_.viewCentre(centre) && Length(centre - camera.Position()) < 400.0f) point = centre;
     }
-    const float heading = camera.Yaw();
+    float heading = camera.Yaw();
+    // FRS_DRIVE_START="x y z headingDegrees": a fixed start, for captures of the drive.
+    if (const char* at = std::getenv("FRS_DRIVE_START")) {
+        float x = 0, y = 0, z = 0, deg = 0;
+        if (std::sscanf(at, "%f %f %f %f", &x, &y, &z, &deg) == 4) {
+            point = { x, y, z };
+            heading = Radians(deg);
+        }
+    }
     if (!Spawn(point, heading, error)) {
-        Status(L"Test drive: " + error);
-        ::MessageBoxW(host_.window, error.c_str(), L"Test drive", MB_ICONWARNING | MB_OK);
+        Status(L"Fast test: " + error);
+        ::MessageBoxW(host_.window, error.c_str(), L"Fast test", MB_ICONWARNING | MB_OK);
         track_.reset();
         return false;
     }
@@ -309,8 +329,11 @@ bool DriveMode::Start() {
     startHeading_ = heading;
 
     active_ = true;
+    // The drive is seen the way the game draws it; Stop puts the editor's choice back.
+    gameLookBefore_ = host_.viewport->GetRenderer().GameLook();
+    host_.viewport->GetRenderer().SetGameLook(true);
     ::SetFocus(host_.viewport->Handle());
-    Status(L"Test drive: arrows/WASD drive, Space handbrake, Shift nitrous, Q/E gears, C camera, "
+    Status(L"Fast test: arrows/WASD drive, Space handbrake, Shift nitrous, Q/E gears, C camera, "
            L"R restart, F nearest ground, Esc stop");
     if (host_.menuChecks) host_.menuChecks();
     return true;
@@ -384,6 +407,8 @@ void DriveMode::Respawn(bool nearestGround) {
 void DriveMode::Stop(const wchar_t* why) {
     if (!active_) return;
     active_ = false;
+    host_.viewport->GetRenderer().SetGameLook(gameLookBefore_);
+    if (streaming_) streaming_->End(&host_.viewport->GetRenderer());
     // Leave the editor camera where the drive left the view.
     Camera& camera = host_.viewport->GetCamera();
     if (camera.HasExplicitView()) {
@@ -400,7 +425,7 @@ void DriveMode::Stop(const wchar_t* why) {
     camera_.reset();
     sim_.reset();
     track_.reset();
-    Status(why ? why : L"Test drive stopped.");
+    Status(why ? why : L"Fast test stopped.");
     if (host_.menuChecks) host_.menuChecks();
 }
 
@@ -466,6 +491,8 @@ void DriveMode::SimFrame() {
     sim_->FrameKeyboard(kSimFrame, left, right, up, down, handbrake, nitrous, shiftUp_, shiftDown_);
     // A shift press is "held" for exactly one game frame.
     shiftUp_ = shiftDown_ = false;
+    // sub_5F62B0: the player's brake lights (Car+0x944) follow RealDriver brake > 0.05 (flt_7A5638).
+    braking_ = sim_->Driver.Brake > bb::X87::Bits(0x3D4CCCCDu);
     if (camera_) camera_->AfterSimFrame();
     if (sound_) sound_->SimFrame(*sim_);
 }
@@ -485,7 +512,7 @@ void DriveMode::Frame(float deltaSeconds) {
             SimFrame();
         } catch (const std::exception& e) {
             LOG_ERROR("test drive: physics stopped: %s", e.what());
-            Stop((L"Test drive stopped: the physics failed (" + Widen(e.what()) + L")").c_str());
+            Stop((L"Fast test stopped: the physics failed (" + Widen(e.what()) + L")").c_str());
             return;
         }
         current_ = ReadPose();
@@ -553,12 +580,68 @@ void DriveMode::ChaseCamera(const Pose& pose, float deltaSeconds) {
 // Drawing
 // ---------------------------------------------------------------------------
 
+void DriveMode::DrawGameFx(IDirect3DDevice9* device, WorldRenderer& renderer, bool beforeCar, const Mat4* body,
+                           bool carVisible) {
+    if (!fx_) fx_ = std::make_unique<bb::DriveFx>();
+    bb::DriveFxFrame frame;
+    frame.world = host_.world ? host_.world() : nullptr;
+    frame.gameFolder = !loadedFolder_.empty() ? loadedFolder_ : (host_.gameFolder ? host_.gameFolder() : std::wstring());
+    frame.worldFlares = renderer.GameLook() || body != nullptr;
+    if (body) {
+        frame.car = model_.get();
+        frame.body = *body;
+        frame.carVisible = carVisible;
+        frame.braking = braking_;
+        frame.headlightsOn = true;   // sub_5F6190: always on in game
+        if (track_) {
+            // The shadow asks GetElevation through a TopologyCoordinate of its own (the game uses the car's,
+            // Car+0x5C4; this one leaves the physics' caches alone).
+            if (shadowTrack_ != track_.get() || !shadowTopology_) {
+                shadowTrack_ = track_.get();
+                shadowTopology_ = track_->CreateTopologyCoordinate();
+            }
+            bb::TrackWorld* track = track_.get();
+            void* coord = shadowTopology_;
+            frame.ground = [track, coord](float x, float y, float z, float& elevation, float* normal) {
+                const float p[3] = { x, y, z };
+                float n[3] = { 0.0f, 0.0f, 1.0f };
+                int terrain = 0;
+                bool valid = false;
+                const float e = track->GetElevation(coord, p, terrain, n, valid);
+                if (!valid) {
+                    elevation = 0.0f;
+                    if (normal) { normal[0] = 0.0f; normal[1] = 0.0f; normal[2] = 1.0f; }
+                    return false;
+                }
+                elevation = e;
+                if (normal) {
+                    const Vec3 u = Normalize(Vec3{ n[0], n[1], n[2] });
+                    normal[0] = u.x; normal[1] = u.y; normal[2] = u.z;
+                }
+                return true;
+            };
+        }
+    }
+    if (beforeCar) fx_->BeforeCar(device, renderer, frame);
+    else fx_->AfterCar(device, renderer, frame);
+}
+
 void DriveMode::DrawWithWorld(IDirect3DDevice9* device, WorldRenderer& renderer) {
-    if (!active_ || !sim_ || !model_ || !modelLoaded_) return;
-    if (gameCamera_ && camera_ && camera_->HidesCar()) return;
+    if (!active_ || !sim_ || !model_ || !modelLoaded_) {
+        // Outside a drive the world's light flares come with the Game look.
+        if (renderer.GameLook()) DrawGameFx(device, renderer, false, nullptr, false);
+        return;
+    }
     const Pose pose = Blend(std::clamp(accumulator_ / kSimFrame, 0.0f, 1.0f));
     const Mat4 body = ModelFrame(pose.axes, pose.position);
+    const bool carVisible = !(gameCamera_ && camera_ && camera_->HidesCar());
+    // The headlights on the world and the car's shadow, then the car, then the flare pass.
+    DrawGameFx(device, renderer, true, &body, carVisible);
+    if (carVisible) DrawCar(device, renderer, pose, body);
+    DrawGameFx(device, renderer, false, &body, carVisible);
+}
 
+void DriveMode::DrawCar(IDirect3DDevice9* device, WorldRenderer& renderer, const Pose& pose, const Mat4& body) {
     Mat4 wheels[4];
     for (int i = 0; i < 4; ++i) {
         // Spin about the axle (the car's left axis), then steer about its up.
@@ -581,6 +664,7 @@ void DriveMode::DrawWithWorld(IDirect3DDevice9* device, WorldRenderer& renderer)
 }
 
 void DriveMode::ReleaseGpu() {
+    if (fx_) fx_->ReleaseGpu();
     if (model_) model_->Release();
     modelLoaded_ = false;
     modelFor_.clear();
@@ -616,10 +700,6 @@ void DriveMode::DrawHud(float x, float y, float width, float height) {
         else if (gear == 1) std::snprintf(gearText, sizeof gearText, "N");
         else std::snprintf(gearText, sizeof gearText, "%d", gear - 1);
         ImGui::Text("%5.0f km/h   gear %s%s", kmh, gearText, sim_->ManualGearbox() ? " (manual)" : "");
-        const float rpm = sim_->Rpm();
-        ImGui::ProgressBar(std::clamp(rpm / 9000.0f, 0.0f, 1.0f), ImVec2(240.0f, 0.0f), nullptr);
-        ImGui::SameLine();
-        ImGui::Text("%.0f rpm", rpm);
         if (sim_->NitrousActive()) ImGui::TextColored(ImVec4(0.3f, 0.75f, 1.0f, 1.0f), "NITROUS");
         if (camera_ && gameCamera_) ImGui::TextDisabled("camera: %s", camera_->ViewName().c_str());
         ImGui::TextDisabled("physics %.2f ms / frame", physicsMs_);
@@ -628,10 +708,6 @@ void DriveMode::DrawHud(float x, float y, float width, float height) {
             for (wchar_t c : message_) text += c < 128 ? (char)c : '?';
             ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f), "%s", text.c_str());
         }
-        ImGui::Separator();
-        ImGui::TextDisabled("WASD/arrows drive  Space handbrake  Shift nitrous");
-        ImGui::TextDisabled("Q/E gears  M manual  C/V camera  B look back");
-        ImGui::TextDisabled("R restart  F nearest ground  N sound  Esc stop");
     }
     ImGui::End();
     (void)width;

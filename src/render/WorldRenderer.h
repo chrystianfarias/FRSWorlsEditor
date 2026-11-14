@@ -3,6 +3,7 @@
 #include "render/Camera.h"
 #include "render/CollisionMesh.h"
 #include "render/D3D9Context.h"
+#include "render/GameLook.h"
 #include "render/Gizmo.h"
 #include "render/GpuResources.h"
 // MINIMAP PREVIEW (temporary)
@@ -113,6 +114,14 @@ struct GpuInstance {
 
     int  placement = -1;     // index into the section's editor placements, or -1
     int  native    = -1;     // index into the section's shipped scenery, or -1
+
+    // The road reflection (Game look). The game draws an instance into it when
+    // its flags (+0x1A) have 0x40 and neither 0x10 nor 0x400, with the model of
+    // SceneryInfo +0x28 (sub_5D6570), when it covers 32 pixels or more.
+    bool reflects = false;
+    u32  reflectSection = 0, reflectObject = 0;
+    float radius = 0.0f;     // SceneryInfo +0x3C
+    bool identityPlaced = false;   // flag 0x100: the game places it with no matrix and does not mirror it
 };
 
 // Draws a parsed world with the Direct3D 9 fixed-function pipeline.
@@ -229,6 +238,35 @@ public:
     bool SkyVisible() const { return showSky_; }
     void SetSkyVisible(bool on) { showSky_ = on; }
 
+    // "Game look": the world drawn with the game's own effects from SPEED2.EXE --
+    // WORLD (2 x texture x baked vertex colour, the game's vertex fog with the
+    // region's fog maps), WORLDREFLECT on the meshes the game gives it (the
+    // road reflection: the scene mirrored into a 320x240 target and added by
+    // the texture's gloss), WORLDNOFOG on additive textures -- and the sky
+    // with the textures the game swaps in at night. Off: the editor's own
+    // modes, unchanged. Needs the game folder (SetGameFolder) for SPEED2.EXE
+    // and TRACKS\<region>.BUN; without them the editor's look stays.
+    bool GameLook() const { return gameLook_; }
+    void SetGameLook(bool on) { gameLook_ = on; }
+    void SetGameFolder(const std::wstring& folder) {
+        gameFolder_ = folder;
+        gameLookTried_ = false;
+        fogRegion_.clear();
+    }
+    // What the game look is using, for the status bar and the log.
+    const std::string& GameLookStatus() const { return gameLookStatus_; }
+    // Default-pool objects (the reflection target): the owner of the device
+    // calls this before a reset; they come back on the next frame.
+    void ReleaseDeviceObjects();
+
+    // The game's distant scenery, each hidden on its own wherever it would be
+    // drawn (editor views, Game look, test drive): the PAN_ panorama pieces,
+    // and the far LOD copies (PAN_*_Z, LOD_*, *_1Z_*).
+    bool BackgroundSceneryHidden() const { return hideBackground_; }
+    void SetBackgroundSceneryHidden(bool hidden) { hideBackground_ = hidden; }
+    bool DistantLodHidden() const { return hideDistantLod_; }
+    void SetDistantLodHidden(bool hidden) { hideDistantLod_ = hidden; }
+
     bool RacePropsVisible() const { return showRaceProps_; }
     void SetRacePropsVisible(bool visible) { showRaceProps_ = visible; }
     void SetRaceGroupsVisible(bool visible);
@@ -341,9 +379,34 @@ public:
     void BeginUserMesh(IDirect3DDevice9* device);
     void BindUserTexture(IDirect3DDevice9* device, u32 textureHash);
 
+    // An extra pass over the world's opaque and cut-out surfaces, for what the
+    // game draws by re-shading the world (the test drive's headlight
+    // projector, drive/fx/HeadlightProjector.h). For every shown placement
+    // whose bounds meet `bounds`, binds its section's buffers and calls
+    // `draw` once per material range; the callee sets its own shaders,
+    // constants and states and issues the DrawIndexedPrimitive itself.
+    struct SolidVisit {
+        const Mat4*        transform = nullptr;   // the placement's world matrix
+        bool               mirrored  = false;
+        INT                baseVertex = 0;
+        const GpuDraw*     draw      = nullptr;
+        IDirect3DTexture9* texture   = nullptr;   // the material's texture (animated frame), may be null
+        bool               cutOut    = false;     // alpha-tested
+    };
+    void VisitSolidDraws(IDirect3DDevice9* device, const Aabb& bounds,
+                         const std::function<void(const SolidVisit&)>& draw);
+
     // Models the editor shows some other way -- the baked roads, drawn from
     // their procedural description instead -- left out of drawing and picking.
     void SetHiddenModels(std::function<bool(const nfs::SolidObject&)> hidden) { hiddenModels_ = std::move(hidden); }
+
+    // What the game itself would draw (drive/world/GameStreaming): when set, a
+    // section is drawn only if `section(number)` says so, and a placed model only
+    // if `model(hash)` says a loaded section holds it. Empty functions: no filter.
+    void SetGameDrawFilter(std::function<bool(u32)> section, std::function<bool(u32)> model) {
+        gameSection_ = std::move(section);
+        gameModel_ = std::move(model);
+    }
 
     // Placed objects hidden in the editor only (ui/HiddenItems.h): neither
     // drawn nor picked. A key names one placement -- the section that places
@@ -542,6 +605,57 @@ private:
     int  selectedExtra_ = -1;
     u32 excludeSection_   = 0;
     int excludePlacement_ = -1;
+    // --- Game look (render/GameLook.h) -----------------------------------
+    bool        gameLook_ = false;
+    std::wstring gameFolder_;
+    bool        gameLookTried_ = false;   // shaders looked for (once per game folder)
+    bool        gameLookReady_ = false;   // shaders created
+    std::string gameLookStatus_ = "Game look: off";
+    IDirect3DVertexShader9* glWorldVs_ = nullptr;
+    IDirect3DPixelShader9*  glWorldPs_ = nullptr;
+    IDirect3DVertexShader9* glReflectVs_ = nullptr;
+    IDirect3DPixelShader9*  glReflectPs_ = nullptr;
+    IDirect3DVertexShader9* glNoFogVs_ = nullptr;
+    IDirect3DPixelShader9*  glNoFogPs_ = nullptr;
+    IDirect3DTexture9*      glMissing_ = nullptr;       // 1x1 grey for a texture that did not decode
+    IDirect3DTexture9*      glReflection_ = nullptr;    // ReflectedTex, 320x240 render target
+    IDirect3DSurface9*      glReflectionDepth_ = nullptr;
+    IDirect3DTexture9*      glReflectionBlur_ = nullptr;   // the blur's intermediate target
+    IDirect3DVertexShader9* glFilterVs_ = nullptr;          // FILTER pass p3 (4 taps)
+    IDirect3DPixelShader9*  glFilterPs_ = nullptr;
+    void BlurReflection(IDirect3DDevice9* device);
+    bool        glReflectionFailed_ = false;
+    bool        glReflectionValid_ = false;             // drawn this frame
+    std::string fogRegion_;                             // region the fog map was read for
+    gamelook::FogMap glFogMap_;
+    // Set between BeginGameLook and EndGameLook: DrawObject uses the game's effects.
+    bool        glActive_ = false;
+    bool        glFogged_ = false;       // the main player view (fog, WORLDREFLECT); other views: WORLDNOFOG
+    bool        glReflectionPass_ = false;
+    bool        glDrawingSky_ = false;
+    int         glBound_ = -1;           // effect whose shaders are bound
+    Mat4        glView_, glProjection_;
+    float       glFogValue_[4] = { 0, 0, 0, 0 };
+    std::unordered_map<u32, u32> glSkyRemap_;   // sub_60F880 without time of day: sunrise -> night
+    bool EnsureGameLook(IDirect3DDevice9* device);
+    void ReleaseGameLook();
+    void BeginGameLook(IDirect3DDevice9* device, const Mat4& view, const Mat4& projection, bool mainView,
+                       const Vec3& eye);
+    void EndGameLook(IDirect3DDevice9* device);
+    bool DrawObjectGameLook(IDirect3DDevice9* device, const GpuObject& object, RenderStats& stats, DrawPass pass);
+    void RenderReflection(IDirect3DDevice9* device, const Camera& camera, const Mat4& view, const Mat4& projection);
+    // The backdrop the game draws as scenery (PAN_ pieces): shown in the game
+    // look; the sky dome itself is drawn round the camera by DrawSky.
+    bool BackdropHidden(const GpuObject& object) const;
+    bool hideBackground_ = false, hideDistantLod_ = false;
+    // Game look: the camera's zone list (sub_5E99C0 draws a zone's 0x34153 list, or with no zone only the
+    // sections numbered below 10); a backdrop piece is drawn only when its section is on it.
+    std::vector<u32> glZoneList_;
+    bool glZoneFound_ = false;
+    Vec3 glZoneFrom_{ 1e30f, 1e30f, 1e30f };
+    void UpdateGameZone(const Vec3& eye);
+    bool BackdropOutOfZone(const GpuObject& object, u32 sectionNumber) const;
+
     // MINIMAP PREVIEW (temporary)
     minimap::Preview minimapPreview_;
     bool showMinimap_ = false;
@@ -551,6 +665,11 @@ private:
     }
 
     std::function<bool(const nfs::SolidObject&)> hiddenModels_;
+    std::function<bool(u32)> gameSection_, gameModel_;   // SetGameDrawFilter
+    bool GameHidesSection(u32 number) const { return gameSection_ && !gameSection_(number); }
+    bool GameHidesModel(const GpuObject& object) const {
+        return gameModel_ && object.source && !gameModel_(object.source->hash);
+    }
     bool HiddenModel(const GpuObject& object) const {
         return (object.raceProp && !showRaceProps_) ||
                (hiddenModels_ && object.source && hiddenModels_(*object.source));

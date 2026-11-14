@@ -627,6 +627,12 @@ void CarModel::Release() {
 
 bool CarModel::Loaded() const { return impl_->cpuLoaded; }
 
+const CarTypeInfoU2* CarModel::CarType() const { return impl_->cpuLoaded ? impl_->carType : nullptr; }
+const CarRenderLayoutU2* CarModel::Layout() const { return impl_->cpuLoaded ? impl_->layout.get() : nullptr; }
+const RideInfoU2* CarModel::Ride() const { return impl_->cpuLoaded ? impl_->ride.get() : nullptr; }
+const std::vector<std::unique_ptr<SolidList>>& CarModel::SolidPacks() const { return impl_->solidPacks; }
+const Texture* CarModel::FindTexture(uint32_t hash) const { return impl_->FindTexture(hash); }
+
 void CarModel::SetLod(int lod) {
     Impl& m = *impl_;
     lod = std::clamp(lod, 0, 3);

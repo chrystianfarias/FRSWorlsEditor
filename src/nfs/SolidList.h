@@ -47,6 +47,9 @@ struct SolidMaterial {
     u32  indexCount   = 0;
     u32  textureIndex = 0;   // index into SolidObject::textureHashes
     u32  flags        = 0;   // the 0xFF field; meaning not yet established
+    // The strip flags at +0x38. Their OR over a mesh picks the game's effect
+    // (sub_5C58A0): 0x01 WORLDBONE, 0x40 WORLDREFLECT, 0x80 CAR, else WORLD.
+    u32  stripFlags   = 0;
     Aabb bounds;             // per-material bounds as stored in the file
 };
 

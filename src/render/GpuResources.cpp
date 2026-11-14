@@ -3,6 +3,7 @@
 #include "core/Log.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstring>
 
 namespace {
@@ -48,14 +49,17 @@ LevelLayout SourceLayout(nfs::TextureFormat format, u32 width, u32 height) {
 // The palette holds D3DCOLOR values, so the low three bytes go straight across.
 // The fourth byte is not opacity -- it carries a noisy gloss pattern the game
 // uses for wet road reflections, and taking it as alpha would leave every
-// street nearly invisible. Road surfaces are opaque.
-void ExpandPaletteRow(u8* destination, const u8* indices, u32 count, const u8* palette) {
+// street nearly invisible. Road surfaces are opaque: their gloss is kept in
+// alpha (`keepAlpha`), which the editor's views ignore for opaque materials and
+// the "Game look" view's WORLDREFLECT effect scales the reflection by. Other
+// palettised textures keep the solid alpha they always had.
+void ExpandPaletteRow(u8* destination, const u8* indices, u32 count, const u8* palette, bool keepAlpha) {
     for (u32 x = 0; x < count; ++x) {
         const u8* entry = palette + (size_t)indices[x] * 4;
         destination[x * 4 + 0] = entry[0];
         destination[x * 4 + 1] = entry[1];
         destination[x * 4 + 2] = entry[2];
-        destination[x * 4 + 3] = 0xFF;
+        destination[x * 4 + 3] = keepAlpha ? entry[3] : 0xFF;
     }
 }
 
@@ -153,6 +157,25 @@ bool GpuSection::Upload(IDirect3DDevice9* device, const nfs::LoadedSection& sect
             gpuObject.raceProp    = object.name.rfind("ZPM_", 0) == 0 ||
                                     object.name.find("TRACKBARRIER") != std::string::npos;
             gpuObject.baseVertex  = vertexCursor;
+            {
+                std::string upper = object.name;
+                for (char& c : upper) c = (char)std::toupper((unsigned char)c);
+                const bool pan = upper.rfind("PAN_", 0) == 0;
+                const bool farCopy = (upper.size() >= 2 && upper.compare(upper.size() - 2, 2, "_Z") == 0) ||
+                                     upper.find("_Z_") != std::string::npos;
+                if (upper.rfind("LOD_", 0) == 0 || upper.find("_1Z_") != std::string::npos || (pan && farCopy))
+                    gpuObject.backdropKind = kBackdropDistantLod;
+                else if (pan)
+                    gpuObject.backdropKind = kBackdropPanorama;
+            }
+            {
+                u32 stripFlags = 0;
+                for (const nfs::SolidMaterial& material : object.materials) stripFlags |= material.stripFlags;
+                gpuObject.effect = (stripFlags & 0x01) ? kEffectWorldBone
+                                 : (stripFlags & 0x40) ? kEffectWorldReflect
+                                 : (stripFlags & 0x80) ? kEffectCar
+                                                       : kEffectWorld;
+            }
 
             std::memcpy(vertices + vertexCursor, object.vertices.data(),
                         object.vertices.size() * sizeof(nfs::SolidVertex));
@@ -230,6 +253,7 @@ const CachedTexture& TextureCache::Get(IDirect3DDevice9* device, u32 hash) {
     if (source) {
         created.texture = Create(device, *source);
         created.blend   = BlendOf(*source);
+        created.punchThru = source->alphaUsage == nfs::AlphaUsage::PunchThru;
         created.scrollType = source->scrollType;
         created.scrollStep = source->scrollStep;
         created.scrollS    = source->scrollS;
@@ -278,7 +302,8 @@ IDirect3DTexture9* TextureCache::Create(IDirect3DDevice9* device, const nfs::Tex
                                    (size_t)row * layout.rowBytes;
 
                 if (palettised) {
-                    ExpandPaletteRow(destination, source, width, texture.palette.data);
+                    ExpandPaletteRow(destination, source, width, texture.palette.data,
+                                     BlendOf(texture) == SurfaceBlend::Opaque);
                 } else {
                     std::memcpy(destination, source, layout.rowBytes);
                 }

@@ -15,6 +15,16 @@
 // so parsed geometry is uploaded without any repacking.
 constexpr DWORD kWorldVertexFvf = D3DFVF_XYZ | D3DFVF_NORMAL | D3DFVF_DIFFUSE | D3DFVF_TEX1;
 
+// The game's effect ids (gEffects[], car-shading.md 2.1) the world can carry.
+constexpr u8 kEffectWorld        = 0;
+constexpr u8 kEffectWorldReflect = 2;
+constexpr u8 kEffectWorldBone    = 4;
+constexpr u8 kEffectCar          = 5;
+
+constexpr u8 kBackdropNone       = 0;
+constexpr u8 kBackdropPanorama   = 1;   // PAN_ skyline pieces (sections numbered 40..99)
+constexpr u8 kBackdropDistantLod = 2;   // PAN_*_Z copies, LOD_*, *_1Z_* models
+
 // One material range of one object: the smallest unit the renderer draws.
 struct GpuDraw {
     u32 startIndex     = 0;
@@ -33,6 +43,13 @@ struct GpuObject {
     // Shown by the game only during the races that use it: the track
     // barriers (XO_TRACKBARRIER*) and the start / finish lines (ZPM_<race>_*).
     bool                 raceProp = false;
+    // The game's effect for the whole mesh (sub_5C58A0, from the OR of the
+    // strip flags): kEffectWorld, kEffectWorldReflect, kEffectWorldBone or
+    // kEffectCar. Only the "Game look" view uses it.
+    u8                   effect = 0;
+    // What the game uses the model for in the distance: kBackdropNone, the
+    // panorama pieces (PAN_) or the far LOD copies (PAN_*_Z, LOD_*, *_1Z_*).
+    u8                   backdropKind = 0;
     u32                  baseVertex = 0;
     std::vector<GpuDraw> draws;
 };
@@ -76,6 +93,9 @@ enum class SurfaceBlend : u8 {
 struct CachedTexture {
     IDirect3DTexture9* texture = nullptr;   // nullptr marks a known miss
     SurfaceBlend       blend   = SurfaceBlend::Opaque;
+    // AlphaUsageType (+0x55) == PUNCHTHRU: the game alpha-tests these at 0x5F
+    // whatever the blend (sub_5BCC30). Only the "Game look" view uses it.
+    bool               punchThru = false;
     // Scrolling (nfs::Texture::scrollType): 0 none, 1 smooth, 2 in steps.
     u8    scrollType = 0;
     float scrollStep = 1.0f, scrollS = 0.0f, scrollT = 0.0f;

@@ -2,6 +2,7 @@
 
 #include "core/Log.h"
 #include "render/RenderExtension.h"
+#include "render/GameLook.h"
 
 #include <windows.h>
 
@@ -41,6 +42,7 @@ void WorldRenderer::Clear() {
     selectedOwner_ = nullptr;
     selectedExtra_ = -1;
     ReleaseThumbnailTargets();
+    ReleaseGameLook();
     sections_.clear();
     // The selection names GPU slots of the world being dropped.
     selection_.clear();
@@ -202,6 +204,19 @@ void WorldRenderer::BuildInstances(const nfs::World& world) {
             gpuInstance.transform   = transform;
             gpuInstance.mirrored    = Determinant3x3(transform) < 0.0f;
             gpuInstance.native      = (int)n;
+            if (instance.infoIndex < scenery.infos.size()) {
+                const nfs::SceneryInfo& info = scenery.infos[instance.infoIndex];
+                gpuInstance.radius = info.radius;
+                gpuInstance.identityPlaced = (instance.flags & 0x100) != 0;
+                u32 reflectHash = 0;
+                if (info.raw.size() >= 0x2C) std::memcpy(&reflectHash, info.raw.data() + 0x28, 4);
+                const auto reflected = reflectHash ? modelIndex.find(reflectHash) : modelIndex.end();
+                if ((instance.flags & 0x40) && !(instance.flags & 0x410) && reflected != modelIndex.end()) {
+                    gpuInstance.reflects = true;
+                    gpuInstance.reflectSection = reflected->second.first;
+                    gpuInstance.reflectObject = reflected->second.second;
+                }
+            }
 
             // Built from the mesh, not taken from the instance record.
             //
@@ -247,6 +262,12 @@ void WorldRenderer::BuildInstances(const nfs::World& world) {
             sections_[i].instanceBounds.Add(gpuInstance.worldBounds);
         }
     }
+    size_t reflecting = 0, total = 0;
+    for (const SectionRender& section : sections_) {
+        total += section.instances.size();
+        for (const GpuInstance& instance : section.instances) reflecting += instance.reflects;
+    }
+    LOG_INFO("road reflection: %zu of %zu placements reflect (flag 0x40, SceneryInfo +0x28 model)", reflecting, total);
 }
 
 void WorldRenderer::RebuildInstances(const nfs::World& world) {
@@ -370,6 +391,7 @@ void WorldRenderer::BindTextureStage(IDirect3DDevice9* device, const CachedTextu
 
 bool WorldRenderer::DrawObject(IDirect3DDevice9* device, const GpuObject& object,
                                RenderStats& stats, DrawPass pass) {
+    if (glActive_) return DrawObjectGameLook(device, object, stats, pass);
     const bool wantsTexture = mode_ == RenderMode::Textured || mode_ == RenderMode::Unlit;
     bool other = false;
 
@@ -408,6 +430,14 @@ bool WorldRenderer::DrawObject(IDirect3DDevice9* device, const GpuObject& object
 
 // The game's texture scrolling (TextureInfo::GetScroll): the fraction of
 // time * speed, time counted in whole steps for the stepped kind.
+static void ScrollOffset(const CachedTexture& texture, double clock, float& s, float& t) {
+    double time = clock;
+    if (texture.scrollType == 2) time = std::floor(time / texture.scrollStep);
+    const auto fraction = [](double v) { return (float)(v - std::floor(v)); };
+    s = fraction(time * texture.scrollS);
+    t = fraction(time * texture.scrollT);
+}
+
 void WorldRenderer::ScrollTextureStage(IDirect3DDevice9* device, const CachedTexture& texture) {
     const bool scroll = animate_ && texture.scrollType != 0;
     if (!scroll) {
@@ -417,14 +447,10 @@ void WorldRenderer::ScrollTextureStage(IDirect3DDevice9* device, const CachedTex
         }
         return;
     }
-    double t = animationClock_;
-    if (texture.scrollType == 2) t = std::floor(t / texture.scrollStep);
-    const auto fraction = [](double v) { return (float)(v - std::floor(v)); };
     D3DMATRIX m{};
     m._11 = m._22 = m._33 = m._44 = 1.0f;
     // Two texture coordinates: the third row moves them.
-    m._31 = fraction(t * texture.scrollS);
-    m._32 = fraction(t * texture.scrollT);
+    ScrollOffset(texture, animationClock_, m._31, m._32);
     device->SetTransform(D3DTS_TEXTURE0, &m);
     if (!scrolling_) device->SetTextureStageState(0, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_COUNT2);
     scrolling_ = true;
@@ -494,6 +520,17 @@ void WorldRenderer::Render(const Camera& camera) {
     const Mat4 view       = camera.ViewMatrix();
     const Mat4 projection = camera.ProjectionMatrix(aspect);
 
+    // Game look: the road reflection is drawn first, into its own target, as
+    // eDisplayFrame does before the player views.
+    const bool gameLook = gameLook_ && mode_ != RenderMode::Wireframe && EnsureGameLook(device);
+    if (!worldOnly_) {
+        glReflectionValid_ = false;
+        if (gameLook) {
+            UpdateGameZone(camera.Position());
+            RenderReflection(device, camera, view, projection);
+        }
+    }
+
     const D3DMATRIX d3dView       = ToD3D(view);
     const D3DMATRIX d3dProjection = ToD3D(projection);
     device->SetTransform(D3DTS_VIEW, &d3dView);
@@ -507,6 +544,9 @@ void WorldRenderer::Render(const Camera& camera) {
 
     ApplyRenderStates();
     animationClock_ = start;
+    if (gameLook) {
+        BeginGameLook(device, view, projection, !worldOnly_, camera.Position());
+    }
 
     // The sky first, behind everything.
     RenderStats skyStats;
@@ -549,7 +589,7 @@ void WorldRenderer::Render(const Camera& camera) {
     }
 
     const bool wantsTexture = mode_ == RenderMode::Textured || mode_ == RenderMode::Unlit;
-    if (!wantsTexture) BindTextureStage(device, CachedTexture{});
+    if (!wantsTexture && !glActive_) BindTextureStage(device, CachedTexture{});
     translucent_.clear();
     const Vec3 eye = camera.Position();
 
@@ -576,6 +616,7 @@ void WorldRenderer::Render(const Camera& camera) {
         stats.instancesTotal += (u32)section.instances.size();
 
         if (section.alternate && !showAlternate_) continue;
+        if (GameHidesSection(section.number)) continue;   // SetGameDrawFilter
 
         // Collision is culled on its own footprint: a section's instances can
         // sit far from its ground, and the section may place nothing at all.
@@ -619,7 +660,7 @@ void WorldRenderer::Render(const Camera& camera) {
         if (showLibrary_ && section.gpu) {
             const auto& objects = section.gpu->Objects();
             for (const GpuObject& object : objects) {
-                if (object.isBackdrop && !showBackdrop_) continue;
+                if (BackdropHidden(object)) continue;
                 if (HiddenBuilding(object)) continue;   // MINIMAP PREVIEW (temporary)
                 if (HiddenModel(object)) continue;
                 // An object with no stored bounds cannot be culled, only drawn:
@@ -647,9 +688,11 @@ void WorldRenderer::Render(const Camera& camera) {
                 !frustum.Intersects(instance.worldBounds)) continue;
 
             const GpuObject& object = sections_[instance.section].gpu->Objects()[instance.object];
-            if (object.isBackdrop && !showBackdrop_) continue;
+            if (BackdropHidden(object)) continue;
+            if (BackdropOutOfZone(object, section.number)) continue;   // Game look: not in the camera's zone list
             if (HiddenBuilding(object)) continue;   // MINIMAP PREVIEW (temporary)
             if (HiddenModel(object)) continue;
+            if (GameHidesModel(object)) continue;   // SetGameDrawFilter: no loaded pack holds the model
 
             stats.instancesVisible++;
             bind(instance.section);
@@ -676,6 +719,7 @@ void WorldRenderer::Render(const Camera& camera) {
 
     if (showScenery_) DrawObjectAnimations(device, usingVisibility, eye, stats);
     DrawTranslucent(device, stats);
+    if (glActive_) EndGameLook(device);
     if (worldOnly_) {
         // RenderWorldOnly: the world is done; nothing of the editor's goes into a reflection.
         device->SetTexture(0, nullptr);
@@ -1194,6 +1238,7 @@ void WorldRenderer::DrawSky(IDirect3DDevice9* device, const Camera& camera, Rend
             device->SetRenderState(D3DRS_ZENABLE, FALSE);
             device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
             device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+            glDrawingSky_ = true;
             const bool layered = DrawObject(device, object, stats);
             if (layered) {
                 BeginTranslucentStates(device);
@@ -1202,6 +1247,7 @@ void WorldRenderer::DrawSky(IDirect3DDevice9* device, const Camera& camera, Rend
                 DrawObject(device, object, stats, DrawPass::Translucent);
                 EndTranslucentStates(device);
             }
+            glDrawingSky_ = false;
             device->SetRenderState(D3DRS_ZENABLE, TRUE);
             device->SetRenderState(D3DRS_ZWRITEENABLE, TRUE);
             device->SetRenderState(D3DRS_CULLMODE, backfaceCulling_ ? cullMode_ : D3DCULL_NONE);
@@ -1503,6 +1549,7 @@ void WorldRenderer::DrawObjectAnimations(IDirect3DDevice9* device, bool usingVis
         if (usingVisibility && !std::binary_search(visibleSections_.begin(), visibleSections_.end(),
                                                    (u32)placement.section))
             continue;
+        if (GameHidesSection((u32)placement.section)) continue;   // SetGameDrawFilter
         animations.Pose(placement, seconds, pose);
         const nfs::WorldAnimationTree& tree = animations.Trees()[placement.tree];
         for (size_t i = 0; i < tree.parts.size() && i < pose.size(); ++i) {
@@ -1874,4 +1921,614 @@ std::vector<minimap::PlacedModel> WorldRenderer::PlacedBuildings() const {
 bool WorldRenderer::SetMinimapBuildings(const std::vector<minimap::Building>& buildings) {
     if (!context_ || !context_->IsValid()) return false;
     return minimapPreview_.Upload(context_->Device(), buildings);
+}
+
+// ---------------------------------------------------------------------------
+// Game look: the game's own WORLD / WORLDREFLECT / WORLDNOFOG effects
+// ---------------------------------------------------------------------------
+
+namespace {
+
+constexpr int kEffectWorldNoFog = 7;   // gEffects[7]
+
+template <typename T>
+void ReleaseTyped(T*& object) {
+    if (object) object->Release();
+    object = nullptr;
+}
+
+} // namespace
+
+bool WorldRenderer::BackdropHidden(const GpuObject& object) const {
+    if (object.backdropKind == kBackdropPanorama && hideBackground_) return true;
+    if (object.backdropKind == kBackdropDistantLod && hideDistantLod_) return true;
+    if (!object.isBackdrop || showBackdrop_) return false;
+    // The game draws the panorama pieces as ordinary scenery (in the zones
+    // that list their sections, see BackdropOutOfZone); the dome is drawn
+    // round the camera by DrawSky.
+    if (gameLook_ && gameLookReady_ && object.source && object.source->name.rfind("SKYDOME", 0) != 0) return false;
+    return true;
+}
+
+// The section set the game draws for the camera (STREAMING-STUDY 1.7, sub_5E99C0 / sub_5E96B0): the zone
+// under the camera (sub_5E00D0) and its visible-section list; with no zone, only sections numbered n % 100
+// < 10. Kept while the camera stays within 2 units.
+void WorldRenderer::UpdateGameZone(const Vec3& eye) {
+    const float dx = eye.x - glZoneFrom_.x, dy = eye.y - glZoneFrom_.y;
+    if (dx * dx + dy * dy < 4.0f || !world_) return;
+    glZoneFrom_ = eye;
+    std::vector<u32> found;
+    glZoneFound_ = world_->Visibility().VisibleAt(eye, found);
+    std::sort(found.begin(), found.end());
+    glZoneList_.swap(found);
+}
+
+bool WorldRenderer::BackdropOutOfZone(const GpuObject& object, u32 sectionNumber) const {
+    if (object.backdropKind == kBackdropNone || !glActive_ || !glFogged_) return false;
+    if (!glZoneFound_) return sectionNumber % 100 >= 10;
+    return !std::binary_search(glZoneList_.begin(), glZoneList_.end(), sectionNumber);
+}
+
+void WorldRenderer::ReleaseDeviceObjects() {
+    ReleaseTyped(glReflection_);
+    ReleaseTyped(glReflectionDepth_);
+    ReleaseTyped(glReflectionBlur_);
+    glReflectionFailed_ = false;
+    glReflectionValid_ = false;
+}
+
+void WorldRenderer::ReleaseGameLook() {
+    ReleaseDeviceObjects();
+    ReleaseTyped(glWorldVs_);
+    ReleaseTyped(glWorldPs_);
+    ReleaseTyped(glReflectVs_);
+    ReleaseTyped(glReflectPs_);
+    ReleaseTyped(glNoFogVs_);
+    ReleaseTyped(glNoFogPs_);
+    ReleaseTyped(glFilterVs_);
+    ReleaseTyped(glFilterPs_);
+    ReleaseTyped(glMissing_);
+    gameLookReady_ = false;
+    gameLookTried_ = false;
+    fogRegion_.clear();
+    glZoneList_.clear();
+    glZoneFound_ = false;
+    glZoneFrom_ = Vec3{ 1e30f, 1e30f, 1e30f };
+}
+
+bool WorldRenderer::EnsureGameLook(IDirect3DDevice9* device) {
+    if (gameLookReady_) return true;
+    if (gameLookTried_ || !device) return false;
+    gameLookTried_ = true;
+    if (gameFolder_.empty()) {
+        gameLookStatus_ = "Game look: no game folder";
+        return false;
+    }
+    std::wstring exe = gameFolder_;
+    if (exe.back() != L'\\' && exe.back() != L'/') exe += L'\\';
+    exe += L"SPEED2.EXE";
+    gamelook::WorldEffects effects;
+    std::string why;
+    if (!gamelook::ExtractWorldEffects(exe, effects, why)) {
+        gameLookStatus_ = "Game look unavailable: " + why;
+        LOG_WARN("%s", gameLookStatus_.c_str());
+        return false;
+    }
+    auto vs = [&](const std::vector<uint32_t>& code, IDirect3DVertexShader9*& out) {
+        return SUCCEEDED(device->CreateVertexShader(reinterpret_cast<const DWORD*>(code.data()), &out));
+    };
+    auto ps = [&](const std::vector<uint32_t>& code, IDirect3DPixelShader9*& out) {
+        return SUCCEEDED(device->CreatePixelShader(reinterpret_cast<const DWORD*>(code.data()), &out));
+    };
+    if (!vs(effects.world.vertexShader, glWorldVs_) || !ps(effects.world.pixelShader, glWorldPs_) ||
+        !vs(effects.reflect.vertexShader, glReflectVs_) || !ps(effects.reflect.pixelShader, glReflectPs_) ||
+        !vs(effects.noFog.vertexShader, glNoFogVs_) || !ps(effects.noFog.pixelShader, glNoFogPs_)) {
+        ReleaseGameLook();
+        gameLookTried_ = true;
+        gameLookStatus_ = "Game look unavailable: the device refused the game's vs_1_1 / ps_1_1";
+        LOG_WARN("%s", gameLookStatus_.c_str());
+        return false;
+    }
+    // What was taken, instruction by instruction, to compare with the published disassembly.
+    const std::pair<const char*, const std::vector<uint32_t>*> listed[] = {
+        { "WORLD vs", &effects.world.vertexShader },          { "WORLD ps", &effects.world.pixelShader },
+        { "WORLDREFLECT vs", &effects.reflect.vertexShader }, { "WORLDREFLECT ps", &effects.reflect.pixelShader },
+        { "WORLDNOFOG vs", &effects.noFog.vertexShader },     { "WORLDNOFOG ps", &effects.noFog.pixelShader },
+    };
+    for (const auto& item : listed) {
+        LOG_INFO("game look: %s, %zu bytes", item.first, item.second->size() * 4);
+        for (const std::string& line : gamelook::Disassemble(*item.second)) LOG_INFO("    %s", line.c_str());
+    }
+    // FILTER pass p3 for the level-3 blur of the reflection (sub_5C7E40); optional.
+    if (!effects.filter.vertexShader.empty() && !effects.filter.pixelShader.empty()) {
+        if (!vs(effects.filter.vertexShader, glFilterVs_) || !ps(effects.filter.pixelShader, glFilterPs_)) {
+            ReleaseTyped(glFilterVs_);
+            ReleaseTyped(glFilterPs_);
+        } else {
+            LOG_INFO("game look: FILTER p3 vs %zu bytes, ps %zu bytes", effects.filter.vertexShader.size() * 4,
+                     effects.filter.pixelShader.size() * 4);
+            for (const std::string& line : gamelook::Disassemble(effects.filter.vertexShader)) LOG_INFO("    %s", line.c_str());
+            for (const std::string& line : gamelook::Disassemble(effects.filter.pixelShader)) LOG_INFO("    %s", line.c_str());
+        }
+    }
+    if (SUCCEEDED(device->CreateTexture(1, 1, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &glMissing_, nullptr))) {
+        D3DLOCKED_RECT locked{};
+        if (SUCCEEDED(glMissing_->LockRect(0, &locked, nullptr, 0))) {
+            *static_cast<u32*>(locked.pBits) = kMissingTextureColor;
+            glMissing_->UnlockRect(0);
+        }
+    }
+    // sub_60F880 without the time-of-day option (dword_870D14 != 1) attaches this replacement table to
+    // SKYDOME: SKY_SUNRISE_A -> SKY_NIGHT_A, SKY_SUNRISE_A_CAP -> SKY_NIGHT_A_CAP.
+    glSkyRemap_.clear();
+    glSkyRemap_[gamelook::GameHash("SKY_SUNRISE_A")] = gamelook::GameHash("SKY_NIGHT_A");
+    glSkyRemap_[gamelook::GameHash("SKY_SUNRISE_A_CAP")] = gamelook::GameHash("SKY_NIGHT_A_CAP");
+    gameLookReady_ = true;
+    gameLookStatus_ = "Game look: WORLD, WORLDREFLECT and WORLDNOFOG from SPEED2.EXE";
+    LOG_INFO("%s", gameLookStatus_.c_str());
+    return true;
+}
+
+void WorldRenderer::BeginGameLook(IDirect3DDevice9* device, const Mat4& view, const Mat4& projection,
+                                  bool mainView, const Vec3& eye) {
+    glActive_ = true;
+    glFogged_ = mainView;
+    glBound_ = -1;
+    glView_ = view;
+    glProjection_ = projection;
+
+    // The fog struct of this view (sub_614300) and the constants eDisplayFrame derives from it.
+    if (mainView) {
+        std::string region;
+        if (world_)
+            for (wchar_t ch : world_->Region()) region += (char)ch;
+        if (region != fogRegion_) {
+            fogRegion_ = region;
+            std::wstring bun = gameFolder_;
+            if (!bun.empty() && bun.back() != L'\\' && bun.back() != L'/') bun += L'\\';
+            bun += L"TRACKS\\" + std::wstring(region.begin(), region.end()) + L".BUN";
+            if (glFogMap_.Load(bun))
+                LOG_INFO("game look: fog from the \"Normal Fog\" parameter map of %S", bun.c_str());
+            else
+                LOG_WARN("game look: %S has no \"Normal Fog\" map; using the exe's fallback fog (0x800E18)",
+                         bun.c_str());
+        }
+        const gamelook::FogState fog = glFogMap_.Sample(eye.x, eye.y);
+        const gamelook::FogConstants c = gamelook::MakeFogConstants(fog);
+        std::memcpy(glFogValue_, c.value, sizeof glFogValue_);
+        static int lastSet = -2;
+        const int set = glFogMap_.SetIndexAt(eye.x, eye.y);
+        if (set != lastSet) {
+            lastSet = set;
+            LOG_INFO("game look: fog set %d at (%.0f, %.0f): start %.1f, factor %.3f, colour %.0f %.0f %.0f -> "
+                     "FOGVALUE (%.0f, %.5f, %.3f), FOGCOLOR %08X",
+                     set, eye.x, eye.y, fog.start, fog.factor, fog.r, fog.g, fog.b, c.value[0], c.value[1],
+                     c.value[2], (unsigned)c.colour);
+        }
+        device->SetRenderState(D3DRS_FOGCOLOR, c.colour);
+    }
+    // FOGENABLE comes from each effect's pass (FogOn = g_FogEnable for WORLD / WORLDREFLECT, FALSE for
+    // WORLDNOFOG); the shaders write oFog, so no fixed-function fog formula is wanted.
+    device->SetRenderState(D3DRS_FOGTABLEMODE, D3DFOG_NONE);
+    device->SetRenderState(D3DRS_FOGVERTEXMODE, D3DFOG_NONE);
+    device->SetRenderState(D3DRS_FOGENABLE, FALSE);
+    device->SetRenderState(D3DRS_LIGHTING, FALSE);
+    device->SetRenderState(D3DRS_COLORWRITEENABLE, 15);
+    device->SetRenderState(D3DRS_ZFUNC, D3DCMP_LESSEQUAL);
+    device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);   // every world effect's .fxo: CULLMODE = NONE
+    device->SetRenderState(D3DRS_ALPHAFUNC, D3DCMP_GREATEREQUAL);
+    device->SetFVF(kWorldVertexFvf);
+    for (DWORD stage = 0; stage < 2; ++stage) {
+        device->SetTextureStageState(stage, D3DTSS_TEXCOORDINDEX, stage);
+        device->SetTextureStageState(stage, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
+    }
+    scrolling_ = false;
+}
+
+void WorldRenderer::EndGameLook(IDirect3DDevice9* device) {
+    glActive_ = false;
+    glBound_ = -1;
+    device->SetVertexShader(nullptr);
+    device->SetPixelShader(nullptr);
+    device->SetRenderState(D3DRS_FOGENABLE, FALSE);
+    device->SetTexture(1, nullptr);
+    device->SetTextureStageState(1, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
+    device->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
+    device->SetTextureStageState(1, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
+    device->SetTextureStageState(0, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
+    scrolling_ = false;
+    // Back to the states ApplyRenderStates leaves for the editor's own drawing.
+    device->SetRenderState(D3DRS_ALPHATESTENABLE, TRUE);
+    device->SetRenderState(D3DRS_ALPHAFUNC, D3DCMP_GREATEREQUAL);
+    device->SetRenderState(D3DRS_ALPHAREF, 128);
+    device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+    device->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
+    device->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+    device->SetRenderState(D3DRS_ZWRITEENABLE, TRUE);
+    device->SetRenderState(D3DRS_CULLMODE, backfaceCulling_ ? cullMode_ : D3DCULL_NONE);
+    device->SetFVF(kWorldVertexFvf);
+    BindTextureStage(device, CachedTexture{});
+}
+
+bool WorldRenderer::DrawObjectGameLook(IDirect3DDevice9* device, const GpuObject& object, RenderStats& stats,
+                                       DrawPass pass) {
+    // sub_5BDDE0: WORLDVIEW = l2w * View, WORLDVIEWPROJECTION = l2w * ViewProj. The vs_1_1 code reads
+    // them as columns (dp4 oPos.x, v0, c0). The game's view space looks down +z; the editor's (right
+    // handed) looks down -z, so WorldView's third column -- the one the fog reads -- goes in negated.
+    D3DMATRIX d3dWorld{};
+    device->GetTransform(D3DTS_WORLD, &d3dWorld);
+    Mat4 world;
+    std::memcpy(world.m, &d3dWorld, sizeof d3dWorld);
+    const Mat4 worldView = world * glView_;
+    const Mat4 worldViewProjection = worldView * glProjection_;
+    float c[7][4];
+    for (int r = 0; r < 4; ++r)
+        for (int k = 0; k < 4; ++k) c[r][k] = worldViewProjection.m[k][r];
+    for (int r = 0; r < 3; ++r)
+        for (int k = 0; k < 4; ++k) c[4 + r][k] = worldView.m[k][r] * (r == 2 ? -1.0f : 1.0f);
+    device->SetVertexShaderConstantF(0, &c[0][0], 7);
+
+    bool other = false;
+    for (const GpuDraw& draw : object.draws) {
+        u32 hash = AnimatedTexture(draw.textureHash);
+        if (glDrawingSky_) {
+            const auto remap = glSkyRemap_.find(hash);
+            if (remap != glSkyRemap_.end()) hash = remap->second;
+        }
+        const CachedTexture& texture = textures_.Get(device, hash);
+        const bool translucent = texture.texture && texture.Translucent();
+        if (translucent != (pass == DrawPass::Translucent)) { other = true; continue; }
+
+        // eViewPlatInterface::Render (0x5C5930): the mesh's effect; views other than the player's draw
+        // WORLDNOFOG; an additive texture (AlphaBlendType 2) turns WORLD into WORLDNOFOG. WORLDREFLECT
+        // needs this frame's reflection; without one it falls back to WORLD, as the game's remap table
+        // 0x7FF0D8 does with the road reflection off. CAR (the signs) and WORLDBONE are drawn with
+        // WORLD: their lighting rigs are not part of this view.
+        int effect = kEffectWorld;
+        if (!glFogged_) effect = kEffectWorldNoFog;
+        else if (object.effect == kEffectWorldReflect && glReflectionValid_) effect = kEffectWorldReflect;
+        if (effect == kEffectWorld && texture.blend == SurfaceBlend::Additive) effect = kEffectWorldNoFog;
+
+        if (effect != glBound_) {
+            glBound_ = effect;
+            if (effect == kEffectWorldReflect) {
+                device->SetVertexShader(glReflectVs_);
+                device->SetPixelShader(glReflectPs_);
+                device->SetRenderState(D3DRS_FOGENABLE, TRUE);
+                // reflected_sampler: WRAP, MIP/MIN/MAG LINEAR; TEXTURETRANSFORMFLAGS[1] = PROJECTED.
+                device->SetTexture(1, glReflection_);
+                device->SetTextureStageState(1, D3DTSS_TEXCOORDINDEX, 1);
+                // The .fxo states PROJECTED alone; with a vertex shader, current drivers need the count
+                // to divide by the fourth coordinate (oT1.w = clip w), as old ones did implicitly.
+                device->SetTextureStageState(1, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_COUNT4 | D3DTTFF_PROJECTED);
+                device->SetSamplerState(1, D3DSAMP_ADDRESSU, D3DTADDRESS_WRAP);
+                device->SetSamplerState(1, D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP);
+                device->SetSamplerState(1, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+                device->SetSamplerState(1, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+                device->SetSamplerState(1, D3DSAMP_MIPFILTER, D3DTEXF_LINEAR);
+                device->SetVertexShaderConstantF(7, glFogValue_, 1);
+            } else {
+                device->SetVertexShader(effect == kEffectWorld ? glWorldVs_ : glNoFogVs_);
+                device->SetPixelShader(effect == kEffectWorld ? glWorldPs_ : glNoFogPs_);
+                device->SetRenderState(D3DRS_FOGENABLE, effect == kEffectWorld ? TRUE : FALSE);
+                device->SetTexture(1, nullptr);
+                device->SetTextureStageState(1, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
+                if (effect == kEffectWorld) device->SetVertexShaderConstantF(8, glFogValue_, 1);
+            }
+        }
+        // TEXTUREOFFSET (sub_5BCC30, the texture's scroll): WORLD c7, WORLDNOFOG c4. WORLDNOFOG's c4
+        // overwrites WorldView's first column, which neither WORLD nor WORLDREFLECT reads.
+        if (effect != kEffectWorldReflect) {
+            float offset[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+            if (animate_ && texture.scrollType != 0) ScrollOffset(texture, animationClock_, offset[0], offset[1]);
+            device->SetVertexShaderConstantF(effect == kEffectWorld ? 7 : 4, offset, 1);
+        }
+
+        // sub_5BCC30: ALPHATEST at 0x5F for PUNCHTHRU, blend from AlphaBlendType, ZWRITE = opaque.
+        device->SetTexture(0, texture.texture ? texture.texture : glMissing_);
+        const bool punch = texture.texture && texture.punchThru;
+        device->SetRenderState(D3DRS_ALPHATESTENABLE, punch ? TRUE : FALSE);
+        device->SetRenderState(D3DRS_ALPHAREF, punch ? 0x5F : 0);
+        device->SetRenderState(D3DRS_ALPHABLENDENABLE, translucent ? TRUE : FALSE);
+        if (translucent) {
+            device->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
+            device->SetRenderState(D3DRS_DESTBLEND,
+                                   texture.blend == SurfaceBlend::Additive ? D3DBLEND_ONE : D3DBLEND_INVSRCALPHA);
+        }
+        device->SetRenderState(D3DRS_ZWRITEENABLE, translucent || glDrawingSky_ ? FALSE : TRUE);
+        device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+
+        device->DrawIndexedPrimitive(D3DPT_TRIANGLELIST, (INT)object.baseVertex, draw.minVertex, draw.vertexCount,
+                                     draw.startIndex, draw.primitiveCount);
+        stats.drawCalls++;
+        stats.triangles += draw.primitiveCount;
+    }
+    return other;
+}
+
+// The road reflection (eDisplayFrame 0x5CAB15..0x5CACC6, g_RoadReflectionEnable = 3): view 4 shares the
+// player camera and its View; it draws into a 320x240 A8R8G8B8 target (sub_5BA060, own D16 depth),
+// cleared to opaque black (sub_5BA3C0), no sky. The scenery set (preculler flag 0x800, sub_5D6570) is
+// the instances with flag 0x40, without 0x10 and 0x400, drawn with SceneryInfo +0x28's model when they
+// cover 32 pixels or more, each flipped by negating element [2][2] of its matrix (0x5D67A4) -- for an
+// upright object, a mirror image about the plane through its own pivot. Every effect but CAR becomes
+// WORLDNOFOG in it. At level 3 sub_5C7E40 then blurs it with FILTER p3. WORLDREFLECT samples it at the
+// road pixel's own screen position.
+void WorldRenderer::RenderReflection(IDirect3DDevice9* device, const Camera& camera, const Mat4& view,
+                                     const Mat4& projection) {
+    if (glReflectionFailed_ || !device) return;
+    constexpr UINT kWidth = 320, kHeight = 240;
+    if (!glReflection_) {
+        if (FAILED(device->CreateTexture(kWidth, kHeight, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT,
+                                         &glReflection_, nullptr)) ||
+            FAILED(device->CreateDepthStencilSurface(kWidth, kHeight, D3DFMT_D16, D3DMULTISAMPLE_NONE, 0, TRUE,
+                                                     &glReflectionDepth_, nullptr))) {
+            ReleaseDeviceObjects();
+            glReflectionFailed_ = true;
+            LOG_WARN("game look: no road reflection (the device cannot make a 320x240 render target)");
+            return;
+        }
+        // The second target of the blur (created when the FILTER effect is available, dword_8764EC == 3).
+        if (glFilterVs_ && glFilterPs_ &&
+            FAILED(device->CreateTexture(kWidth, kHeight, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT,
+                                         &glReflectionBlur_, nullptr)))
+            glReflectionBlur_ = nullptr;
+    }
+    IDirect3DSurface9* surface = nullptr;
+    if (FAILED(glReflection_->GetSurfaceLevel(0, &surface)) || !surface) return;
+
+    IDirect3DSurface9* oldTarget = nullptr;
+    IDirect3DSurface9* oldDepth = nullptr;
+    D3DVIEWPORT9 oldViewport{};
+    device->GetRenderTarget(0, &oldTarget);
+    device->GetDepthStencilSurface(&oldDepth);
+    device->GetViewport(&oldViewport);
+    for (DWORD s = 0; s < 4; ++s) device->SetTexture(s, nullptr);
+
+    device->SetRenderTarget(0, surface);
+    device->SetDepthStencilSurface(glReflectionDepth_);
+    const D3DVIEWPORT9 viewport{ 0, 0, kWidth, kHeight, 0.0f, 1.0f };
+    device->SetViewport(&viewport);
+    device->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, 0xFF000000u, 1.0f, 0);
+
+    const D3DMATRIX d3dView = ToD3D(view);
+    const D3DMATRIX d3dProjection = ToD3D(projection);
+    device->SetTransform(D3DTS_VIEW, &d3dView);
+    device->SetTransform(D3DTS_PROJECTION, &d3dProjection);
+    ApplyRenderStates();
+    const Vec3 eye = camera.Position();
+    BeginGameLook(device, view, projection, false, eye);
+
+    // The frustum test uses the instance's own, unmirrored bounds, as the game's does.
+    Frustum frustum;
+    frustum.Build(view * projection);
+    const Vec3 forward = camera.Forward();
+    // sub_5D64D0: pixels = K * r / (d - r) with r = SceneryInfo radius + 6 (flt_7A47CC), d the distance
+    // from the eye, K the view's pixel scale (taken here as half the target height over tan(fov / 2)).
+    const float pixelScale = 0.5f * (float)kHeight * projection.m[1][1];
+    const bool usingVisibility = streaming_ && haveVisible_ && !visibleSections_.empty();
+
+    RenderStats stats;
+    translucent_.clear();
+    size_t boundSection = (size_t)-1;
+    for (size_t i = 0; i < sections_.size() && showScenery_; ++i) {
+        const SectionRender& section = sections_[i];
+        if (section.alternate && !showAlternate_) continue;
+        if (GameHidesSection(section.number)) continue;   // SetGameDrawFilter
+        if (usingVisibility) {
+            if (!std::binary_search(visibleSections_.begin(), visibleSections_.end(), section.number)) continue;
+        } else if (streaming_ && section.instanceBounds.Valid()) {
+            const Vec3 centre = (section.instanceBounds.min + section.instanceBounds.max) * 0.5f;
+            const float dx = centre.x - eye.x, dy = centre.y - eye.y;
+            if (dx * dx + dy * dy > streamRadius_ * streamRadius_) continue;
+        }
+        if (culling_ && section.instanceBounds.Valid() && !frustum.Intersects(section.instanceBounds)) continue;
+
+        const std::vector<char>& hiddenHere = HiddenFlags(i);
+        for (size_t k = 0; k < section.instances.size(); ++k) {
+            const GpuInstance& instance = section.instances[k];
+            if (!instance.reflects || hiddenHere[k]) continue;
+            if (instance.worldBounds.Valid() && !frustum.Intersects(instance.worldBounds)) continue;
+            const Vec3 position{ instance.transform.m[3][0], instance.transform.m[3][1], instance.transform.m[3][2] };
+            const Vec3 offset = position - eye;
+            const float r = instance.radius + 6.0f;
+            if (Dot(offset, forward) < -r) continue;
+            const float d = Length(offset) - r;
+            const float pixels = d > r ? pixelScale * r / d : pixelScale;
+            if (pixels < 32.0f) continue;
+
+            const GpuSection* gpu = sections_[instance.reflectSection].gpu.get();
+            if (!gpu || instance.reflectObject >= gpu->Objects().size()) continue;
+            const GpuObject& object = gpu->Objects()[instance.reflectObject];
+            if (HiddenModel(object)) continue;
+            // View 4 shares the player camera, so its drawing set is the same zone list.
+            if (object.backdropKind != kBackdropNone &&
+                (BackdropHidden(object) ||
+                 (glZoneFound_ ? !std::binary_search(glZoneList_.begin(), glZoneList_.end(), section.number)
+                               : section.number % 100 >= 10)))
+                continue;
+            if (boundSection != instance.reflectSection) {
+                device->SetStreamSource(0, gpu->VertexBuffer(), 0, sizeof(nfs::SolidVertex));
+                device->SetIndices(gpu->IndexBuffer());
+                boundSection = instance.reflectSection;
+            }
+            Mat4 transform = instance.transform;
+            if (!instance.identityPlaced) transform.m[2][2] = -transform.m[2][2];
+            const D3DMATRIX world = ToD3D(transform);
+            device->SetTransform(D3DTS_WORLD, &world);
+            if (DrawObject(device, object, stats))
+                QueueTranslucent(object, instance.reflectSection, transform, false, instance.worldBounds, eye);
+        }
+    }
+    DrawTranslucent(device, stats);
+    EndGameLook(device);
+
+    surface->Release();
+    if (glReflectionBlur_) BlurReflection(device);
+
+    // FRS_REFLECTION_CAPTURE=<file.bmp>: the reflection target as it is sampled, rewritten every 120
+    // frames, to check what the roads add.
+    static unsigned dumpFrame = 0;
+    if (++dumpFrame % 120 == 0) {
+        wchar_t path[MAX_PATH] = {};
+        if (::GetEnvironmentVariableW(L"FRS_REFLECTION_CAPTURE", path, MAX_PATH)) {
+            IDirect3DSurface9* source = nullptr;
+            IDirect3DSurface9* copy = nullptr;
+            if (SUCCEEDED(glReflection_->GetSurfaceLevel(0, &source)) &&
+                SUCCEEDED(device->CreateOffscreenPlainSurface(kWidth, kHeight, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM, &copy,
+                                                              nullptr)) &&
+                SUCCEEDED(device->GetRenderTargetData(source, copy))) {
+                D3DLOCKED_RECT locked{};
+                FILE* file = nullptr;
+                if (SUCCEEDED(copy->LockRect(&locked, nullptr, D3DLOCK_READONLY))) {
+                    if (::_wfopen_s(&file, path, L"wb") == 0 && file) {
+                        BITMAPFILEHEADER header{};
+                        BITMAPINFOHEADER info{};
+                        header.bfType = 0x4D42;
+                        header.bfOffBits = sizeof(header) + sizeof(info);
+                        header.bfSize = header.bfOffBits + kWidth * kHeight * 4;
+                        info.biSize = sizeof(info);
+                        info.biWidth = (LONG)kWidth;
+                        info.biHeight = -(LONG)kHeight;   // top-down rows
+                        info.biPlanes = 1;
+                        info.biBitCount = 32;
+                        std::fwrite(&header, sizeof header, 1, file);
+                        std::fwrite(&info, sizeof info, 1, file);
+                        for (UINT row = 0; row < kHeight; ++row)
+                            std::fwrite((const u8*)locked.pBits + (size_t)row * locked.Pitch, 4, kWidth, file);
+                        std::fclose(file);
+                    }
+                    copy->UnlockRect();
+                }
+            }
+            if (copy) copy->Release();
+            if (source) source->Release();
+        }
+    }
+
+    device->SetRenderTarget(0, oldTarget);
+    device->SetDepthStencilSurface(oldDepth);
+    device->SetViewport(&oldViewport);
+    if (oldTarget) oldTarget->Release();
+    if (oldDepth) oldDepth->Release();
+    glReflectionValid_ = true;
+}
+
+// sub_5C7E40: two passes of FILTER p3 (sub_5C5F70 with four taps), the reflection into the second target
+// along x (table 0x7FF1CC) and back along y (table 0x7FF19C). Taps {weight, offset in texels}: (1/3, -1),
+// (1/3, +1), (1/6, -3), (1/6, +3) -- no centre tap.
+void WorldRenderer::BlurReflection(IDirect3DDevice9* device) {
+    constexpr float kWidth = 320.0f, kHeight = 240.0f;
+    struct Vertex { float x, y, z, w; float uv[4][2]; };
+    const float weights[4][4] = { { 1 / 3.0f, 1 / 3.0f, 1 / 3.0f, 1 / 3.0f },
+                                  { 1 / 3.0f, 1 / 3.0f, 1 / 3.0f, 1 / 3.0f },
+                                  { 1 / 6.0f, 1 / 6.0f, 1 / 6.0f, 1 / 6.0f },
+                                  { 1 / 6.0f, 1 / 6.0f, 1 / 6.0f, 1 / 6.0f } };
+    const float taps[4] = { -1.0f, 1.0f, -3.0f, 3.0f };
+
+    device->SetVertexShader(glFilterVs_);
+    device->SetPixelShader(glFilterPs_);
+    device->SetFVF(D3DFVF_XYZW | D3DFVF_TEX4);
+    device->SetPixelShaderConstantF(0, &weights[0][0], 4);
+    device->SetRenderState(D3DRS_ZENABLE, FALSE);
+    device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+    device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+    device->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+    device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+    device->SetRenderState(D3DRS_FOGENABLE, FALSE);
+    device->SetRenderState(D3DRS_COLORWRITEENABLE, 15);
+    for (DWORD s = 0; s < 4; ++s) {
+        device->SetSamplerState(s, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+        device->SetSamplerState(s, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+        device->SetSamplerState(s, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+        device->SetSamplerState(s, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+        device->SetSamplerState(s, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+        device->SetTextureStageState(s, D3DTSS_TEXCOORDINDEX, s);
+        device->SetTextureStageState(s, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
+    }
+
+    for (int pass = 0; pass < 2; ++pass) {
+        IDirect3DTexture9* source = pass == 0 ? glReflection_ : glReflectionBlur_;
+        IDirect3DTexture9* target = pass == 0 ? glReflectionBlur_ : glReflection_;
+        IDirect3DSurface9* surface = nullptr;
+        if (FAILED(target->GetSurfaceLevel(0, &surface)) || !surface) break;
+        device->SetRenderTarget(0, surface);
+        // Pixel centres on texel centres: the quad is moved half a pixel up and left.
+        const float px = 1.0f / kWidth, py = 1.0f / kHeight;
+        const float corners[4][4] = { { -1 - px, 1 + py, 0, 0 }, { 1 - px, 1 + py, 1, 0 },
+                                      { -1 - px, -1 + py, 0, 1 }, { 1 - px, -1 + py, 1, 1 } };
+        Vertex quad[4];
+        for (int v = 0; v < 4; ++v) {
+            quad[v].x = corners[v][0];
+            quad[v].y = corners[v][1];
+            quad[v].z = 0.5f;
+            quad[v].w = 1.0f;
+            for (int t = 0; t < 4; ++t) {
+                quad[v].uv[t][0] = corners[v][2] + (pass == 0 ? taps[t] * px : 0.0f);
+                quad[v].uv[t][1] = corners[v][3] + (pass == 1 ? taps[t] * py : 0.0f);
+            }
+        }
+        for (DWORD s = 0; s < 4; ++s) device->SetTexture(s, source);
+        device->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, quad, sizeof(Vertex));
+        for (DWORD s = 0; s < 4; ++s) device->SetTexture(s, nullptr);
+        surface->Release();
+    }
+    device->SetVertexShader(nullptr);
+    device->SetPixelShader(nullptr);
+    device->SetRenderState(D3DRS_ZENABLE, TRUE);
+    device->SetRenderState(D3DRS_ZWRITEENABLE, TRUE);
+    device->SetFVF(kWorldVertexFvf);
+    for (DWORD s = 1; s < 4; ++s) {
+        device->SetTextureStageState(s, D3DTSS_TEXCOORDINDEX, s);
+        device->SetTextureStageState(s, D3DTSS_COLOROP, D3DTOP_DISABLE);
+        device->SetTextureStageState(s, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
+    }
+    device->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_WRAP);
+    device->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP);
+    device->SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_LINEAR);
+}
+
+// ---------------------------------------------------------------------------
+// Extra passes over the world (drive/fx/HeadlightProjector.h)
+// ---------------------------------------------------------------------------
+
+void WorldRenderer::VisitSolidDraws(IDirect3DDevice9* device, const Aabb& bounds,
+                                    const std::function<void(const SolidVisit&)>& draw) {
+    if (!showScenery_ || !bounds.Valid() || mode_ == RenderMode::Wireframe) return;
+    auto overlaps = [&](const Aabb& b) {
+        return !b.Valid() || (b.min.x <= bounds.max.x && b.max.x >= bounds.min.x && b.min.y <= bounds.max.y &&
+                              b.max.y >= bounds.min.y && b.min.z <= bounds.max.z && b.max.z >= bounds.min.z);
+    };
+    size_t boundSection = (size_t)-1;
+    for (size_t i = 0; i < sections_.size(); ++i) {
+        const SectionRender& section = sections_[i];
+        if (section.alternate && !showAlternate_) continue;
+        if (GameHidesSection(section.number)) continue;
+        const std::vector<char>& hiddenHere = HiddenFlags(i);
+        for (size_t k = 0; k < section.instances.size(); ++k) {
+            const GpuInstance& instance = section.instances[k];
+            if (hiddenHere[k] || !overlaps(instance.worldBounds)) continue;
+            const GpuObject& object = sections_[instance.section].gpu->Objects()[instance.object];
+            if (BackdropHidden(object) || HiddenBuilding(object) || HiddenModel(object) || GameHidesModel(object))
+                continue;
+            for (const GpuDraw& d : object.draws) {
+                const CachedTexture& texture = textures_.Get(device, AnimatedTexture(d.textureHash));
+                if (texture.texture && texture.Translucent()) continue;
+                if (boundSection != instance.section) {
+                    const GpuSection& gpu = *sections_[instance.section].gpu;
+                    device->SetStreamSource(0, gpu.VertexBuffer(), 0, sizeof(nfs::SolidVertex));
+                    device->SetIndices(gpu.IndexBuffer());
+                    boundSection = instance.section;
+                }
+                SolidVisit v;
+                v.transform = &instance.transform;
+                v.mirrored = instance.mirrored;
+                v.baseVertex = (INT)object.baseVertex;
+                v.draw = &d;
+                v.texture = texture.texture;
+                v.cutOut = texture.texture && (texture.blend == SurfaceBlend::CutOut || texture.punchThru);
+                draw(v);
+            }
+        }
+    }
 }

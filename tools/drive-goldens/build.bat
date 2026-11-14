@@ -1,5 +1,6 @@
 @echo off
-rem Builds drive-goldens.exe: the C++ golden runner for src/drive (vehicle physics, numerics, camera).
+rem Builds drive-goldens.exe: the C++ golden runner for src/drive (vehicle physics, numerics, camera,
+rem car light flares and shadow).
 rem   build.bat            -> build\drive-goldens.exe with every suite
 rem   set OUT=dir          -> build into another folder (parallel builds)
 rem   set SUITES=mover wheel ...  -> only these suite_<name>.cpp files (main.cpp always has the maths helpers)
@@ -11,7 +12,7 @@ cd /d %~dp0
 set S=%~dp0..\..\src
 set D=%S%\drive
 if "%OUT%"=="" set OUT=build
-if "%SUITES%"=="" set SUITES=mover wheel engine rigidbody timing keyboard camera
+if "%SUITES%"=="" set SUITES=mover wheel engine rigidbody timing keyboard camera flares shadow
 if not exist "%OUT%\obj" mkdir "%OUT%\obj"
 set SRC=main.cpp
 for %%s in (%SUITES%) do set SRC=!SRC! suite_%%s.cpp
@@ -21,5 +22,6 @@ cl /nologo /MP /std:c++17 /O2 /fp:precise /EHsc /W3 /permissive- /utf-8 /DNOMINM
   "%D%\numerics\*.cpp" "%D%\physics\*.cpp" "%D%\physics\collision\*.cpp" "%D%\physics\engine\*.cpp" ^
   "%D%\physics\input\*.cpp" "%D%\physics\rigidbody\*.cpp" "%D%\physics\timing\*.cpp" "%D%\physics\wheel\*.cpp" ^
   "%D%\camera\*.cpp" "%D%\cars\CarTypeInfoU2.cpp" "%D%\cars\CarBin.cpp" ^
+  "%D%\cars\CarLightFlaresU2.cpp" "%D%\cars\CarShadowU2.cpp" "%D%\cars\CarHeadlightsU2.cpp" ^
   /Fo"%OUT%\obj\\" /Fe"%OUT%\drive-goldens.exe" /link /STACK:16777216
 exit /b %ERRORLEVEL%

@@ -63,7 +63,10 @@ bool Viewport::Create(HWND parent, int controlId) {
 
     // The panels draw in this device; its default-pool objects go round a reset.
     ui_.Init(window_, context_.Device());
-    context_.beforeReset = [this] { ui_.DeviceLost(); };
+    context_.beforeReset = [this] {
+        renderer_.ReleaseDeviceObjects();   // the game look's reflection target
+        ui_.DeviceLost();
+    };
     context_.afterReset = [this] { ui_.DeviceReset(); };
     return true;
 }

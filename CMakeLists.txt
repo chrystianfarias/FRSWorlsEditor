@@ -58,6 +58,7 @@ add_executable(FRSWorldEditor WIN32
     src/render/Camera.cpp
     src/render/CollisionMesh.cpp
     src/render/WorldRenderer.cpp
+    src/render/GameLook.cpp
     src/render/Gizmo.cpp
     src/render/ModelThumbnails.cpp
 

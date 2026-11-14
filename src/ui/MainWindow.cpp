@@ -778,6 +778,21 @@ void MainWindow::OnCreate() {
             ::AppendMenuW(view, MF_SEPARATOR, 0, nullptr);
             ::AppendMenuW(view, MF_STRING, kViewSkyCommand, L"S&ky (follows the camera)");
             ::AppendMenuW(view, MF_STRING, kViewAnimationsCommand, L"&Animations");
+            ::AppendMenuW(view, MF_STRING, kViewGameLookCommand, L"&Game look (the game's shaders, fog and reflections)");
+            ::AppendMenuW(view, MF_STRING, kViewHideBackgroundCommand, L"Hide &background scenery (PAN_ panoramas)");
+            ::AppendMenuW(view, MF_STRING, kViewHideDistantLodCommand, L"Hide &distant LOD models (PAN_*_Z, LOD_, _1Z_)");
+            // Remembered between sessions.
+            for (auto [name, set] : { std::pair<const wchar_t*, void (WorldRenderer::*)(bool)>{
+                                          L"HideBackgroundScenery", &WorldRenderer::SetBackgroundSceneryHidden },
+                                      { L"HideDistantLod", &WorldRenderer::SetDistantLodHidden } }) {
+                DWORD stored = 0, size = sizeof(stored);
+                if (::RegGetValueW(HKEY_CURRENT_USER, kSettingsKey, name, RRF_RT_REG_DWORD, nullptr, &stored, &size) ==
+                    ERROR_SUCCESS)
+                    (viewport_.GetRenderer().*set)(stored != 0);
+            }
+            // FRS_GAMELOOK=1: start in the game look (for captures).
+            if (const char* look = std::getenv("FRS_GAMELOOK"); look && *look == '1')
+                viewport_.GetRenderer().SetGameLook(true);
         }
         break;
     }
@@ -1039,6 +1054,29 @@ void MainWindow::OnCommand(int id, int notification, HWND control) {
     }
     if (id == kViewAnimationsCommand) {
         viewport_.GetRenderer().SetAnimationsEnabled(!viewport_.GetRenderer().AnimationsEnabled());
+        UpdateMenuChecks();
+        return;
+    }
+    if (id == kViewHideBackgroundCommand || id == kViewHideDistantLodCommand) {
+        WorldRenderer& renderer = viewport_.GetRenderer();
+        const bool background = id == kViewHideBackgroundCommand;
+        const bool hidden = background ? !renderer.BackgroundSceneryHidden() : !renderer.DistantLodHidden();
+        if (background) renderer.SetBackgroundSceneryHidden(hidden);
+        else renderer.SetDistantLodHidden(hidden);
+        HKEY key = nullptr;
+        if (::RegCreateKeyExW(HKEY_CURRENT_USER, kSettingsKey, 0, nullptr, 0, KEY_WRITE, nullptr, &key, nullptr) ==
+            ERROR_SUCCESS) {
+            const DWORD stored = hidden ? 1 : 0;
+            ::RegSetValueExW(key, background ? L"HideBackgroundScenery" : L"HideDistantLod", 0, REG_DWORD,
+                             (const BYTE*)&stored, sizeof(stored));
+            ::RegCloseKey(key);
+        }
+        UpdateMenuChecks();
+        return;
+    }
+    if (id == kViewGameLookCommand) {
+        WorldRenderer& renderer = viewport_.GetRenderer();
+        renderer.SetGameLook(!renderer.GameLook());
         UpdateMenuChecks();
         return;
     }
@@ -2310,6 +2348,7 @@ void MainWindow::SetGameFolder(const std::wstring& folder) {
 
     gameFolder_   = folder;
     tracksFolder_ = folder + L"\\TRACKS";
+    viewport_.GetRenderer().SetGameFolder(folder);
     modelsFolder_ = folder + L"\\models";
     // The world file last opened or saved, and how <game>\models stood then.
     {
@@ -2860,6 +2899,12 @@ void MainWindow::UpdateMenuChecks() {
                     MF_BYCOMMAND | (viewport_.GetRenderer().SkyVisible() ? MF_CHECKED : MF_UNCHECKED));
     ::CheckMenuItem(menu_, kViewAnimationsCommand,
                     MF_BYCOMMAND | (viewport_.GetRenderer().AnimationsEnabled() ? MF_CHECKED : MF_UNCHECKED));
+    ::CheckMenuItem(menu_, kViewGameLookCommand,
+                    MF_BYCOMMAND | (viewport_.GetRenderer().GameLook() ? MF_CHECKED : MF_UNCHECKED));
+    ::CheckMenuItem(menu_, kViewHideBackgroundCommand,
+                    MF_BYCOMMAND | (viewport_.GetRenderer().BackgroundSceneryHidden() ? MF_CHECKED : MF_UNCHECKED));
+    ::CheckMenuItem(menu_, kViewHideDistantLodCommand,
+                    MF_BYCOMMAND | (viewport_.GetRenderer().DistantLodHidden() ? MF_CHECKED : MF_UNCHECKED));
     for (auto& extension : extensions_) extension->UpdateMenuChecks(menu_);
 }
 

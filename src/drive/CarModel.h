@@ -21,6 +21,10 @@ class WorldRenderer;
 namespace bb {
 
 class CarTypeInfoU2;
+class CarRenderLayoutU2;
+class RideInfoU2;
+class SolidList;
+class Texture;
 
 class CarModel {
 public:
@@ -73,6 +77,14 @@ public:
     void SetEnvironmentMapMode(int mode);
     // Which path Draw takes, for logs.
     std::string ShaderStatus() const;
+
+    // ---- For the car's light and shadow effects (drive/fx/CarFx.h); null until loaded.
+    const CarTypeInfoU2* CarType() const;
+    const CarRenderLayoutU2* Layout() const;
+    const RideInfoU2* Ride() const;
+    const std::vector<std::unique_ptr<SolidList>>& SolidPacks() const;
+    // A texture of the car's packs (its own, the shared car packs, GLOBALB), or null.
+    const Texture* FindTexture(uint32_t hash) const;
 
     // ---- Checks
     // One line per drawn part: label, row, solid, triangles and resolved textures (MISSING_ when absent).

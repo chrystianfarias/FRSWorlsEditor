@@ -22,6 +22,8 @@ class GameCamera;
 class EngineSound;
 class TrackWorld;
 class VehicleSim;
+class GameStreamingHud;
+class DriveFx;
 }
 
 struct DriveModeHost {
@@ -103,6 +105,7 @@ private:
 
     DriveModeHost host_;
     bool active_ = false;
+    bool gameLookBefore_ = false;   // the renderer's Game look before the drive
 
     // Read once from the game folder, kept while it does not change.
     std::wstring loadedFolder_;
@@ -136,4 +139,15 @@ private:
     std::wstring message_;                  // shown in the HUD for a few seconds
     float messageTime_ = 0.0f;
     float physicsMs_ = 0.0f;
+    // What the game would have loaded, drawn and collided with (drive/GameStreamingHud).
+    std::unique_ptr<bb::GameStreamingHud> streaming_;
+    // The game's car shadow, car and world light flares and headlight projector (drive/fx/DriveFx.h);
+    // the world's flares are also drawn outside a drive while the renderer's Game look is on.
+    std::unique_ptr<bb::DriveFx> fx_;
+    bool braking_ = false;                  // Car+0x944: RealDriver brake > 0.05 (sub_5F62B0)
+    void* shadowTopology_ = nullptr;        // the shadow's own TopologyCoordinate on track_
+    const bb::TrackWorld* shadowTrack_ = nullptr;
+    void DrawGameFx(IDirect3DDevice9* device, WorldRenderer& renderer, bool beforeCar, const Mat4* body,
+                    bool carVisible);
+    void DrawCar(IDirect3DDevice9* device, WorldRenderer& renderer, const Pose& pose, const Mat4& body);
 };
