@@ -22,6 +22,15 @@ constexpr size_t kOffOrder        = 0x20;
 constexpr size_t kOffPosition     = 0x24;
 constexpr size_t kOffHash         = 0x30;
 
+// Underground 1 keeps its table in the track bundle (TRACKB<n>.LZC), chunk
+// 0x00034107: 56 bytes {char tag[8], u32 number, 0, u32 type (0 for the
+// "--" entry, else 1), offset, size, size without the texture data, a byte
+// sum of the section, 5 x 0}. No position, no ordering key. A number with
+// bit 16 set is a section that track leaves out; the bit is dropped, since
+// the editor shows the whole region.
+constexpr u32    kChunkSectionTableU1  = 0x00034107;
+constexpr size_t kSectionEntrySizeU1   = 56;
+
 std::string DecodeName(u32 packed) {
     char text[5] = {};
     for (int i = 0; i < 4; ++i) {
@@ -42,10 +51,12 @@ bool SectionTable::Parse(ByteSpan bunFile) {
     ByteSpan table;
     u64 chunkDataOffset = 0;
 
+    bool underground1 = false;
     while (reader.Next(chunk)) {
-        if (chunk.id == kChunkSectionTable) {
+        if (chunk.id == kChunkSectionTable || chunk.id == kChunkSectionTableU1) {
             table = chunk.data;
             chunkDataOffset = chunk.dataOffset;
+            underground1 = chunk.id == kChunkSectionTableU1;
             break;
         }
     }
@@ -53,6 +64,33 @@ bool SectionTable::Parse(ByteSpan bunFile) {
     if (table.empty()) {
         LOG_ERROR("section table (chunk %08X) not found", (unsigned)kChunkSectionTable);
         return false;
+    }
+
+    if (underground1) {
+        const size_t count = table.size / kSectionEntrySizeU1;
+        size_t trackOwn = 0;
+        sections_.reserve(count);
+        for (size_t i = 0; i < count; ++i) {
+            const ByteSpan entry = table.sub(i * kSectionEntrySizeU1, kSectionEntrySizeU1);
+            // Type 2 lives in the track's own STREAM<region>_<track>.BUN,
+            // not in the region's stream these offsets would be read from.
+            if (entry.read<u32>(0x10) == 2) { ++trackOwn; continue; }
+            Section section;
+            section.tableEntryOffset = chunkDataOffset + i * kSectionEntrySizeU1;
+            section.id           = entry.read<u32>(kOffName);
+            section.name         = DecodeName(section.id);
+            section.number       = entry.read<u32>(kOffNumber) & 0xFFFFu;
+            section.streamOffset = entry.read<u32>(kOffStreamOffset);
+            section.streamSize   = entry.read<u32>(kOffStreamSize);
+            section.geometrySize = entry.read<u32>(kOffGeometrySize);
+            section.originalStreamOffset = section.streamOffset;
+            section.originalStreamSize   = section.streamSize;
+            section.originalOtherSize    = section.geometrySize;
+            sections_.push_back(std::move(section));
+        }
+        LOG_INFO("section table (Underground 1): %zu sections, %zu of the track's own stream left out",
+                 sections_.size(), trackOwn);
+        return !sections_.empty();
     }
 
     const size_t count = table.size / kSectionEntrySize;
@@ -84,6 +122,10 @@ bool SectionTable::Parse(ByteSpan bunFile) {
 
     LOG_INFO("section table: %zu sections", sections_.size());
     return !sections_.empty();
+}
+
+void SectionTable::SetPosition(size_t index, const Vec3& position) {
+    if (index < sections_.size()) sections_[index].position = position;
 }
 
 void SectionTable::ApplyBytes(u64 fileOffset, const u8* data, size_t size) {

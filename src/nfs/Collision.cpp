@@ -342,8 +342,14 @@ bool ParseCollision(const Chunk& collisionChunk, CollisionPack& out) {
                           header.read<float>(kHeaderBoundsMax + 4),
                           header.read<float>(kHeaderBoundsMax + 8) };
 
+    ParseCollisionPolygons(polygons, out.polygons);
+    out.gridRank = RecoverGridRank(out.polygons.size(), cellRefs, cells);
+    return !out.polygons.empty();
+}
+
+void ParseCollisionPolygons(ByteSpan polygons, std::vector<CollisionPolygon>& out) {
     const size_t count = polygons.size / kPolygonSize;
-    out.polygons.reserve(count);
+    out.reserve(out.size() + count);
     for (size_t i = 0; i < count; ++i) {
         const ByteSpan entry = polygons.sub(i * kPolygonSize, kPolygonSize);
 
@@ -361,11 +367,8 @@ bool ParseCollision(const Chunk& collisionChunk, CollisionPack& out) {
                 entry.read<i16>(kPolygonY + at) * kPlanScale,
                 polygon.barrier ? 0.0f : base + entry.read<i16>(kPolygonZ + at) * kHeightScale };
         }
-        out.polygons.push_back(polygon);
+        out.push_back(polygon);
     }
-
-    out.gridRank = RecoverGridRank(out.polygons.size(), cellRefs, cells);
-    return !out.polygons.empty();
 }
 
 // ---------------------------------------------------------------------------

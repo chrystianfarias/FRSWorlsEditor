@@ -780,7 +780,10 @@ void MainWindow::OnCreate() {
     // Pick the folder back up from the last session. The first run -- or one
     // after an update with something new to install -- opens the setup once
     // the window is on screen.
-    const std::wstring stored = LoadStoredGameFolder();
+    // FRS_GAME_FOLDER opens another game folder for this session only, without
+    // replacing the stored one (testing Underground 1 beside Underground 2).
+    const wchar_t* overrideFolder = _wgetenv(L"FRS_GAME_FOLDER");
+    const std::wstring stored = overrideFolder && *overrideFolder ? std::wstring(overrideFolder) : LoadStoredGameFolder();
     if (!stored.empty() && DirectoryExists(stored + L"\\TRACKS"))
         SetGameFolder(stored);
     if (StoredSetupVersion() < kSetupVersion) ::PostMessageW(window_, kRunSetupMessage, 0, 0);
@@ -1297,9 +1300,22 @@ void MainWindow::ShowAbout() {
 // Worlds
 // ---------------------------------------------------------------------------
 
+// Underground 1 regions open read-only: the plugins that would hand the game
+// an edit are written for Underground 2. True (and says so) when the open
+// region is one.
+bool MainWindow::RefuseReadOnlyWorld() {
+    if (!world_ || !world_->IsUnderground1()) return false;
+    ::MessageBoxW(window_, L"Need for Speed Underground regions are read-only for now: the editor can show and export them, but nothing it writes would reach the game.", kWindowTitle, MB_ICONINFORMATION | MB_OK);
+    return true;
+}
+
 void MainWindow::UpdateTitle() {
     std::wstring title = kWindowTitle;
-    if (world_) title += L" - " + world_->Region();
+    if (world_) {
+        title += L" - " + world_->Region();
+        if (world_->IsUnderground1())
+            title += L" (Underground, track " + std::to_wstring(world_->TrackNumber()) + L", read-only)";
+    }
     if (!gameFolder_.empty()) title += L" [" + worldName_ + L"]";
     ::SetWindowTextW(window_, title.c_str());
 }
@@ -1482,6 +1498,7 @@ void MainWindow::SaveWorld() {
         SetStatusText(2, L"No region open: nothing to save.");
         return;
     }
+    if (RefuseReadOnlyWorld()) return;
     // Extensions write what they have not yet; placements wait for this, and
     // reopen the region once written.
     for (auto& extension : extensions_) extension->Save();
@@ -1489,6 +1506,11 @@ void MainWindow::SaveWorld() {
     // Then the world file: the first time, wherever the person wants it.
     if (worldPath_.empty()) { SaveWorldAs(); return; }
     if (WriteWorldFile(worldPath_)) SetStatusText(2, Format(L"World \"%s\" saved", worldName_.c_str()));
+}
+
+std::wstring MainWindow::CameraValueName() const {
+    if (!world_) return L"Camera";
+    return std::wstring(L"Camera.") + (world_->IsUnderground1() ? L"U1." : L"") + world_->Region();
 }
 
 void MainWindow::SaveCameraPosition() {
@@ -1507,6 +1529,10 @@ void MainWindow::SaveCameraPosition() {
                                  camera.Yaw(), camera.Pitch() };
     ::RegSetValueExW(key, L"Camera", 0, REG_BINARY, (const BYTE*)viewpoint,
                      sizeof(viewpoint));
+    // And one per region (and game): coming back to a region finds its own.
+    if (world_)
+        ::RegSetValueExW(key, CameraValueName().c_str(), 0, REG_BINARY, (const BYTE*)viewpoint,
+                         sizeof(viewpoint));
     ::RegCloseKey(key);
 
     SetStatusText(2, Format(L"Camera saved at %.0f, %.0f, %.0f",
@@ -1522,13 +1548,29 @@ void MainWindow::RestoreCameraPosition() {
     float viewpoint[5]{};
     DWORD size = sizeof(viewpoint);
     DWORD type = 0;
-    const LONG result = ::RegQueryValueExW(key, L"Camera", nullptr, &type,
-                                           (BYTE*)viewpoint, &size);
+    // The region's own first; the last one saved anywhere otherwise.
+    LONG result = world_ ? ::RegQueryValueExW(key, CameraValueName().c_str(), nullptr, &type, (BYTE*)viewpoint, &size)
+                         : ERROR_FILE_NOT_FOUND;
+    if (result != ERROR_SUCCESS) {
+        size = sizeof(viewpoint);
+        result = ::RegQueryValueExW(key, L"Camera", nullptr, &type, (BYTE*)viewpoint, &size);
+    }
     ::RegCloseKey(key);
 
     if (result != ERROR_SUCCESS || type != REG_BINARY || size != sizeof(viewpoint)) {
         SetStatusText(2, L"No camera saved yet");
         return;
+    }
+    // Saved in another region or game: well outside this one, the framing stays.
+    if (world_) {
+        const Aabb bounds = world_->TrackBounds();
+        const float margin = 2000.0f;
+        if (bounds.Valid() &&
+            (viewpoint[0] < bounds.min.x - margin || viewpoint[0] > bounds.max.x + margin ||
+             viewpoint[1] < bounds.min.y - margin || viewpoint[1] > bounds.max.y + margin)) {
+            SetStatusText(2, L"The saved camera is outside this region: framed on the whole of it");
+            return;
+        }
     }
 
     viewport_.GetCamera().SetPosition({ viewpoint[0], viewpoint[1], viewpoint[2] });
@@ -1799,6 +1841,7 @@ void MainWindow::ImportEditedObjectsImpl() {
 
 void MainWindow::ImportObj(const std::wstring& path, bool quick, const Vec3* newOrigin) {
     if (!world_) return;
+    if (RefuseReadOnlyWorld()) return;
 
     // Everything that needs the region is read first, because the region has to
     // be closed before the file can be written: the editor keeps the stream in a
@@ -3037,6 +3080,14 @@ bool MainWindow::ConfirmUnsavedPlacements() {
         explicit Asking(bool& f) : flag(f) { flag = true; }
         ~Asking() { flag = false; }
     } guard(asking);
+    // Nothing of an Underground 1 region can be written: the edits just go.
+    if (world_->IsUnderground1()) {
+        for (const auto& section : world_->Loaded()) {
+            section->placementsChanged = false;
+            section->collisionChanged = false;
+        }
+        return true;
+    }
     const int answer = ::MessageBoxW(
         window_,
         L"There are placed objects or collision edits that have not been written to the game.\n\n"
@@ -3490,6 +3541,7 @@ void MainWindow::PasteClipboard() {
 
 bool MainWindow::SavePlacements() {
     if (!world_) return false;
+    if (RefuseReadOnlyWorld()) return false;
     if (!HasUnsavedPlacements()) {
         SetStatusText(2, L"No placements to write.");
         return true;

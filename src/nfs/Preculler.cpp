@@ -41,7 +41,7 @@ std::vector<std::pair<size_t, size_t>> RecordBodies(ByteSpan span) {
 
 } // namespace
 
-bool Preculler::Parse(ByteSpan bunFile) {
+bool Preculler::Parse(ByteSpan bunFile, bool underground1) {
     zones_.clear();
     visible_.clear();
     records_.clear();
@@ -57,6 +57,33 @@ bool Preculler::Parse(ByteSpan bunFile) {
     ChunkReader children = ChunkReader::Children(container);
     Chunk child;
     while (children.Next(child)) {
+        if (underground1) {
+            if (child.id == kChunkVisibilityHeader) {          // outlines, one id lower
+                for (const auto& [offset, length] : RecordBodies(child.data)) {
+                    const ByteSpan body = child.data.sub(offset, length);
+                    Zone zone;
+                    zone.id = body.read<u16>(0);
+                    const u32 points = body.read<u16>(2);
+                    if (points < 3 || 4 + (size_t)points * 8 > body.size) continue;
+                    zone.boundsMin = { 1e30f, 1e30f, 0.0f };
+                    zone.boundsMax = { -1e30f, -1e30f, 0.0f };
+                    for (u32 i = 0; i < points; ++i) {
+                        const Vec3 p{ body.read<float>(4 + i * 8), body.read<float>(8 + i * 8), 0.0f };
+                        zone.ring.push_back(p);
+                        zone.boundsMin.x = std::min(zone.boundsMin.x, p.x);
+                        zone.boundsMin.y = std::min(zone.boundsMin.y, p.y);
+                        zone.boundsMax.x = std::max(zone.boundsMax.x, p.x);
+                        zone.boundsMax.y = std::max(zone.boundsMax.y, p.y);
+                    }
+                    zone.recordOffset = (u64)(child.data.data - bunFile.data) + offset;
+                    zone.recordLength = (u32)length;
+                    zones_.push_back(std::move(zone));
+                }
+                continue;
+            }
+            if (child.id == kChunkZonePolygons) child.id = kChunkZoneVisibility;   // the lists
+            else continue;
+        }
         if (child.id == kChunkVisibilityHeader && child.data.size >= 4) {
             const u32 base = child.data.read<u32>(0);
             if (base > 0 && base < 100) collisionBase_ = base;

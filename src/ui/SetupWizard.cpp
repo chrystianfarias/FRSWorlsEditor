@@ -359,6 +359,12 @@ void DescribeFolder(HWND dialog) {
     bool valid = false;
     if (folder.empty()) {
         text = L"Choose the folder that holds SPEED2.EXE.";
+    } else if (IsUnderground1Folder(folder)) {
+        valid = true;
+        text = L"Need for Speed Underground found.\r\n"
+               L"The editor opens its tracks to look at and export. The plugins are written for "
+               L"Underground 2, so nothing is installed here, and edits cannot be saved for this "
+               L"game yet.";
     } else if (!FileExists(folder + L"\\SPEED2.EXE")) {
         text = L"There is no SPEED2.EXE in this folder.";
     } else if (!DirectoryExists(folder + L"\\TRACKS")) {
@@ -389,7 +395,7 @@ void BrowseForFolder(HWND dialog) {
     DWORD options = 0;
     picker->GetOptions(&options);
     picker->SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
-    picker->SetTitle(L"The Need for Speed Underground 2 folder (the one with SPEED2.EXE)");
+    picker->SetTitle(L"The Need for Speed Underground 2 folder (SPEED2.EXE), or Underground's (speed.exe)");
     const std::wstring current = Trimmed(TextOf(dialog, IDC_SETUP_PATH));
     IShellItem* start = nullptr;
     if (!current.empty() &&
@@ -431,7 +437,16 @@ INT_PTR CALLBACK FolderPage(HWND dialog, UINT message, WPARAM wParam, LPARAM lPa
                 case PSN_WIZNEXT: {
                     const std::wstring folder = Trimmed(TextOf(dialog, IDC_SETUP_PATH));
                     if (!IsGameFolder(folder)) { Stay(dialog); return TRUE; }
-                    WizardOf(dialog)->choices.folder = folder;
+                    Wizard* wizard = WizardOf(dialog);
+                    wizard->choices.folder = folder;
+                    if (IsUnderground1Folder(folder)) {
+                        // Nothing to install: straight to the end.
+                        wizard->installed = true;
+                        wizard->installOk = true;
+                        wizard->report = L"Need for Speed Underground: no plugins installed (they are for "
+                                         L"Underground 2). Its regions open read-only.";
+                        ::SetWindowLongPtrW(dialog, DWLP_MSGRESULT, IDD_SETUP_DONE);
+                    }
                     return TRUE;
                 }
             }
@@ -581,7 +596,13 @@ PROPSHEETPAGEW Page(HINSTANCE instance, int templateId, DLGPROC procedure, const
 } // namespace
 
 bool IsGameFolder(const std::wstring& folder) {
-    return !folder.empty() && FileExists(folder + L"\\SPEED2.EXE") && DirectoryExists(folder + L"\\TRACKS");
+    return !folder.empty() && DirectoryExists(folder + L"\\TRACKS") &&
+           (FileExists(folder + L"\\SPEED2.EXE") || FileExists(folder + L"\\speed.exe"));
+}
+
+bool IsUnderground1Folder(const std::wstring& folder) {
+    return !folder.empty() && !FileExists(folder + L"\\SPEED2.EXE") && FileExists(folder + L"\\speed.exe") &&
+           DirectoryExists(folder + L"\\TRACKS");
 }
 
 std::wstring DetectGameFolder() {

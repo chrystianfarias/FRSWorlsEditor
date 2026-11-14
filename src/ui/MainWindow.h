@@ -263,6 +263,8 @@ private:
     static constexpr UINT kShellLibraryActivate = WM_APP + 0x52;
 
     std::wstring LoadStoredGameFolder() const;
+    bool RefuseReadOnlyWorld();
+    std::wstring CameraValueName() const;
     void         StoreGameFolder(const std::wstring& folder) const;
     DWORD        StoredSetupVersion() const;
     void         StoreSetupVersion(DWORD version) const;

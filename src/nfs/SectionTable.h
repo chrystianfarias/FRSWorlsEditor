@@ -58,7 +58,8 @@ struct Section {
 // The full section table of one track region.
 class SectionTable {
 public:
-    // Parses chunk 0x00034110 out of an already-mapped L4Rx.BUN.
+    // Parses chunk 0x00034110 out of an already-mapped L4Rx.BUN, or
+    // Underground 1's chunk 0x00034107 out of an unpacked TRACKB<n>.LZC.
     bool Parse(ByteSpan bunFile);
 
     const std::vector<Section>& Sections() const { return sections_; }
@@ -70,6 +71,10 @@ public:
     // own fields are re-read after they land -- which keeps this honest if the
     // patch ever covers something other than the offset and the size.
     void ApplyBytes(u64 fileOffset, const u8* data, size_t size);
+
+    // Underground 1's table gives no positions: World fills them in from the
+    // visibility zones, which carry each drivable section's outline.
+    void SetPosition(size_t index, const Vec3& position);
 
     const Section* FindByName(const std::string& name) const;
     const Section* FindByNumber(u32 number) const;

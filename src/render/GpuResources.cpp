@@ -16,6 +16,7 @@ D3DFORMAT ToD3DFormat(nfs::TextureFormat format) {
         case nfs::TextureFormat::Dxt3:        return D3DFMT_DXT3;
         case nfs::TextureFormat::Dxt5:        return D3DFMT_DXT5;
         case nfs::TextureFormat::Palettised8: return D3DFMT_A8R8G8B8;
+        case nfs::TextureFormat::Argb8888:    return D3DFMT_A8R8G8B8;
         default:                              return D3DFMT_UNKNOWN;
     }
 }
@@ -33,6 +34,11 @@ LevelLayout SourceLayout(nfs::TextureFormat format, u32 width, u32 height) {
     LevelLayout layout;
     if (format == nfs::TextureFormat::Palettised8) {
         layout.rowBytes = width;
+        layout.rowCount = height;
+        return layout;
+    }
+    if (format == nfs::TextureFormat::Argb8888) {
+        layout.rowBytes = width * 4;
         layout.rowCount = height;
         return layout;
     }

@@ -87,7 +87,16 @@ struct TextureAnimation {
     float            fps = 0.0f;
 };
 
+// The games whose worlds the editor reads.
+enum class Game { Underground2, Underground1 };
+
 // One track region: the L4Rx.BUN layout file plus its STREAML4Rx.BUN payload.
+//
+// Underground 1 has no layout file per region: each track has a bundle,
+// TRACKS\TRACKB<n>.LZC (JDLZ), holding the section table, the visibility
+// zones and the whole track's collision, over a stream shared by every track
+// of the region. The region opens with one of those bundles in the layout's
+// place (see OpenUnderground1).
 //
 // Sections are parsed on demand. Because the stream stays memory-mapped, a
 // section that is never visited costs nothing beyond its table entry.
@@ -110,6 +119,11 @@ public:
 
     bool IsOpen() const { return stream_.IsOpen(); }
 
+    Game GameKind() const { return game_; }
+    bool IsUnderground1() const { return game_ == Game::Underground1; }
+    // Underground 1: the track whose bundle the region was opened with.
+    u32  TrackNumber() const { return trackNumber_; }
+
     const std::wstring& Region() const { return region_; }
     const SectionTable& Table()  const { return table_; }
 
@@ -124,7 +138,7 @@ public:
     const Preculler&    Visibility() const { return preculler_; }
     // The layout file (L4Rx.BUN) as shipped, and the spans the models folder
     // lays over it and the stream.
-    ByteSpan LayoutBytes() const { return layout_.Span(); }
+    ByteSpan LayoutBytes() const { return LayoutSpan(); }
     const std::vector<SpanOverlay>& Spans() const { return spans_; }
 
     // Parses a section if it has not been parsed yet. Returns nullptr when the
@@ -235,6 +249,17 @@ public:
 private:
     std::wstring region_;
     FileMap      layout_;   // L4Rx.BUN
+    std::vector<u8> layoutUnpacked_;   // Underground 1: the unpacked TRACKB<n>.LZC
+    ByteSpan LayoutSpan() const {
+        return layoutUnpacked_.empty() ? layout_.Span() : ByteSpan{ layoutUnpacked_.data(), layoutUnpacked_.size() };
+    }
+    Game         game_ = Game::Underground2;
+    u32          trackNumber_ = 0;
+    bool OpenUnderground1(const std::wstring& tracksDirectory, const std::wstring& region);
+    // Underground 1's collision, one pack per drivable section (by zone).
+    std::unordered_map<u32, CollisionPack> trackCollision_;
+    void SplitTrackCollision();
+    void NameUnderground1Scenery(LoadedSection& section) const;
     FileMap      stream_;   // STREAML4Rx.BUN
     std::vector<std::unique_ptr<FileMap>>     globalFiles_;
     std::vector<std::unique_ptr<TexturePack>> globalPacks_;

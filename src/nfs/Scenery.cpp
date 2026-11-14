@@ -25,6 +25,20 @@ constexpr size_t kInstFlags         = 0x1A;
 constexpr size_t kInstTranslation   = 0x20;
 constexpr size_t kInstRotation      = 0x2C;   // 3x3 of i16, row major
 
+// --- Underground 1 ------------------------------------------------------------
+// SceneryInfo: u32 hash[6] (one per detail level, the first the closest), i16
+// size thresholds at 0x18, eModel pointers filled at run time, radius at 0x44.
+constexpr size_t kU1InfoEntrySize  = 72;
+constexpr size_t kU1InfoRadius     = 0x44;
+// Instance: i16 bounds min[3], max[3], u16 info, u16 flags, float position[3],
+// i16 rotation[9], padding.
+constexpr size_t kU1InstanceEntrySize = 48;
+constexpr size_t kU1InstBounds        = 0x00;
+constexpr size_t kU1InstInfoIndex     = 0x0C;
+constexpr size_t kU1InstFlags         = 0x0E;
+constexpr size_t kU1InstTranslation   = 0x10;
+constexpr size_t kU1InstRotation      = 0x1C;
+
 // The rotation matrix is fixed point with 1.0 stored as 0x2000. Scale is baked
 // into it, so the rows are only unit length for instances drawn at 1:1.
 constexpr float kRotationScale = 1.0f / 8192.0f;
@@ -42,17 +56,17 @@ std::string ReadName(ByteSpan span, size_t offset, size_t capacity) {
     return std::string(text, ::strnlen(text, available));
 }
 
-Mat4 ReadTransform(ByteSpan entry) {
+Mat4 ReadTransform(ByteSpan entry, size_t rotationAt = kInstRotation, size_t translationAt = kInstTranslation) {
     Mat4 m = Mat4::Identity();
 
     for (int row = 0; row < 3; ++row) {
         for (int col = 0; col < 3; ++col) {
-            const i16 fixed = entry.read<i16>(kInstRotation + (size_t)(row * 3 + col) * 2);
+            const i16 fixed = entry.read<i16>(rotationAt + (size_t)(row * 3 + col) * 2);
             m.m[row][col] = (float)fixed * kRotationScale;
         }
     }
 
-    const Vec3 translation = ReadVec3(entry, kInstTranslation);
+    const Vec3 translation = ReadVec3(entry, translationAt);
     m.m[3][0] = translation.x;
     m.m[3][1] = translation.y;
     m.m[3][2] = translation.z;
@@ -61,7 +75,7 @@ Mat4 ReadTransform(ByteSpan entry) {
 
 } // namespace
 
-bool ParseScenery(const Chunk& sceneryChunk, Scenery& out) {
+bool ParseScenery(const Chunk& sceneryChunk, Scenery& out, bool underground1) {
     ByteSpan infoData, instanceData;
 
     ChunkReader reader = ChunkReader::Children(sceneryChunk);
@@ -81,6 +95,43 @@ bool ParseScenery(const Chunk& sceneryChunk, Scenery& out) {
     // parking building, because index 0 meant a tree in its own table and a
     // building in the one that happened to be first.
     const u32 infoBase = (u32)out.infos.size();
+
+    if (underground1) {
+        const size_t infoCount = infoData.size / kU1InfoEntrySize;
+        out.infos.reserve(out.infos.size() + infoCount);
+        for (size_t i = 0; i < infoCount; ++i) {
+            const ByteSpan entry = infoData.sub(i * kU1InfoEntrySize, kU1InfoEntrySize);
+            SceneryInfo info;
+            info.solidHash = entry.read<u32>(0);
+            info.radius    = entry.read<float>(kU1InfoRadius);
+            info.raw.assign(entry.data, entry.data + entry.size);
+            out.infos.push_back(std::move(info));
+        }
+
+        const size_t instanceCount = instanceData.size / kU1InstanceEntrySize;
+        out.instances.reserve(out.instances.size() + instanceCount);
+        for (size_t i = 0; i < instanceCount; ++i) {
+            const ByteSpan entry = instanceData.sub(i * kU1InstanceEntrySize, kU1InstanceEntrySize);
+            SceneryInstance instance;
+            instance.infoIndex = infoBase + entry.read<u16>(kU1InstInfoIndex);
+            instance.flags     = entry.read<u16>(kU1InstFlags);
+            instance.record    = (u32)i;
+            instance.transform = ReadTransform(entry, kU1InstRotation, kU1InstTranslation);
+            instance.worldBounds.min = { (float)entry.read<i16>(kU1InstBounds),
+                                         (float)entry.read<i16>(kU1InstBounds + 2),
+                                         (float)entry.read<i16>(kU1InstBounds + 4) };
+            instance.worldBounds.max = { (float)entry.read<i16>(kU1InstBounds + 6),
+                                         (float)entry.read<i16>(kU1InstBounds + 8),
+                                         (float)entry.read<i16>(kU1InstBounds + 10) };
+            // Whole units, rounded either way: a unit of margin keeps the
+            // culling from clipping what pokes past the stored box.
+            instance.worldBounds.min = instance.worldBounds.min - Vec3{ 1.0f, 1.0f, 1.0f };
+            instance.worldBounds.max = instance.worldBounds.max + Vec3{ 1.0f, 1.0f, 1.0f };
+            if (instance.infoIndex >= out.infos.size()) continue;
+            out.instances.push_back(instance);
+        }
+        return !out.instances.empty();
+    }
 
     const size_t infoCount = infoData.size / kInfoEntrySize;
     out.infos.reserve(infoCount);
