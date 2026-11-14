@@ -237,87 +237,92 @@ struct StretchTaper {
     }
 };
 
+// Where a point `x` across road `p` lands once the tapers are applied, at
+// `distance` along it: the lanes, shoulders, sidewalks and median narrowing
+// or widening to meet the road going on.
+float TaperRemap(const RoadProfile& p, const StretchTaper& taper, float distance, float x) {
+    if (!taper.Any()) return x;
+    const float lane = p.laneWidth, half = p.HalfRoad();
+    const auto open = [&](float d) {
+        const float t = std::clamp(d / std::max(1.0f, taper.length), 0.0f, 1.0f);
+        return t * t * (3.0f - 2.0f * t);
+    };
+    const float wa = open(distance), wb = open(taper.total - distance);
+    float shrink[2], region[2];
+    for (int side = 0; side < 2; ++side) {
+        shrink[side] = lane * (taper.lanes[0][side] * (1.0f - wa) + taper.lanes[1][side] * (1.0f - wb));
+        region[side] = lane * (float)std::max(taper.lanes[0][side], taper.lanes[1][side]);
+    }
+    float out = x;
+    // A sidewalk narrowing away: what is beyond it closes in on the kerb.
+    if (p.sidewalkWidth > 0.01f) {
+        for (int side = -1; side <= 1; side += 2) {
+            if (!p.Walk(side)) continue;
+            const float c = taper.WalkClosed(side, distance);
+            const float beyond = x * side - half;
+            if (c > 0.0f && beyond > 0.0f) out -= std::min(beyond, p.sidewalkWidth) * c * side;
+        }
+    }
+    const float shoulderL = p.ShoulderAt(-1), shoulderR = p.ShoulderAt(1);
+    // The shoulders narrowing away: the edges close in on the lanes.
+    if (shoulderR > 0.01f) {
+        const float c = taper.ShoulderClosed(1, distance);
+        if (c > 0.0f && x > half - shoulderR) out -= std::min(x - (half - shoulderR), shoulderR) * c;
+    }
+    if (shoulderL > 0.01f) {
+        const float c = taper.ShoulderClosed(-1, distance);
+        if (c > 0.0f && x < -half + shoulderL) out += std::min(-half + shoulderL - x, shoulderL) * c;
+    }
+    // The leftover: the outer right lane widening (or narrowing), and on
+    // each side the shoulder -- or the sidewalk where there is none -- to
+    // meet the other road.
+    {
+        const float laneMore = taper.laneStretch[0] * (1.0f - wa) + taper.laneStretch[1] * (1.0f - wb);
+        if (laneMore != 0.0f) {
+            const float edge = half - shoulderR, from = edge - lane;
+            if (x >= edge) out += laneMore;
+            else if (x > from) out += laneMore * (x - from) / std::max(0.01f, lane);
+        }
+        for (int side = -1; side <= 1; side += 2) {
+            const int k = side > 0 ? 1 : 0;
+            const float more = taper.outerStretch[0][k] * (1.0f - wa) + taper.outerStretch[1][k] * (1.0f - wb);
+            if (more == 0.0f) continue;
+            const float shoulderHere = side > 0 ? shoulderR : shoulderL;
+            const float from = shoulderHere > 0.01f ? half - shoulderHere : half;
+            const float width = shoulderHere > 0.01f ? shoulderHere : (p.Walk(side) ? p.sidewalkWidth : 0.0f);
+            const float beyond = x * side - from;
+            if (width > 0.01f && beyond > 0.0f) out += more * std::min(1.0f, beyond / width) * side;
+        }
+    }
+    // The median narrowing away: the lanes either side close in on its
+    // middle, which stays where it is.
+    if (const float median = p.MedianWidth(); median > 0.01f) {
+        const float c = taper.MedianClosed(distance);
+        if (c > 0.0f) {
+            const float m0 = p.MedianLeft(), m1 = m0 + median, mid = (m0 + m1) * 0.5f;
+            if (x >= m1) out -= median * 0.5f * c;
+            else if (x <= m0) out += median * 0.5f * c;
+            else out = mid + (x - mid) * (1.0f - c);
+        }
+    }
+    if (region[1] > 0.0f) {
+        const float from = half - shoulderR - region[1];
+        if (x >= half - shoulderR) out -= shrink[1];
+        else if (x > from) out -= shrink[1] * (x - from) / region[1];
+    }
+    if (region[0] > 0.0f) {
+        const float from = -half + shoulderL + region[0];
+        if (x <= -half + shoulderL) out += shrink[0];
+        else if (x < from) out += shrink[0] * (from - x) / region[0];
+    }
+    return out + taper.slide[0] * (1.0f - wa) + taper.slide[1] * (1.0f - wb);
+}
+
 void BuildStretch(const RoadProfile& p, const std::vector<Station>& stations, size_t first, size_t last,
                   float crossBefore, float crossAfter, float medianBefore, float medianAfter, MeshPiece& piece,
                   const StretchTaper& taper = StretchTaper{}) {
     // Where a point across the road lands once the tapers are applied.
-    const auto remap = [&](float distance, float x) {
-        if (!taper.Any()) return x;
-        const float lane = p.laneWidth, half = p.HalfRoad();
-        const auto open = [&](float d) {
-            const float t = std::clamp(d / std::max(1.0f, taper.length), 0.0f, 1.0f);
-            return t * t * (3.0f - 2.0f * t);
-        };
-        const float wa = open(distance), wb = open(taper.total - distance);
-        float shrink[2], region[2];
-        for (int side = 0; side < 2; ++side) {
-            shrink[side] = lane * (taper.lanes[0][side] * (1.0f - wa) + taper.lanes[1][side] * (1.0f - wb));
-            region[side] = lane * (float)std::max(taper.lanes[0][side], taper.lanes[1][side]);
-        }
-        float out = x;
-        // A sidewalk narrowing away: what is beyond it closes in on the kerb.
-        if (p.sidewalkWidth > 0.01f) {
-            for (int side = -1; side <= 1; side += 2) {
-                if (!p.Walk(side)) continue;
-                const float c = taper.WalkClosed(side, distance);
-                const float beyond = x * side - half;
-                if (c > 0.0f && beyond > 0.0f) out -= std::min(beyond, p.sidewalkWidth) * c * side;
-            }
-        }
-        const float shoulderL = p.ShoulderAt(-1), shoulderR = p.ShoulderAt(1);
-        // The shoulders narrowing away: the edges close in on the lanes.
-        if (shoulderR > 0.01f) {
-            const float c = taper.ShoulderClosed(1, distance);
-            if (c > 0.0f && x > half - shoulderR) out -= std::min(x - (half - shoulderR), shoulderR) * c;
-        }
-        if (shoulderL > 0.01f) {
-            const float c = taper.ShoulderClosed(-1, distance);
-            if (c > 0.0f && x < -half + shoulderL) out += std::min(-half + shoulderL - x, shoulderL) * c;
-        }
-        // The leftover: the outer right lane widening (or narrowing), and on
-        // each side the shoulder -- or the sidewalk where there is none -- to
-        // meet the other road.
-        {
-            const float laneMore = taper.laneStretch[0] * (1.0f - wa) + taper.laneStretch[1] * (1.0f - wb);
-            if (laneMore != 0.0f) {
-                const float edge = half - shoulderR, from = edge - lane;
-                if (x >= edge) out += laneMore;
-                else if (x > from) out += laneMore * (x - from) / std::max(0.01f, lane);
-            }
-            for (int side = -1; side <= 1; side += 2) {
-                const int k = side > 0 ? 1 : 0;
-                const float more = taper.outerStretch[0][k] * (1.0f - wa) + taper.outerStretch[1][k] * (1.0f - wb);
-                if (more == 0.0f) continue;
-                const float shoulderHere = side > 0 ? shoulderR : shoulderL;
-                const float from = shoulderHere > 0.01f ? half - shoulderHere : half;
-                const float width = shoulderHere > 0.01f ? shoulderHere : (p.Walk(side) ? p.sidewalkWidth : 0.0f);
-                const float beyond = x * side - from;
-                if (width > 0.01f && beyond > 0.0f) out += more * std::min(1.0f, beyond / width) * side;
-            }
-        }
-        // The median narrowing away: the lanes either side close in on its
-        // middle, which stays where it is.
-        if (const float median = p.MedianWidth(); median > 0.01f) {
-            const float c = taper.MedianClosed(distance);
-            if (c > 0.0f) {
-                const float m0 = p.MedianLeft(), m1 = m0 + median, mid = (m0 + m1) * 0.5f;
-                if (x >= m1) out -= median * 0.5f * c;
-                else if (x <= m0) out += median * 0.5f * c;
-                else out = mid + (x - mid) * (1.0f - c);
-            }
-        }
-        if (region[1] > 0.0f) {
-            const float from = half - shoulderR - region[1];
-            if (x >= half - shoulderR) out -= shrink[1];
-            else if (x > from) out -= shrink[1] * (x - from) / region[1];
-        }
-        if (region[0] > 0.0f) {
-            const float from = -half + shoulderL + region[0];
-            if (x <= -half + shoulderL) out += shrink[0];
-            else if (x < from) out += shrink[0] * (from - x) / region[0];
-        }
-        return out + taper.slide[0] * (1.0f - wa) + taper.slide[1] * (1.0f - wb);
-    };
+    const auto remap = [&](float distance, float x) { return TaperRemap(p, taper, distance, x); };
     // A bridge's deck: its underside and its two edges.
     if (p.bridge && p.deckThickness > 0.01f) {
         const u32 grey = Grey(0.5f);
@@ -912,6 +917,7 @@ float ReliefNoise(float x, float y, int seed) {
 // out -- the row it ends with at each end and side, for junction corners.
 struct SideContext {
     const RoadProfile* next[2][2] = {};          // [end][side: 0 left, 1 right]
+    const StretchTaper* taper = nullptr;         // the road's own narrowing and widening, for its real edge
     const Network::GroundQuery* ground = nullptr;
     std::vector<Vec3> ends[2][2];                // [end][side], from the road outwards
 };
@@ -1025,8 +1031,14 @@ void BuildSideTerrain(const RoadProfile& p, const std::vector<Station>& stations
                 return v;
             };
             const float width = mix([](const Source& src) { return src.section.width; });
-            const float start = mix([](const Source& src) { return src.start; });
-            const float lift = mix([](const Source& src) { return src.lift; });
+            // From the road's real edge, its tapers applied: where they meet at
+            // a node the two roads' edges are one, so the two grounds are too.
+            float start = own.start, lift = own.lift;
+            if (context.taper) {
+                const float edge = p.Edge(side);
+                start = std::fabs(TaperRemap(p, *context.taper, st.distance, edge * (float)side)) + (own.start - edge);
+                if (p.Walk(side)) lift = p.sidewalkHeight * (1.0f - context.taper->WalkLow(side, st.distance));
+            }
             const Vec3 edge = st.At(side * start, lift);
             for (size_t i = 0; i < across; ++i) {
                 const float u = (float)i / (float)(across - 1);
@@ -2817,41 +2829,6 @@ std::vector<MeshPiece> Network::BuildMesh(std::vector<Pole>* polesOut) const {
             if (!posts.walls.empty()) pieces.push_back(std::move(posts));
         }
         PlaceWallModels(s, stations, poles);
-        if (!s.profile.bridge && (s.profile.Terrain(-1) || s.profile.Terrain(1))) {
-            MeshPiece side;
-            char sideName[64];
-            std::snprintf(sideName, sizeof(sideName), "ROAD_G%u", s.id);
-            side.name = sideName;
-            side.segment = s.id;
-            SideContext context;
-            context.ground = &ground_;
-            for (int end = 0; end < 2; ++end) {
-                const u32 nodeId = end ? s.b : s.a;
-                const std::vector<u32> around = SegmentsAt(nodeId);
-                if (around.size() != 2) continue;
-                const Segment* o = FindSegment(around[0] == s.id ? around[1] : around[0]);
-                if (!o || o->profile.bridge) continue;
-                // Its sides as this road's: swapped when it runs the other way.
-                const bool sameWay = (s.a == nodeId) != (o->a == nodeId);
-                for (int si = 0; si < 2; ++si) {
-                    const int theirs = sameWay ? si : 1 - si;
-                    if (!o->profile.terrain[theirs].on) continue;
-                    // Their settings with that side put where this road has it.
-                    RoadProfile& turned = sideNeighbours[{ s.id, end * 2 + si }];
-                    turned = o->profile;
-                    if (!sameWay) {
-                        std::swap(turned.terrain[0], turned.terrain[1]);
-                        std::swap(turned.wallLeft, turned.wallRight);
-                        std::swap(turned.sidewalkLeft, turned.sidewalkRight);
-                    }
-                    context.next[end][si] = &turned;
-                }
-            }
-            BuildSideTerrain(s.profile, stations, groundTexture_, rockTexture_, rockMixTexture_, context, side);
-            for (int end = 0; end < 2; ++end)
-                for (int si = 0; si < 2; ++si) sideEnds[{ s.id, end * 2 + si }] = context.ends[end][si];
-            if (side.VertexCount()) pieces.push_back(std::move(side));
-        }
         if (s.profile.bridge) {
             MeshPiece pillars;
             char pillarName[64];
@@ -3089,6 +3066,42 @@ std::vector<MeshPiece> Network::BuildMesh(std::vector<Pole>* polesOut) const {
         wallSkips[s.id] = { taper.wallSkip[0][0], taper.wallSkip[0][1], taper.wallSkip[1][0], taper.wallSkip[1][1] };
         const int count = std::max(1, (int)std::ceil(total / kPieceLength));
         size_t first = 0;
+        if (!s.profile.bridge && (s.profile.Terrain(-1) || s.profile.Terrain(1))) {
+            MeshPiece side;
+            char sideName[64];
+            std::snprintf(sideName, sizeof(sideName), "ROAD_G%u", s.id);
+            side.name = sideName;
+            side.segment = s.id;
+            SideContext context;
+            context.ground = &ground_;
+            context.taper = &taper;
+            for (int end = 0; end < 2; ++end) {
+                const u32 nodeId = end ? s.b : s.a;
+                const std::vector<u32> around = SegmentsAt(nodeId);
+                if (around.size() != 2) continue;
+                const Segment* o = FindSegment(around[0] == s.id ? around[1] : around[0]);
+                if (!o || o->profile.bridge) continue;
+                // Its sides as this road's: swapped when it runs the other way.
+                const bool sameWay = (s.a == nodeId) != (o->a == nodeId);
+                for (int si = 0; si < 2; ++si) {
+                    const int theirs = sameWay ? si : 1 - si;
+                    if (!o->profile.terrain[theirs].on) continue;
+                    // Their settings with that side put where this road has it.
+                    RoadProfile& turned = sideNeighbours[{ s.id, end * 2 + si }];
+                    turned = o->profile;
+                    if (!sameWay) {
+                        std::swap(turned.terrain[0], turned.terrain[1]);
+                        std::swap(turned.wallLeft, turned.wallRight);
+                        std::swap(turned.sidewalkLeft, turned.sidewalkRight);
+                    }
+                    context.next[end][si] = &turned;
+                }
+            }
+            BuildSideTerrain(s.profile, stations, groundTexture_, rockTexture_, rockMixTexture_, context, side);
+            for (int end = 0; end < 2; ++end)
+                for (int si = 0; si < 2; ++si) sideEnds[{ s.id, end * 2 + si }] = context.ends[end][si];
+            if (side.VertexCount()) pieces.push_back(std::move(side));
+        }
         for (int k = 0; k < count; ++k) {
             const float until = total * (float)(k + 1) / count;
             size_t last = first;

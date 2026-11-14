@@ -590,6 +590,9 @@ public:
     const std::vector<BuildingModel>& BuildingModels() const { return buildings_; }
     // The texture of ground beside roads that do not name one: the region's grass.
     void SetGroundTexture(const std::string& texture) { groundTexture_ = texture; SetDirty(); }
+    const std::string& GroundTexture() const { return groundTexture_; }
+    const std::string& RockTexture() const { return rockTexture_; }
+    const std::string& RockMixTexture() const { return rockMixTexture_; }
     // The region's rock for steep ground, and its grass-into-rock texture
     // between the two (empty: none, grass straight into rock).
     void SetRockTextures(const std::string& rock, const std::string& mix) {

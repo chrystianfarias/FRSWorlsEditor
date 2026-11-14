@@ -81,6 +81,7 @@ add_executable(FRSWorldEditor WIN32
     src/ui/RoadsExtension.cpp
     src/roads/RoadNetwork.cpp
     src/roads/CityZones.cpp
+    src/roads/Prefabs.cpp
     src/roads/RoadBake.cpp
     src/roads/RoadRoutes.cpp
     src/nfs/Routes.cpp

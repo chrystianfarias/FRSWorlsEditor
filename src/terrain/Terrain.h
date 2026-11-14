@@ -40,6 +40,13 @@ struct Patch {
     float shoulder = 12.0f;          // from a road's edge to the sculpted height
     float sink = 0.15f;              // how far under the road surface the ground sits
     u32   ambient = 0x383C42;        // RRGGBB, the night light, as on the roads
+    // Rock on the steep ground, as beside the roads: cells painted with the
+    // first layer turn to `rockTexture` from about `rockAngle` degrees of
+    // slope, through `mixTexture` (a grass-into-rock strip), cut along smooth
+    // ragged lines -- so sculpting a hill brings its rock out by itself.
+    bool  autoRock = false;
+    float rockAngle = 32.0f;
+    std::string rockTexture, mixTexture;
 
     float& H(int i, int j) { return heights[(size_t)j * (columns + 1) + i]; }
     float  H(int i, int j) const { return heights[(size_t)j * (columns + 1) + i]; }

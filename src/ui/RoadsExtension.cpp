@@ -20,6 +20,7 @@
 #include "render/RenderExtension.h"
 #include "roads/RoadBake.h"
 #include "roads/RoadNetwork.h"
+#include "roads/Prefabs.h"
 #include "roads/RoadRoutes.h"
 #include "terrain/GroundDeform.h"
 #include "terrain/Terrain.h"
@@ -136,6 +137,8 @@ constexpr int ID_ROAD_EXTRUDE_RIGHT = ID_ROADS_FIRST + 52;
 constexpr int ID_ROAD_TRIM_LEFT     = ID_ROADS_FIRST + 53;   // the outermost band taken off
 constexpr int ID_ROAD_TRIM_RIGHT    = ID_ROADS_FIRST + 54;
 constexpr int ID_ROAD_FILL          = ID_ROADS_FIRST + 55;   // ground between roads that close an area
+constexpr int ID_ROAD_GROUND_PATCH  = ID_ROADS_FIRST + 59;   // the ground beside roads made sculptable terrain
+constexpr int ID_TERRAIN_TOOL       = ID_ROADS_FIRST + 60;   // the terrain tool: brushes, extrude, cut
 constexpr int ID_ROAD_LIGHTS        = ID_ROADS_FIRST + 56;   // the light placing tool
 constexpr int ID_ROAD_TREES         = ID_ROADS_FIRST + 57;   // the tree brush
 constexpr int ID_ROAD_PROPS         = ID_ROADS_FIRST + 58;   // the prop tool
@@ -518,6 +521,7 @@ public:
 
     static constexpr const wchar_t* kLightsShelf = L"Lights";
     static constexpr const wchar_t* kPropsShelf = L"Props with physics";
+    static constexpr const wchar_t* kPrefabsShelf = L"Road prefabs";
 
     void CatalogRows(std::vector<ModelCatalog::Row>& rows) override {
         const auto add = [&](const std::string& key, const std::wstring& name, const std::wstring& shelf,
@@ -552,6 +556,65 @@ public:
             add("light:" + Narrow(name), name, kLightsShelf, found->second);
         }
         add("light:", L"Light (no post)", kLightsShelf, any);
+        // Road prefabs, each with a picture of itself from above.
+        for (const roads::PrefabInfo& prefab : roads::Prefabs()) {
+            ModelCatalog::Row row;
+            row.name = prefab.name;
+            row.group = kPrefabsShelf;
+            row.owner = static_cast<EditorExtension*>(this);
+            row.key = "prefab:" + prefab.key;
+            const std::string key = prefab.key;
+            row.picture = [this, key](std::vector<u32>& bgra) {
+                return roads::DrawPrefabPicture(key, lastProfile_, (int)ModelThumbnails::kSize, bgra);
+            };
+            rows.push_back(std::move(row));
+        }
+    }
+
+    // ---- road prefabs
+    //
+    // Laid down whole from the Library: turned with the camera (in steps of
+    // 15 degrees, so it lines up with a street seen square on), its open ends
+    // joining roads that end close by. While dragged it is laid again at
+    // every step, without joining; let go, it is laid for good.
+
+    float PrefabHeading() const {
+        const float yaw = Degrees(app_.View().GetCamera().Yaw());
+        return std::round(yaw / 15.0f) * 15.0f;
+    }
+
+    roads::PrefabGround PrefabGroundQuery() const {
+        return [this](float x, float y, float fallback) { return GroundOr(x, y, fallback); };
+    }
+
+    // Lays a prefab; its first node's id (0 when nothing was laid).
+    u32 LayPrefab(const std::string& key, const Vec3& at, bool join) {
+        roads::PrefabResult result;
+        if (!roads::PlacePrefab(network_, key, at, PrefabHeading(), lastProfile_, PrefabGroundQuery(), result,
+                                join ? 6.0f : 0.0f))
+            return 0;
+        prefabNodes_ = result.nodes;
+        prefabJoined_ = result.joined;
+        for (u32 id : result.nodes)
+            if (network_.FindNode(id)) return id;
+        return 0;
+    }
+
+    void TakeUpPrefab() {
+        for (u32 id : prefabNodes_)
+            if (network_.FindNode(id)) network_.RemoveNode(id);
+        prefabNodes_.clear();
+        network_.SetDirty();
+    }
+
+    void PrefabPlaced(const std::string& key, u32 first) {
+        Changed(true);
+        if (first) Select((int)first);
+        const roads::PrefabInfo* info = roads::FindPrefab(key);
+        app_.Status(Fmt(L"%s laid: %zu nodes%s -- every road and node of it can be edited now",
+                        info ? info->name.c_str() : L"Prefab", prefabNodes_.size(),
+                        prefabJoined_ ? Fmt(L", %zu ends joined to roads already there", prefabJoined_).c_str() : L""));
+        prefabNodes_.clear();
     }
 
     // The object a row stands for, made at `at`; its id.
@@ -576,6 +639,11 @@ public:
         Vec3 at;
         if (!app_.World() || !app_.ViewCentre(at)) return;
         visible_ = true;
+        if (row.key.rfind("prefab:", 0) == 0) {
+            const std::string key = row.key.substr(7);
+            PrefabPlaced(key, LayPrefab(key, at, true));
+            return;
+        }
         if (const u32 id = MakeFromRow(row.key, at)) {
             Changed(true);
             Select((int)id);
@@ -583,6 +651,13 @@ public:
     }
 
     bool DescribeRow(const ModelCatalog::Row& row, std::wstring& text) override {
+        if (row.key.rfind("prefab:", 0) == 0) {
+            const roads::PrefabInfo* info = roads::FindPrefab(row.key.substr(7));
+            text = (info ? info->name + L": " + info->description : row.name) +
+                   L" Drag it onto the map or double-click for the view centre; it faces the way the camera "
+                   L"looks, and its ends join roads ending close by.";
+            return true;
+        }
         if (row.key.rfind("prop:", 0) == 0)
             text = L"A prop with the game's physics (" + row.name + L"): knocked about when hit. Drag it onto the "
                    L"map or double-click for the view centre.";
@@ -593,14 +668,25 @@ public:
     }
 
     bool BeginDrag(const ModelCatalog::Row& row) override {
-        if (row.key.rfind("prop:", 0) != 0 && row.key.rfind("light:", 0) != 0) return false;
+        if (row.key.rfind("prop:", 0) != 0 && row.key.rfind("light:", 0) != 0 &&
+            row.key.rfind("prefab:", 0) != 0)
+            return false;
         dragKey_ = row.key;
         dragObject_ = 0;
+        prefabNodes_.clear();
         return true;
     }
 
     void UpdateDrag(const Vec3& ground) override {
         visible_ = true;
+        if (dragKey_.rfind("prefab:", 0) == 0) {
+            // Laid again only once it has moved a little: a prefab is many roads.
+            if (!prefabNodes_.empty() && FlatDistance(ground, prefabDragAt_) < 1.0f) return;
+            TakeUpPrefab();
+            prefabDragAt_ = ground;
+            dragObject_ = LayPrefab(dragKey_.substr(7), ground, false);
+            return;
+        }
         if (!dragObject_) dragObject_ = MakeFromRow(dragKey_, ground);
         if (roads::Prop* prop = network_.FindProp(dragObject_)) prop->position = ground;
         if (roads::Light* light = network_.FindLight(dragObject_)) light->position = ground;
@@ -611,7 +697,18 @@ public:
     void EndDrag(const Vec3* ground) override {
         const u32 id = dragObject_;
         dragObject_ = 0;
+        const std::string key = dragKey_;
         dragKey_.clear();
+        if (key.rfind("prefab:", 0) == 0) {
+            TakeUpPrefab();
+            if (!ground) {
+                app_.Renderer().ClearSelection();
+                app_.Status(L"Placement cancelled");
+                return;
+            }
+            PrefabPlaced(key.substr(7), LayPrefab(key.substr(7), *ground, true));
+            return;
+        }
         if (!id) return;
         if (!ground) {
             network_.RemoveProps([id](const roads::Prop& p) { return p.id == id; });
@@ -694,6 +791,10 @@ public:
             case ID_ROAD_GRID:         if (gridTool_) CloseGridTool(); else StartGridTool(); return true;
             case ID_ROAD_EXTRUDE_LEFT:  ExtrudeTerrain(0, true); return true;
             case ID_ROAD_FILL:          ToggleFill(); return true;
+            case ID_ROAD_GROUND_PATCH:  TerrainFromRoadGround(); return true;
+            case ID_TERRAIN_TOOL:
+                SetBrush(brush_ == terrain::Brush::None ? terrain::Brush::Raise : terrain::Brush::None);
+                return true;
             case ID_ROAD_LIGHTS:        if (lightTool_) CloseLightTool(); else StartLightTool(); return true;
             case ID_ROAD_TREES:         if (treeTool_) CloseTreeTool(); else StartTreeTool(); return true;
             case ID_ROAD_PROPS:         if (propTool_) ClosePropTool(); else StartPropTool(); return true;
@@ -1138,8 +1239,16 @@ public:
         Vec3 point;
         if (AreaBrush(brush_)) {
             if (AnythingUnder(cursorX_, cursorY_, point)) brushPoint_ = point;
+            // New ground carries on from the patch's own edge -- an extrusion --
+            // rather than dropping to whatever is under it.
             terrain_.Apply(*patch, brush_, brushPoint_, brushRadius_, 0.0f, 0.0f, paintLayer_,
-                           [this, z = brushPoint_.z](float x, float y) { return NewGroundHeight(x, y, z); });
+                           [patch](float x, float y) {
+                               const int i = std::clamp((int)std::lround((x - patch->origin.x) / patch->cell), 0,
+                                                        patch->columns);
+                               const int j = std::clamp((int)std::lround((y - patch->origin.y) / patch->cell), 0,
+                                                        patch->rows);
+                               return patch->H(i, j);
+                           });
             dirtyPatch_ = patch->id;
             return;
         }
@@ -4568,6 +4677,242 @@ private:
         ImGui::PopStyleVar(2);
     }
 
+    // The ground beside the selected roads as a terrain patch: the same
+    // heights, sampled from the generated ground, with 40 m more round its
+    // edge (past the roads' ends too) carrying on from it; steep cells
+    // painted with the rock. The roads' own ground beside them goes, the
+    // patch takes its place -- and from then on the Terrain brushes sculpt,
+    // paint and grow it.
+    void TerrainFromRoadGround() {
+        const std::vector<u32> ids = SelectedRoadIds();
+        std::set<u32> chosen, nodes;
+        for (u32 id : ids)
+            if (const roads::Segment* s = network_.FindSegment(id); s && (s->profile.terrain[0].on || s->profile.terrain[1].on)) {
+                chosen.insert(id);
+                nodes.insert(s->a);
+                nodes.insert(s->b);
+            }
+        if (chosen.empty()) {
+            app_.Status(L"Select a road with ground beside it (Terrain beside: left or right) first");
+            return;
+        }
+        // The generated ground of those roads, and of the junction corners between them.
+        struct Tri { Vec3 a, b, c; };
+        std::vector<Tri> tris;
+        Aabb box;
+        for (const roads::MeshPiece& piece : network_.BuildMesh()) {
+            bool take = false;
+            if (piece.name.rfind("ROAD_GJ", 0) == 0) take = nodes.count(piece.node) != 0;
+            else if (piece.name.rfind("ROAD_G", 0) == 0) take = chosen.count(piece.segment) != 0;
+            if (!take) continue;
+            for (const roads::MeshGroup& g : piece.groups)
+                for (size_t k = 0; k + 2 < g.indices.size(); k += 3) {
+                    const Tri t{ g.vertices[g.indices[k]].position, g.vertices[g.indices[k + 1]].position,
+                                 g.vertices[g.indices[k + 2]].position };
+                    tris.push_back(t);
+                    box.Add(t.a); box.Add(t.b); box.Add(t.c);
+                }
+        }
+        if (tris.empty()) {
+            app_.Status(L"Those roads have no ground beside them to turn into terrain");
+            return;
+        }
+        constexpr float kCell = 2.5f, kMargin = 40.0f;
+        const Vec2 origin{ std::floor((box.min.x - kMargin) / kCell) * kCell,
+                           std::floor((box.min.y - kMargin) / kCell) * kCell };
+        const int columns = std::min(1000, (int)std::ceil((box.max.x + kMargin - origin.x) / kCell));
+        const int rows = std::min(1000, (int)std::ceil((box.max.y + kMargin - origin.y) / kCell));
+        const auto at = [columns](int i, int j) { return (size_t)j * (columns + 1) + i; };
+        std::vector<float> height((size_t)(columns + 1) * (rows + 1), 0.0f);
+        std::vector<int> rank(height.size(), -1);     // corner steps from the sampled ground; -1 not yet
+        // Triangles in 10 m buckets, for the downward rays.
+        constexpr float kBucket = 10.0f;
+        const int bx = (int)std::ceil(columns * kCell / kBucket) + 1, by = (int)std::ceil(rows * kCell / kBucket) + 1;
+        std::vector<std::vector<size_t>> buckets((size_t)bx * by);
+        for (size_t t = 0; t < tris.size(); ++t) {
+            const Tri& tr = tris[t];
+            const float x0 = std::min({ tr.a.x, tr.b.x, tr.c.x }), x1 = std::max({ tr.a.x, tr.b.x, tr.c.x });
+            const float y0 = std::min({ tr.a.y, tr.b.y, tr.c.y }), y1 = std::max({ tr.a.y, tr.b.y, tr.c.y });
+            for (int v = std::max(0, (int)((y0 - origin.y) / kBucket)); v <= std::min(by - 1, (int)((y1 - origin.y) / kBucket)); ++v)
+                for (int u = std::max(0, (int)((x0 - origin.x) / kBucket)); u <= std::min(bx - 1, (int)((x1 - origin.x) / kBucket)); ++u)
+                    buckets[(size_t)v * bx + u].push_back(t);
+        }
+        for (int j = 0; j <= rows; ++j)
+            for (int i = 0; i <= columns; ++i) {
+                const float x = origin.x + i * kCell, y = origin.y + j * kCell;
+                const int u = std::min(bx - 1, (int)((x - origin.x) / kBucket)), v = std::min(by - 1, (int)((y - origin.y) / kBucket));
+                const Ray down{ { x, y, box.max.z + 50.0f }, { 0.0f, 0.0f, -1.0f } };
+                float best = -1.0f;
+                for (size_t t : buckets[(size_t)v * bx + u]) {
+                    const float d = IntersectRayTriangle(down, tris[t].a, tris[t].b, tris[t].c);
+                    if (d >= 0.0f && (best < 0.0f || d < best)) best = d;
+                }
+                if (best >= 0.0f) {
+                    height[at(i, j)] = box.max.z + 50.0f - best;
+                    rank[at(i, j)] = 0;
+                }
+            }
+        // Carried on outwards, ring by ring: each new corner the mean of its
+        // neighbours already known -- the ground goes on as it was going.
+        for (int step = 1; step <= (int)(kMargin / kCell) + 2; ++step) {
+            std::vector<std::pair<size_t, float>> found;
+            for (int j = 0; j <= rows; ++j)
+                for (int i = 0; i <= columns; ++i) {
+                    if (rank[at(i, j)] >= 0) continue;
+                    float sum = 0.0f;
+                    int count = 0;
+                    for (int dj = -1; dj <= 1; ++dj)
+                        for (int di = -1; di <= 1; ++di) {
+                            const int ni = i + di, nj = j + dj;
+                            if ((di || dj) && ni >= 0 && nj >= 0 && ni <= columns && nj <= rows && rank[at(ni, nj)] >= 0 &&
+                                rank[at(ni, nj)] < step) {
+                                sum += height[at(ni, nj)];
+                                ++count;
+                            }
+                        }
+                    if (count) found.push_back({ at(i, j), sum / count });
+                }
+            if (found.empty()) break;
+            for (const auto& [index, h] : found) {
+                height[index] = h;
+                rank[index] = step;
+            }
+        }
+        for (size_t k = 0; k < height.size(); ++k)
+            if (rank[k] < 0) height[k] = box.min.z;
+        // Cells within the margin of the sampled ground, but not under the roads.
+        const int reach = (int)(kMargin / kCell);
+        const auto keep = [&](float x, float y) {
+            const int i = (int)std::floor((x - origin.x) / kCell), j = (int)std::floor((y - origin.y) / kCell);
+            if (i < 0 || j < 0 || i >= columns || j >= rows) return false;
+            int nearest = 1 << 20;
+            for (int dj = 0; dj <= 1; ++dj)
+                for (int di = 0; di <= 1; ++di)
+                    if (const int r = rank[at(i + di, j + dj)]; r >= 0) nearest = std::min(nearest, r);
+            // Under the roads too: the patch sinks under them by itself, and
+            // leaving them out left a ragged gap along the edge.
+            return nearest <= reach;
+        };
+        const u32 id = terrain_.AddWhere(origin, { origin.x + columns * kCell, origin.y + rows * kCell }, kCell, keep,
+                                         [&](float x, float y) {
+                                             const int i = std::clamp((int)std::lround((x - origin.x) / kCell), 0, columns);
+                                             const int j = std::clamp((int)std::lround((y - origin.y) / kCell), 0, rows);
+                                             return height[at(i, j)];
+                                         });
+        terrain::Patch* patch = terrain_.Find(id);
+        if (!patch) {
+            app_.Status(L"No terrain could be made there");
+            return;
+        }
+        // Grass, with the rock coming out on the steep ground the way it did
+        // beside the road (the second layer is there to paint by hand).
+        patch->layers.resize(2);
+        patch->layers[0].texture = network_.GroundTexture();
+        patch->layers[0].tile = 24.0f;
+        patch->layers[0].surface = 0x0F;
+        patch->layers[1].texture = network_.RockTexture().empty() ? network_.GroundTexture() : network_.RockTexture();
+        patch->layers[1].tile = 14.0f;
+        patch->layers[1].surface = 0x0F;
+        patch->autoRock = true;
+        patch->rockAngle = 32.0f;
+        patch->rockTexture = network_.RockTexture();
+        patch->mixTexture = network_.RockMixTexture();
+        patch->conform = true;
+        patch->shoulder = 3.0f;          // it already meets the road's edge
+        patch->sink = 0.15f;
+        for (u32 roadId : chosen)
+            if (roads::Segment* s = network_.FindSegment(roadId)) s->profile.terrain[0].on = s->profile.terrain[1].on = false;
+        terrainBuilt_ = 0;
+        terrainBatches_.clear();
+        SaveTerrain();
+        Changed(true);
+        Select(kTerrainBit | (int)id);
+        app_.Status(Fmt(L"The ground beside %zu road(s) is terrain patch %u now: Terrain > Raise / Lower / Smooth / "
+                        L"Flatten sculpt it, Paint Texture paints it, Add Area grows it on from its edge",
+                        chosen.size(), id));
+    }
+
+    // The terrain tool's panel: the brushes by what they do, their size and
+    // strength, and the selected patch's own settings.
+    void TerrainToolHud(float x, float y, float width) {
+        ImGui::SetNextWindowPos(ImVec2(x + width * 0.5f, y + 52.0f), ImGuiCond_Always, ImVec2(0.5f, 0.0f));
+        ImGui::SetNextWindowBgAlpha(0.9f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12.0f, 10.0f));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 8.0f);
+        if (ImGui::Begin("##terraintool", nullptr, HudFlags())) {
+            const ImVec4 accent = ImGui::GetStyleColorVec4(ImGuiCol_CheckMark);
+            terrain::Patch* patch = SelectedPatchMutable();
+            ImGui::TextColored(accent, "Terrain");
+            ImGui::SameLine();
+            if (patch) ImGui::TextDisabled("patch %u, %d x %d cells of %.1f m", patch->id, patch->columns, patch->rows, patch->cell);
+            else ImGui::TextDisabled("click a terrain patch to work on it (the game's ground: raise, lower, smooth, flatten)");
+            ImGui::Separator();
+            struct Choice { terrain::Brush brush; const char* label; const char* help; };
+            static const Choice choices[] = {
+                { terrain::Brush::Raise, "Raise", "Lifts the ground under the brush." },
+                { terrain::Brush::Lower, "Lower", "Sinks the ground under the brush." },
+                { terrain::Brush::Smooth, "Smooth", "Evens out bumps and edges." },
+                { terrain::Brush::Flatten, "Flatten", "Levels to the height where the stroke began." },
+                { terrain::Brush::Paint, "Paint", "Paints the chosen layer's texture." },
+                { terrain::Brush::AddArea, "Extrude", "Grows the patch where the brush goes, carrying on from its edge." },
+                { terrain::Brush::EraseArea, "Cut", "Cuts the patch away where the brush goes." },
+            };
+            for (size_t k = 0; k < std::size(choices); ++k) {
+                if (k) ImGui::SameLine();
+                const bool on = brush_ == choices[k].brush;
+                if (on) ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
+                if (ImGui::Button(choices[k].label)) SetBrush(choices[k].brush);
+                if (on) ImGui::PopStyleColor();
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", choices[k].help);
+            }
+            ImGui::PushItemWidth(120.0f);
+            ImGui::DragFloat("Size ([ ])", &brushRadius_, 0.25f, 1.0f, 400.0f, "%.0f m");
+            ImGui::SameLine();
+            ImGui::DragFloat("Strength", &brushStrength_, 0.1f, 0.05f, 200.0f, "%.1f");
+            if (patch && brush_ == terrain::Brush::Paint) {
+                ImGui::SameLine();
+                int layer = paintLayer_;
+                std::string names;
+                for (size_t l = 0; l < patch->layers.size(); ++l) {
+                    names += std::to_string(l + 1) + "  " + patch->layers[l].texture;
+                    names.push_back('\0');
+                }
+                if (ImGui::Combo("Layer", &layer, names.c_str())) paintLayer_ = (u8)layer;
+            }
+            ImGui::PopItemWidth();
+            if (patch) {
+                bool rock = patch->autoRock;
+                if (ImGui::Checkbox("Rock on steep ground", &rock)) {
+                    patch->autoRock = rock;
+                    if (rock && patch->rockTexture.empty()) {
+                        patch->rockTexture = network_.RockTexture();
+                        patch->mixTexture = network_.RockMixTexture();
+                    }
+                    terrain_.Touch();
+                    terrainBuilt_ = 0;
+                    SaveTerrain();
+                    Commit(L"terrain rock");
+                }
+                if (patch->autoRock) {
+                    ImGui::SameLine();
+                    ImGui::SetNextItemWidth(110.0f);
+                    if (ImGui::DragFloat("from##rockangle", &patch->rockAngle, 0.5f, 5.0f, 85.0f, "%.0f deg")) {
+                        terrain_.Touch();
+                        terrainBuilt_ = 0;
+                    }
+                    if (ImGui::IsItemDeactivatedAfterEdit()) {
+                        SaveTerrain();
+                        Commit(L"terrain rock angle");
+                    }
+                }
+            }
+            ImGui::TextDisabled("Hold the left button to work; Esc puts the brush away.");
+            if (ImGui::Button("Close the tool  (Esc)")) SetBrush(terrain::Brush::None);
+        }
+        ImGui::End();
+        ImGui::PopStyleVar(2);
+    }
+
     // Another band of ground beside the selected roads, or the outermost one off.
     void ExtrudeTerrain(int side, bool add) {
         std::vector<u32> ids = SelectedRoadIds();
@@ -4653,6 +4998,10 @@ private:
         (void)height;
         if (lightTool_ && wizard_ == kWizardOff) {
             LightToolHud(x, y, width);
+            return;
+        }
+        if (brush_ != terrain::Brush::None && wizard_ == kWizardOff && !drawTool_ && !gridTool_ && !treeTool_) {
+            TerrainToolHud(x, y, width);
             return;
         }
         if (treeTool_ && wizard_ == kWizardOff) {
@@ -6054,6 +6403,7 @@ private:
     // scale: they are tools of the same kind, and only one is on at a time.
     static constexpr struct { int id; const wchar_t* text; } kToolButtons[] = {
         { ID_ROAD_DRAW, L"Roads" }, { ID_ROAD_GRID, L"Grid" }, { ID_ROAD_TREES, L"Trees" },
+        { ID_TERRAIN_TOOL, L"Terrain" },
     };
 
     void AddToolbarButton() {
@@ -6080,7 +6430,7 @@ private:
     void SyncToolbar() const {
         HWND toolbar = app_.Toolbar();
         if (!toolbar) return;
-        const bool on[] = { drawTool_, gridTool_, treeTool_ };
+        const bool on[] = { drawTool_, gridTool_, treeTool_, brush_ != terrain::Brush::None };
         for (size_t k = 0; k < std::size(kToolButtons); ++k)
             ::SendMessageW(toolbar, TB_CHECKBUTTON, kToolButtons[k].id, MAKELPARAM(on[k] ? 1 : 0, 0));
     }
@@ -6098,6 +6448,7 @@ private:
         ::AppendMenuW(toolsMenu, MF_STRING, ID_ROAD_DRAW, L"&Roads (draw, curve, upgrade, bulldoze)\tCtrl+Shift+D");
         ::AppendMenuW(toolsMenu, MF_STRING, ID_ROAD_GRID, L"Street &Grid with Zoned Blocks\tCtrl+Shift+U");
         ::AppendMenuW(toolsMenu, MF_STRING, ID_ROAD_TREES, L"&Tree Brush\tCtrl+Shift+A");
+        ::AppendMenuW(toolsMenu, MF_STRING, ID_TERRAIN_TOOL, L"T&errain (sculpt, paint, extrude, cut)");
         ::AppendMenuW(toolsMenu, MF_SEPARATOR, 0, nullptr);
         ::AppendMenuW(toolsMenu, MF_STRING, ID_ROAD_FACE_JUNCTION, L"&Junction into a Game Road...\tCtrl+Shift+J");
         ::AppendMenuW(toolsMenu, MF_STRING, ID_TERRAIN_OUTLINE, L"Draw a Terrain &Area...\tCtrl+Shift+T");
@@ -6125,6 +6476,8 @@ private:
         HMENU terrainMenu = ::CreatePopupMenu();
         ::AppendMenuW(terrainMenu, MF_STRING, ID_TERRAIN_OUTLINE, L"&Draw a Terrain Area...\tCtrl+Shift+T");
         ::AppendMenuW(terrainMenu, MF_STRING, ID_TERRAIN_ALONG, L"Terrain &Along the Selected Road");
+        ::AppendMenuW(terrainMenu, MF_STRING, ID_ROAD_GROUND_PATCH,
+                      L"&Make the Ground Beside the Selected Roads Sculptable");
         ::AppendMenuW(terrainMenu, MF_STRING, ID_TERRAIN_NEW, L"Square Patch at View &Centre");
         ::AppendMenuW(terrainMenu, MF_SEPARATOR, 0, nullptr);
         ::AppendMenuW(terrainMenu, MF_STRING, ID_TERRAIN_BRUSH + (int)terrain::Brush::None, L"Brush &Off\tEsc");
@@ -6220,6 +6573,9 @@ private:
     // The light tool, the settings of the next light, and the game's models lit.
     bool  lightTool_ = false;
     std::string dragKey_;              // a Library row being dragged onto the map
+    std::vector<u32> prefabNodes_;     // the nodes of the prefab being laid
+    size_t prefabJoined_ = 0;
+    Vec3  prefabDragAt_;
     u32   dragObject_ = 0;
     // The tree brush and the prop tool.
     bool  treeTool_ = false, propTool_ = false;
@@ -6596,6 +6952,11 @@ void RoadsExtension::FillRoad(PropertiesPanel::View& view, const roads::Segment&
     if (p.zoneLeft || p.zoneRight)
         view.actions.push_back({ L"New buildings", ID_ROAD_ZONE_RESEED, L"Zoning",
                                  L"Other buildings along this road (or every selected one): the next variation." });
+    if (p.terrain[0].on || p.terrain[1].on)
+        view.actions.push_back({ L"Make sculptable", ID_ROAD_GROUND_PATCH, L"Terrain beside",
+                                 L"Turns the ground beside this road (or every selected one) into terrain you can "
+                                 L"sculpt, paint and grow with the Terrain brushes -- 40 m more of it round the edge, "
+                                 L"past the road's ends too." });
     view.actions.push_back({ L"Extrude left", ID_ROAD_EXTRUDE_LEFT, L"Terrain beside",
                              L"Another band of ground beyond the last one on the left (turns it on)." });
     view.actions.push_back({ L"Extrude right", ID_ROAD_EXTRUDE_RIGHT, L"Terrain beside",
@@ -7221,7 +7582,7 @@ void RoadsExtension::DrawOverlay(IDirect3DDevice9* device, const Camera& camera,
     if (wizard_ != kWizardOff) DrawWizard(device, renderer);
     if (!visible_ || (network_.Nodes().empty() && network_.Lights().empty() && brush_ == terrain::Brush::None &&
                       network_.Props().empty() && !drawing_ && !drawTool_ && !gridTool_ && !lightTool_ &&
-                      !treeTool_ && !propTool_))
+                      !treeTool_ && !propTool_ && !SelectedPatch()))
         return;
     struct Vertex { float x, y, z; D3DCOLOR colour; };
     std::vector<Vertex> solid, lines;
@@ -7386,6 +7747,24 @@ void RoadsExtension::DrawOverlay(IDirect3DDevice9* device, const Camera& camera,
     }
 
     DrawGridPreview(line);
+
+    // The selected terrain patch: its outline, along the edges of its cells.
+    if (const terrain::Patch* patch = SelectedPatch()) {
+        const auto filled = [&](int i, int j) {
+            return i >= 0 && j >= 0 && i < patch->columns && j < patch->rows &&
+                   patch->paint[(size_t)j * patch->columns + i] != terrain::kEmpty;
+        };
+        const Vec3 lift{ 0.0f, 0.0f, 0.35f };
+        const D3DCOLOR colour = 0xFF40E0FF;
+        for (int j = 0; j <= patch->rows; ++j)
+            for (int i = 0; i <= patch->columns; ++i) {
+                // The edge below corner (i, j) along x, and the one along y.
+                if (i < patch->columns && filled(i, j) != filled(i, j - 1))
+                    line(patch->Corner(i, j) + lift, patch->Corner(i + 1, j) + lift, colour);
+                if (j < patch->rows && filled(i, j) != filled(i - 1, j))
+                    line(patch->Corner(i, j) + lift, patch->Corner(i, j + 1) + lift, colour);
+            }
+    }
 
     // The tree brush where it would paint.
     if (treeTool_ && treeBrushHit_) {

@@ -13,6 +13,26 @@ namespace terrain {
 
 namespace {
 
+// Smooth random height in [-1, 1], the same as the ground beside the roads
+// uses (roads/RoadNetwork.cpp), so a patch made of it keeps its rock edge.
+float RockNoise(float x, float y, int seed) {
+    const auto lattice = [seed](int i, int j) {
+        u32 h = (u32)i * 73856093u ^ (u32)j * 19349663u ^ (u32)seed * 83492791u;
+        h ^= h >> 13; h *= 0x5BD1E995u; h ^= h >> 15;
+        return (float)(h & 0xFFFF) / 32767.5f - 1.0f;
+    };
+    const auto octave = [&](float px, float py) {
+        const float fx = std::floor(px), fy = std::floor(py);
+        const int i = (int)fx, j = (int)fy;
+        float u = px - fx, v = py - fy;
+        u = u * u * (3.0f - 2.0f * u);
+        v = v * v * (3.0f - 2.0f * v);
+        const float a = lattice(i, j), b = lattice(i + 1, j), c = lattice(i, j + 1), d = lattice(i + 1, j + 1);
+        return (a * (1 - u) + b * u) * (1 - v) + (c * (1 - u) + d * u) * v;
+    };
+    return octave(x / 18.0f, y / 18.0f) * 0.7f + octave(x / 6.0f + 31.7f, y / 6.0f - 12.3f) * 0.3f;
+}
+
 constexpr int kChunk = 16;     // cells a side in one baked piece
 
 float Smoothstep(float t) {
@@ -268,42 +288,123 @@ std::vector<roads::MeshPiece> Terrain::BuildMesh(const Patch& patch, const roads
         return Normalize(Vec3{ (l - r) / (2.0f * patch.cell), (d - u) / (2.0f * patch.cell), 1.0f });
     };
 
+    // Rock on the steep ground (Patch::autoRock): a weight per corner from
+    // its slope and a ragged noise, and every triangle cut where the weight
+    // crosses the two limits -- grass, the grass-and-rock strip laid across
+    // the band between them, rock (mirrored up the slope, its texture tiling
+    // only along its length).
+    const bool rocky = patch.autoRock && !patch.rockTexture.empty() && !patch.layers.empty();
+    const float lo = patch.mixTexture.empty() ? 0.5f : 0.43f, hi = patch.mixTexture.empty() ? 0.5f : 0.57f;
+    struct Corner { Vec3 p, n; float w; };
+    const auto smooth = [](float e0, float e1, float x) {
+        const float t = std::clamp((x - e0) / (e1 - e0), 0.0f, 1.0f);
+        return t * t * (3.0f - 2.0f * t);
+    };
+    const auto cornerOf = [&](int ci, int cj) {
+        Corner c{ at(ci, cj), normal(ci, cj), 0.0f };
+        const float slope = std::acos(std::clamp(c.n.z, 0.0f, 1.0f)) * 180.0f / 3.14159265f;
+        c.w = smooth(patch.rockAngle - 12.0f, patch.rockAngle + 12.0f, slope) +
+              0.2f * RockNoise(c.p.x * 1.4f, c.p.y * 1.4f, 977);
+        return c;
+    };
+    roads::MeshPiece* target = nullptr;
+    const auto emit = [&](int kind, const std::vector<Corner>& poly) {
+        const std::string& texture = kind == 0 ? patch.layers[0].texture : kind == 1 ? patch.mixTexture : patch.rockTexture;
+        roads::MeshGroup& group = target->Group(texture);
+        Vec3 n = Cross(poly[1].p - poly[0].p, poly[2].p - poly[0].p);
+        const bool alongX = std::fabs(n.x) < std::fabs(n.y);   // the face looks along y: its length runs along x
+        const u32 base = (u32)group.vertices.size();
+        for (const Corner& c : poly) {
+            roads::MeshVertex v;
+            v.position = c.p;
+            v.normal = c.n;
+            if (kind == 0) {
+                v.uv = { c.p.x / patch.layers[0].tile, -c.p.y / patch.layers[0].tile };
+            } else {
+                const float along = (alongX ? c.p.x : c.p.y) / 20.0f;
+                if (kind == 1) {
+                    v.uv = { 0.03f + 0.94f * std::clamp((c.w - lo) / std::max(1e-4f, hi - lo), 0.0f, 1.0f), -along };
+                } else {
+                    const float f = c.p.z / 20.0f;
+                    v.uv = { 0.02f + 0.96f * (1.0f - std::fabs((f - std::floor(f)) * 2.0f - 1.0f)), -along * 0.83f };
+                }
+            }
+            group.vertices.push_back(v);
+        }
+        for (size_t k = 1; k + 1 < poly.size(); ++k) {
+            group.indices.push_back(base);
+            group.indices.push_back(base + (u32)k);
+            group.indices.push_back(base + (u32)k + 1);
+        }
+    };
+    const auto clip = [](const std::vector<Corner>& in, float limit, bool above) {
+        std::vector<Corner> out;
+        for (size_t k = 0; k < in.size(); ++k) {
+            const Corner& a = in[k];
+            const Corner& b = in[(k + 1) % in.size()];
+            const bool ia = above ? a.w >= limit : a.w < limit, ib = above ? b.w >= limit : b.w < limit;
+            if (ia) out.push_back(a);
+            if (ia != ib) {
+                const float f = (limit - a.w) / (b.w - a.w);
+                out.push_back({ a.p + (b.p - a.p) * f, Normalize(a.n + (b.n - a.n) * f), limit });
+            }
+        }
+        return out;
+    };
+    const auto Cut = [&](Corner tri[3]) {
+        // Counter-clockwise from above.
+        if (Cross(tri[1].p - tri[0].p, tri[2].p - tri[0].p).z < 0.0f) std::swap(tri[1], tri[2]);
+        for (int kind = 0; kind < 3; ++kind) {
+            const float from = kind == 0 ? -1e9f : kind == 1 ? lo : hi, to = kind == 0 ? lo : kind == 1 ? hi : 1e9f;
+            if (from >= to) continue;
+            std::vector<Corner> poly{ tri[0], tri[1], tri[2] };
+            if (kind > 0) poly = clip(poly, from, true);
+            if (kind < 2 && poly.size() >= 3) poly = clip(poly, to, false);
+            if (poly.size() >= 3) emit(kind, poly);
+        }
+    };
+
     for (int cj = 0; cj < patch.rows; cj += kChunk)
         for (int ci = 0; ci < patch.columns; ci += kChunk) {
             roads::MeshPiece piece;
+            target = &piece;
             char name[64];
             std::snprintf(name, sizeof(name), "ROAD_T%u_%d_%d", patch.id, ci / kChunk, cj / kChunk);
             piece.name = name;
             for (int j = cj; j < std::min(patch.rows, cj + kChunk); ++j)
                 for (int i = ci; i < std::min(patch.columns, ci + kChunk); ++i) {
-                    // Under a road on every corner: the road covers it.
-                    const size_t k00 = (size_t)j * stride + i;
-                    if (underRoad[k00] && underRoad[k00 + 1] && underRoad[k00 + stride] &&
-                        underRoad[k00 + stride + 1])
-                        continue;
+                    // Kept under the roads too: it sits just below them, out of
+                    // sight, and the road field reaches past a road's end and
+                    // leaves bridges out -- dropping those cells left holes there.
                     const u8 index = patch.paint[(size_t)j * patch.columns + i];
                     if (index == kEmpty) continue;
                     const Layer& layer = patch.layers[std::min<size_t>(index, patch.layers.size() - 1)];
-                    roads::MeshGroup& group = piece.Group(layer.texture);
-                    const u32 base = (u32)group.vertices.size();
                     const int corners[4][2] = { { i, j }, { i + 1, j }, { i + 1, j + 1 }, { i, j + 1 } };
                     roads::CollisionArea area;
                     area.surface = layer.surface;
-                    for (const auto& c : corners) {
-                        roads::MeshVertex v;
-                        v.position = at(c[0], c[1]);
-                        v.normal = normal(c[0], c[1]);
-                        v.uv = { v.position.x / layer.tile, -v.position.y / layer.tile };
-                        group.vertices.push_back(v);
-                        area.outline.push_back(v.position);
-                    }
+                    for (const auto& c : corners) area.outline.push_back(at(c[0], c[1]));
                     // Counter-clockwise from above, split along the flatter diagonal.
                     const float d0 = std::fabs(at(i, j).z - at(i + 1, j + 1).z);
                     const float d1 = std::fabs(at(i + 1, j).z - at(i, j + 1).z);
-                    if (d0 <= d1) {
-                        for (u32 q : { 0u, 1u, 2u, 0u, 2u, 3u }) group.indices.push_back(base + q);
+                    static const int splitA[6] = { 0, 1, 2, 0, 2, 3 }, splitB[6] = { 0, 1, 3, 1, 2, 3 };
+                    const int* split = d0 <= d1 ? splitA : splitB;
+                    if (rocky && index == 0) {
+                        for (int t = 0; t < 6; t += 3) {
+                            Corner tri[3];
+                            for (int q = 0; q < 3; ++q) tri[q] = cornerOf(corners[split[t + q]][0], corners[split[t + q]][1]);
+                            Cut(tri);
+                        }
                     } else {
-                        for (u32 q : { 0u, 1u, 3u, 1u, 2u, 3u }) group.indices.push_back(base + q);
+                        roads::MeshGroup& group = piece.Group(layer.texture);
+                        const u32 base = (u32)group.vertices.size();
+                        for (const auto& c : corners) {
+                            roads::MeshVertex v;
+                            v.position = at(c[0], c[1]);
+                            v.normal = normal(c[0], c[1]);
+                            v.uv = { v.position.x / layer.tile, -v.position.y / layer.tile };
+                            group.vertices.push_back(v);
+                        }
+                        for (int q = 0; q < 6; ++q) group.indices.push_back(base + (u32)split[q]);
                     }
                     piece.areas.push_back(std::move(area));
                 }
@@ -327,6 +428,11 @@ bool Terrain::Save(const std::wstring& path) const {
                       p.origin.y, p.cell, p.columns, p.rows, p.conform ? 1 : 0, p.shoulder, p.sink,
                       p.ambient & 0xFFFFFF);
         out << line;
+        if (p.autoRock) {
+            std::snprintf(line, sizeof(line), "autorock %.3f %s %s\n", p.rockAngle,
+                          p.rockTexture.empty() ? "-" : p.rockTexture.c_str(), p.mixTexture.empty() ? "-" : p.mixTexture.c_str());
+            out << line;
+        }
         for (const Layer& l : p.layers) {
             std::snprintf(line, sizeof(line), "layer %s %.3f %02X\n", l.texture.empty() ? "-" : l.texture.c_str(),
                           l.tile, l.surface);
@@ -371,6 +477,12 @@ bool Terrain::Load(const std::wstring& path) {
             patches_.push_back(std::move(p));
             current = &patches_.back();
             highest = std::max(highest, current->id);
+        } else if (current && kind == "autorock") {
+            std::string rock, mix;
+            line >> current->rockAngle >> rock >> mix;
+            current->autoRock = (bool)line;
+            current->rockTexture = rock == "-" ? std::string() : rock;
+            current->mixTexture = mix == "-" ? std::string() : mix;
         } else if (current && kind == "layer") {
             Layer l;
             std::string texture, surface;

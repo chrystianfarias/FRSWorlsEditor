@@ -80,6 +80,7 @@ const char* ToolbarIcon(const std::wstring& text) {
         { L"Move", ICON_PH_ARROWS_OUT_CARDINAL },   { L"Rotate", ICON_PH_ARROW_CLOCKWISE },
         { L"Scale", ICON_PH_ARROWS_OUT },           { L"Road", ICON_PH_ROAD_HORIZON },
         { L"Grid", ICON_PH_GRID_FOUR },             { L"Lights", ICON_PH_LIGHTBULB },
+        { L"Terrain", ICON_PH_MOUNTAINS },
         { L"Trees", ICON_PH_TREE },                 { L"Props", ICON_PH_TRAFFIC_CONE },
         { L"Fast test", ICON_PH_PLAY },
     };
@@ -157,7 +158,7 @@ void MainWindow::DrawShellBars() {
         const auto groupOf = [](const std::wstring& text) {
             for (const wchar_t* game : { L"Launch game", L"Show map", L"Show game", L"Fast test" })
                 if (text == game) return 0;
-            for (const wchar_t* tool : { L"Move", L"Rotate", L"Scale", L"Roads", L"Grid", L"Trees" })
+            for (const wchar_t* tool : { L"Move", L"Rotate", L"Scale", L"Roads", L"Grid", L"Trees", L"Terrain" })
                 if (text == tool) return 1;
             return 2;
         };
@@ -347,6 +348,7 @@ const char* ShelfIcon(const std::wstring& text) {
         { L"District pieces", ICON_PH_PUZZLE_PIECE }, { L"Race graphics", ICON_PH_FLAG_CHECKERED },
         { L"Terrain and roads", ICON_PH_ROAD_HORIZON }, { L"Sky and backdrop", ICON_PH_CLOUD },
         { L"Lights", ICON_PH_LIGHTBULB },           { L"Props with physics", ICON_PH_TRAFFIC_CONE },
+        { L"Road prefabs", ICON_PH_INTERSECTION },
     };
     for (const Pair& pair : kIcons)
         if (text.rfind(pair.name, 0) == 0 && text.size() > wcslen(pair.name) && text[wcslen(pair.name)] == L' ')
