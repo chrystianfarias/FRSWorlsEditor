@@ -170,3 +170,9 @@
 #define IDC_WORLD_NAME         2801
 #define IDC_WORLD_LIST         2802
 #define IDC_WORLD_NOTE         2803
+#define IDD_PUBLISH_WORLD      272
+#define IDC_PUBLISH_NOTE       2804
+#define IDC_PUBLISH_NAME       2805
+#define IDC_PUBLISH_AUTHOR     2806
+#define IDC_PUBLISH_DESCRIPTION 2807
+#define ID_WORLD_PUBLISH       40108

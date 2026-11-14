@@ -73,6 +73,9 @@ private:
     void OpenWorld();
     void SaveWorld();
     void SaveWorldAs();
+    // A zip players unpack into their game: the world's game files and the
+    // loader, without its source (io/WorldPublish.h).
+    void PublishWorld();
     // The world file (io/WorldFile.h): where it is, and the fingerprint of
     // <game>\models when it was last written or opened, to see unsaved work.
     std::wstring worldPath_;
@@ -334,6 +337,11 @@ private:
     HWND libShelf_ = nullptr, libUsed_ = nullptr, libList_ = nullptr;
     ModelCatalog catalog_;                // the Library tab
     int sideTab_ = 0;                     // 0 scene, 1 library
+    // The panels (Explorer, Library, Edits, Online) are windows of their own:
+    // the one to bring to the front next frame (-1 none), and the scene
+    // tree's own filter -- the native search box is the Library's now.
+    int focusPanel_ = -1;
+    std::wstring sceneFilter_;
     std::vector<u32> mineHashes_;         // the scene tree's "My objects", in order
     std::vector<nfs::CityZone> zones_;    // read with the region
     size_t sceneSignature_ = 0;           // what the scene tree was built from

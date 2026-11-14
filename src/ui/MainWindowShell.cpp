@@ -79,7 +79,9 @@ const char* ToolbarIcon(const std::wstring& text) {
         { L"Show map", ICON_PH_MAP_TRIFOLD },       { L"Show game", ICON_PH_GAME_CONTROLLER },
         { L"Move", ICON_PH_ARROWS_OUT_CARDINAL },   { L"Rotate", ICON_PH_ARROW_CLOCKWISE },
         { L"Scale", ICON_PH_ARROWS_OUT },           { L"Road", ICON_PH_ROAD_HORIZON },
-        { L"Breaker", ICON_PH_STACK },          { L"Fast test", ICON_PH_PLAY },
+        { L"Grid", ICON_PH_GRID_FOUR },             { L"Lights", ICON_PH_LIGHTBULB },
+        { L"Trees", ICON_PH_TREE },                 { L"Props", ICON_PH_TRAFFIC_CONE },
+        { L"Fast test", ICON_PH_PLAY },
     };
     for (const Pair& pair : kIcons)
         if (text.rfind(pair.text, 0) == 0) return pair.icon;
@@ -149,41 +151,56 @@ void MainWindow::DrawShellBars() {
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8, 4));
     if (ImGui::BeginViewportSideBar("##toolbar", ImGui::GetMainViewport(), ImGuiDir_Up, bar, flags)) {
         const int buttons = toolbar_ ? (int)::SendMessageW(toolbar_, TB_BUTTONCOUNT, 0, 0) : 0;
+        // In three groups, whatever order the buttons were added in: testing
+        // in the game first, then the tools (one on at a time), then the
+        // extras the extensions add (markers, cars...).
+        const auto groupOf = [](const std::wstring& text) {
+            for (const wchar_t* game : { L"Launch game", L"Show map", L"Show game", L"Fast test" })
+                if (text == game) return 0;
+            for (const wchar_t* tool : { L"Move", L"Rotate", L"Scale", L"Roads", L"Grid", L"Trees" })
+                if (text == tool) return 1;
+            return 2;
+        };
         bool first = true;
-        for (int i = 0; i < buttons; ++i) {
-            TBBUTTON button{};
-            if (!::SendMessageW(toolbar_, TB_GETBUTTON, (WPARAM)i, (LPARAM)&button)) continue;
-            if (button.fsState & TBSTATE_HIDDEN) continue;
-            if (!first) ImGui::SameLine();
-            first = false;
-            if (button.fsStyle & BTNS_SEP) {
-                ImGui::SeparatorEx(ImGuiSeparatorFlags_Vertical, 1.0f);
-                continue;
-            }
-            wchar_t text[128] = {};
-            ::SendMessageW(toolbar_, TB_GETBUTTONTEXTW, (WPARAM)button.idCommand, (LPARAM)text);
-            const std::wstring wide = text;
-            const char* icon = ToolbarIcon(wide);
-            const std::string label = (icon ? std::string(icon) + "  " : std::string()) + Utf8(wide) +
-                                      "##tb" + std::to_string(button.idCommand);
-            const bool checked = (button.fsState & TBSTATE_CHECKED) != 0;
-            const bool enabled = (button.fsState & TBSTATE_ENABLED) != 0;
-            if (checked) ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_HeaderActive));
-            else ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0, 0, 0, 0));
-            ImGui::BeginDisabled(!enabled);
-            if (ImGui::Button(label.c_str()))
-                ::PostMessageW(window_, WM_COMMAND, MAKEWPARAM(button.idCommand, BN_CLICKED), (LPARAM)toolbar_);
-            ImGui::EndDisabled();
-            ImGui::PopStyleColor();
-            // Beside the game's own button, while it runs: end it.
-            if (button.idCommand == IDC_LAUNCH_GAME && game_.Running()) {
-                ImGui::SameLine();
-                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.55f, 0.16f, 0.16f, 1.0f));
-                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.72f, 0.22f, 0.22f, 1.0f));
-                if (ImGui::Button(ICON_PH_STOP "  Stop game"))
-                    ::PostMessageW(window_, kStopGameMessage, 0, 0);
-                ImGui::PopStyleColor(2);
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Close the game and go back to the map");
+        for (int group = 0; group < 3; ++group) {
+            bool groupStarted = false;
+            for (int i = 0; i < buttons; ++i) {
+                TBBUTTON button{};
+                if (!::SendMessageW(toolbar_, TB_GETBUTTON, (WPARAM)i, (LPARAM)&button)) continue;
+                if ((button.fsState & TBSTATE_HIDDEN) || (button.fsStyle & BTNS_SEP)) continue;
+                wchar_t text[128] = {};
+                ::SendMessageW(toolbar_, TB_GETBUTTONTEXTW, (WPARAM)button.idCommand, (LPARAM)text);
+                const std::wstring wide = text;
+                if (groupOf(wide) != group) continue;
+                if (!first) ImGui::SameLine();
+                if (!first && !groupStarted) {
+                    ImGui::SeparatorEx(ImGuiSeparatorFlags_Vertical, 1.0f);
+                    ImGui::SameLine();
+                }
+                first = false;
+                groupStarted = true;
+                const char* icon = ToolbarIcon(wide);
+                const std::string label = (icon ? std::string(icon) + "  " : std::string()) + Utf8(wide) +
+                                          "##tb" + std::to_string(button.idCommand);
+                const bool checked = (button.fsState & TBSTATE_CHECKED) != 0;
+                const bool enabled = (button.fsState & TBSTATE_ENABLED) != 0;
+                if (checked) ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_HeaderActive));
+                else ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0, 0, 0, 0));
+                ImGui::BeginDisabled(!enabled);
+                if (ImGui::Button(label.c_str()))
+                    ::PostMessageW(window_, WM_COMMAND, MAKEWPARAM(button.idCommand, BN_CLICKED), (LPARAM)toolbar_);
+                ImGui::EndDisabled();
+                ImGui::PopStyleColor();
+                // Beside the game's own button, while it runs: end it.
+                if (button.idCommand == IDC_LAUNCH_GAME && game_.Running()) {
+                    ImGui::SameLine();
+                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.55f, 0.16f, 0.16f, 1.0f));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.72f, 0.22f, 0.22f, 1.0f));
+                    if (ImGui::Button(ICON_PH_STOP "  Stop game"))
+                        ::PostMessageW(window_, kStopGameMessage, 0, 0);
+                    ImGui::PopStyleColor(2);
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Close the game and go back to the map");
+                }
             }
         }
     }
@@ -316,6 +333,28 @@ void MainWindow::ForgetShellThumbnails() {
     thumbList_ = nullptr;
 }
 
+namespace {
+// The icon of a Library shelf, from its name ("Buildings (120)"); none for a
+// sub-shelf, which is indented.
+const char* ShelfIcon(const std::wstring& text) {
+    if (!text.empty() && text[0] == L' ') return nullptr;
+    struct Pair { const wchar_t* name; const char* icon; };
+    static const Pair kIcons[] = {
+        { L"All models", ICON_PH_BOOKS },           { L"My objects", ICON_PH_USER },
+        { L"Buildings", ICON_PH_BUILDINGS },        { L"Objects", ICON_PH_CUBE },
+        { L"Signs", ICON_PH_SIGNPOST },             { L"Walls and fences", ICON_PH_WALL },
+        { L"Trees and plants", ICON_PH_TREE },      { L"Vehicles", ICON_PH_CAR },
+        { L"District pieces", ICON_PH_PUZZLE_PIECE }, { L"Race graphics", ICON_PH_FLAG_CHECKERED },
+        { L"Terrain and roads", ICON_PH_ROAD_HORIZON }, { L"Sky and backdrop", ICON_PH_CLOUD },
+        { L"Lights", ICON_PH_LIGHTBULB },           { L"Props with physics", ICON_PH_TRAFFIC_CONE },
+    };
+    for (const Pair& pair : kIcons)
+        if (text.rfind(pair.name, 0) == 0 && text.size() > wcslen(pair.name) && text[wcslen(pair.name)] == L' ')
+            return pair.icon;
+    return ICON_PH_FOLDER;
+}
+} // namespace
+
 void MainWindow::DrawShellLibrary() {
     // Shelf and the "used by the map" filter: the native ones, driven.
     {
@@ -324,12 +363,18 @@ void MainWindow::DrawShellLibrary() {
         wchar_t text[200] = {};
         if (current >= 0) ::SendMessageW(libShelf_, CB_GETLBTEXT, (WPARAM)current, (LPARAM)text);
         ImGui::SetNextItemWidth(-FLT_MIN);
-        if (ImGui::BeginCombo("##shelf", (std::string(ICON_PH_BOOKS) + "  " + Utf8(text)).c_str(),
+        const char* currentIcon = ShelfIcon(text);
+        std::wstring shown = text;
+        while (!shown.empty() && shown[0] == L' ') shown.erase(0, 1);
+        if (ImGui::BeginCombo("##shelf",
+                              (std::string(currentIcon ? currentIcon : ICON_PH_FOLDER_OPEN) + "  " + Utf8(shown)).c_str(),
                               ImGuiComboFlags_HeightLarge)) {
             for (int i = 0; i < count; ++i) {
                 wchar_t item[200] = {};
                 ::SendMessageW(libShelf_, CB_GETLBTEXT, (WPARAM)i, (LPARAM)item);
-                if (ImGui::Selectable((Utf8(item) + "##" + std::to_string(i)).c_str(), i == current) && i != current) {
+                const char* icon = ShelfIcon(item);
+                const std::string label = (icon ? std::string(icon) + "  " : std::string()) + Utf8(item);
+                if (ImGui::Selectable((label + "##" + std::to_string(i)).c_str(), i == current) && i != current) {
                     ::SendMessageW(libShelf_, CB_SETCURSEL, (WPARAM)i, 0);
                     ::SendMessageW(window_, WM_COMMAND, MAKEWPARAM(IDC_LIB_SHELF, CBN_SELCHANGE), (LPARAM)libShelf_);
                 }
@@ -836,11 +881,15 @@ void MainWindow::DrawShellPanels() {
     }();
     if (demoOnline && online_) {
         demoOnline = false;
-        sideTab_ = 3;
+        focusPanel_ = 3;
         online_->Search("street lamp");
     }
     DrawViewModes();
 
+    if (focusPanel_ == 0) {
+        ImGui::SetNextWindowFocus();
+        focusPanel_ = -1;
+    }
     const std::string title = std::string(ICON_PH_TREE_STRUCTURE) + "  Explorer###Explorer";
     if (ImGui::Begin(title.c_str())) {
         // Region
@@ -865,65 +914,65 @@ void MainWindow::DrawShellPanels() {
             }
         }
 
-        // Scene / Library / Edits (FRS_SIDE_TAB picks one at start, for captures)
-        static bool sideTabFromEnv = false;
-        if (!sideTabFromEnv) { sideTabFromEnv = true; if (const char* t = std::getenv("FRS_SIDE_TAB")) sideTab_ = std::atoi(t); }
-        int wanted = sideTab_;
-        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6.0f, ImGui::GetStyle().FramePadding.y));
-        const bool tabs = ImGui::BeginTabBar("##sidetabs", ImGuiTabBarFlags_FittingPolicyResizeDown);
-        ImGui::PopStyleVar();
-        if (tabs) {
-            // A narrow panel shows the icons alone; the name is in the tooltip.
-            const bool narrow = ImGui::GetContentRegionAvail().x < 360.0f;
-            struct Tab { int index; const char* icon; std::string name; const char* id; };
-            const Tab tabsList[] = {
-                { 0, ICON_PH_TREE_STRUCTURE, "Scene", "###scene" },
-                { 1, ICON_PH_CUBE, "Library", "###library" },
-                { 3, ICON_PH_GLOBE, "Online", "###online" },
-                { 2, ICON_PH_LIST_CHECKS, "Edits " + std::to_string(edits_.Count()), "###edits" },
-            };
-            for (const Tab& tab : tabsList) {
-                const std::string label = std::string(tab.icon) +
-                                          (narrow ? (tab.index == 2 ? " " + std::to_string(edits_.Count()) : std::string())
-                                                  : "  " + tab.name) + tab.id;
-                // Follow a tab chosen elsewhere (a menu, the code) as well as a click.
-                const ImGuiTabItemFlags flags = tab.index == sideTab_ && shownTab_ != sideTab_
-                                                    ? ImGuiTabItemFlags_SetSelected : 0;
-                const bool open = ImGui::BeginTabItem(label.c_str(), nullptr, flags);
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tab.name.c_str());
-                if (open) { wanted = tab.index; ImGui::EndTabItem(); }
-            }
-            ImGui::EndTabBar();
-        }
-        if (shownTab_ != sideTab_) wanted = sideTab_;   // this frame selected it
-        shownTab_ = sideTab_;
-        if (wanted != sideTab_) { ShowSideTab(wanted); shownTab_ = sideTab_; }
-
-        // The shared search box drives the native one, which filters.
-        if (sideTab_ != 2 && sideTab_ != 3) {
+        // Its own filter: the Library has the native search box.
+        {
             char search[256] = {};
-            const std::string current = Utf8(WindowText(sideSearch_));
+            const std::string current = Utf8(sceneFilter_);
             std::memcpy(search, current.c_str(), std::min(current.size(), sizeof(search) - 1));
             ImGui::SetNextItemWidth(-FLT_MIN);
-            if (ImGui::InputTextWithHint("##search", ICON_PH_MAGNIFYING_GLASS "  Search", search, sizeof(search)))
-                ::SetWindowTextW(sideSearch_, Wide(search).c_str());
-        }
-
-        if (sideTab_ == 0) {
-            if (ImGui::BeginChild("##tree")) {
-                const HTREEITEM root = (HTREEITEM)::SendMessageW(sectionTree_, TVM_GETNEXTITEM, TVGN_ROOT, 0);
-                DrawShellTree(root, 0);
+            if (ImGui::InputTextWithHint("##scenesearch", ICON_PH_MAGNIFYING_GLASS "  Search the scene", search,
+                                         sizeof(search))) {
+                sceneFilter_ = Wide(search);
+                PopulateSectionTree();
             }
-            ImGui::EndChild();
-        } else if (sideTab_ == 1) {
-            DrawShellLibrary();
-        } else if (sideTab_ == 3) {
-            if (online_)
-                online_->Draw(viewport_.GetRenderer().Context() ? viewport_.GetRenderer().Context()->Device() : nullptr);
-        } else {
-            DrawShellEdits();
         }
+        if (ImGui::BeginChild("##tree")) {
+            const HTREEITEM root = (HTREEITEM)::SendMessageW(sectionTree_, TVM_GETNEXTITEM, TVGN_ROOT, 0);
+            DrawShellTree(root, 0);
+        }
+        ImGui::EndChild();
     }
+    ImGui::End();
+
+    // FRS_SIDE_TAB brings one panel to the front at start, for captures.
+    static bool sideTabFromEnv = false;
+    if (!sideTabFromEnv) {
+        sideTabFromEnv = true;
+        if (const char* t = std::getenv("FRS_SIDE_TAB")) focusPanel_ = std::atoi(t);
+    }
+    const auto front = [this](int panel) {
+        if (focusPanel_ != panel) return;
+        ImGui::SetNextWindowFocus();
+        focusPanel_ = -1;
+    };
+
+    front(1);
+    const std::string library = std::string(ICON_PH_CUBE) + "  Library###Library";
+    if (ImGui::Begin(library.c_str())) {
+        char search[256] = {};
+        const std::string current = Utf8(WindowText(sideSearch_));
+        std::memcpy(search, current.c_str(), std::min(current.size(), sizeof(search) - 1));
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        if (ImGui::InputTextWithHint("##libsearch", ICON_PH_MAGNIFYING_GLASS "  Search the library", search,
+                                     sizeof(search))) {
+            ::SetWindowTextW(sideSearch_, Wide(search).c_str());
+            catalog_.OnCommand(sideSearch_, EN_CHANGE);
+        }
+        DrawShellLibrary();
+    }
+    ImGui::End();
+
+    front(3);
+    const std::string online = std::string(ICON_PH_GLOBE) + "  Online###Online";
+    if (ImGui::Begin(online.c_str())) {
+        if (online_)
+            online_->Draw(viewport_.GetRenderer().Context() ? viewport_.GetRenderer().Context()->Device() : nullptr);
+    }
+    ImGui::End();
+
+    front(2);
+    const std::string edits = std::string(ICON_PH_LIST_CHECKS) + "  Edits " + std::to_string(edits_.Count()) + "###Edits";
+    if (ImGui::Begin(edits.c_str())) DrawShellEdits();
     ImGui::End();
 }
 

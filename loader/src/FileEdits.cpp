@@ -37,10 +37,13 @@
 
 #include "Loader.h"
 
+#include "../../src/core/FileFingerprint.h"
+
 #include <psapi.h>
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -113,6 +116,7 @@ volatile LONG g_allReads = 0;
 volatile LONG g_supplied = 0;   // reads answered from beyond the file's end
 volatile LONG g_streamReads = 0;
 volatile LONG g_editsApplied = 0;
+volatile LONG g_otherRegion = 0;   // edits held back from another region's file
 volatile LONG g_otherReads = 0;
 volatile LONG g_layoutReads = 0;
 volatile unsigned __int64 g_firstStreamAt = ~0ull;
@@ -122,7 +126,46 @@ volatile unsigned __int64 g_firstLayoutAt = ~0ull;
 // opening a file rather than on every read.
 CRITICAL_SECTION g_lock;
 enum class TrackFile { Other, Stream, Layout };
-std::vector<std::pair<HANDLE, TrackFile>> g_handles;
+
+// Which region a track file belongs to: "L4RA" for TRACKS\STREAML4RA.BUN and
+// TRACKS\L4RA.BUN alike.
+//
+// An edit is a byte range of one region's files, and the same range of another
+// region's stream is some other mesh entirely. Without this an L4RA edit was
+// spliced into STREAML4RD.BUN the moment the game loaded a drag track, and the
+// game crashed on the bytes it was handed. Kept as a fixed array so the read
+// hook never allocates to find out.
+struct Region {
+    char name[8]{};
+};
+
+Region RegionFromName(const std::wstring& raw) {
+    Region region;
+    size_t start = raw.find_last_of(L"\\/");
+    start = start == std::wstring::npos ? 0 : start + 1;
+    std::wstring file = raw.substr(start);
+    for (wchar_t& c : file) c = (wchar_t)::towupper(c);
+    if (file.size() > 4 && file.compare(file.size() - 4, 4, L".BUN") == 0)
+        file.resize(file.size() - 4);
+    if (file.compare(0, 6, L"STREAM") == 0) file.erase(0, 6);
+    for (size_t i = 0; i < file.size() && i < sizeof(region.name) - 1; ++i)
+        region.name[i] = (char)file[i];
+    return region;
+}
+
+// An edit made before overlays named their region applies anywhere, as it
+// always did; a file whose region could not be told takes nothing.
+bool EditFits(const Edit& edit, const Region& region) {
+    if (edit.region.empty()) return true;
+    return region.name[0] && ::_stricmp(edit.region.c_str(), region.name) == 0;
+}
+
+struct KnownHandle {
+    HANDLE    handle;
+    TrackFile kind;
+    Region    region;
+};
+std::vector<KnownHandle> g_handles;
 std::vector<std::wstring> g_seen;      // every distinct path read, for the log
 size_t g_reported = 0;                 // how many of them the watcher has printed
 
@@ -209,6 +252,73 @@ void LoadEdits() {
     Log("%zu edits ready", g_edits.size());
 }
 
+// A published world names the game files it was made against.
+//
+// models\frs-world.txt is written by File > Publish World, never by the editor
+// at work, so a world being edited is applied as it always was. In a published
+// one each "target=" line holds a track file's path, size and fingerprint as
+// the publisher had them; where this game's file differs, every edit for that
+// region is left out. The city then looks as shipped, which is a great deal
+// better than splicing a stranger's byte ranges into it and crashing.
+void CheckPublishedTargets() {
+    const std::wstring manifest = GameFolder() + L"\\models\\frs-world.txt";
+    FILE* file = nullptr;
+    if (::_wfopen_s(&file, manifest.c_str(), L"rb") != 0 || !file) return;
+
+    std::string text;
+    char chunk[4096];
+    size_t got = 0;
+    while ((got = std::fread(chunk, 1, sizeof(chunk), file)) > 0) text.append(chunk, got);
+    std::fclose(file);
+
+    std::string worldName;
+    size_t at = 0;
+    while (at < text.size()) {
+        size_t end = text.find('\n', at);
+        if (end == std::string::npos) end = text.size();
+        std::string line = text.substr(at, end - at);
+        at = end + 1;
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+
+        if (line.compare(0, 5, "name=") == 0) {
+            worldName = line.substr(5);
+            continue;
+        }
+        if (line.compare(0, 7, "target=") != 0) continue;
+
+        // target=TRACKS\STREAML4RA.BUN|118489088|0123456789abcdef
+        const size_t bar1 = line.find('|', 7);
+        const size_t bar2 = bar1 == std::string::npos ? std::string::npos : line.find('|', bar1 + 1);
+        if (bar2 == std::string::npos) continue;
+        const std::string relative = line.substr(7, bar1 - 7);
+        const unsigned long long size = std::strtoull(line.substr(bar1 + 1, bar2 - bar1 - 1).c_str(), nullptr, 10);
+        const unsigned long long hash = std::strtoull(line.substr(bar2 + 1).c_str(), nullptr, 16);
+
+        wchar_t wide[MAX_PATH]{};
+        ::MultiByteToWideChar(CP_UTF8, 0, relative.c_str(), -1, wide, MAX_PATH);
+        const frs::FileFingerprint here = frs::FingerprintFile(GameFolder() + L"\\" + wide);
+        if (here.valid && here.size == size && here.hash == hash) {
+            Log("published world '%s': %s matches the one it was made for", worldName.c_str(), relative.c_str());
+            continue;
+        }
+
+        // Only edits that name this region go; ones that name none are older
+        // than published worlds and cannot come from one.
+        const Region region = RegionFromName(wide);
+        const size_t before = g_edits.size();
+        g_edits.erase(std::remove_if(g_edits.begin(), g_edits.end(),
+                                     [&](const Edit& edit) {
+                                         return !edit.region.empty() && EditFits(edit, region);
+                                     }),
+                      g_edits.end());
+        Log("published world '%s': %s is not the file it was made for (%s; size %llu here, %llu there). "
+            "Its %zu edits for %s are left out so the game does not crash. Another map mod or another copy "
+            "of the game changes this file; install the world on a game without it.",
+            worldName.c_str(), relative.c_str(), here.valid ? "it differs" : "it is missing",
+            here.size, size, before - g_edits.size(), region.name);
+    }
+}
+
 // Every file under models\files, keyed by its path below that folder.
 void LoadRedirects(const std::wstring& folder, const std::wstring& relative) {
     WIN32_FIND_DATAW found{};
@@ -266,12 +376,17 @@ const std::wstring* RedirectFor(const wchar_t* name) {
 // ---------------------------------------------------------------------------
 
 // `readAt` is where in the file the buffer starts.
-void ApplyEdits(unsigned __int64 readAt, char* buffer, DWORD length, bool layout) {
+void ApplyEdits(unsigned __int64 readAt, char* buffer, DWORD length, bool layout,
+                const Region& region) {
     const unsigned __int64 readEnd = readAt + length;
 
     for (const Edit& edit : g_edits) {
         if (edit.layout != layout) continue;
         if (edit.end <= readAt || edit.begin >= readEnd) continue;
+        if (!EditFits(edit, region)) {
+            ::InterlockedIncrement(&g_otherRegion);
+            continue;
+        }
 
         ::InterlockedIncrement(&g_editsApplied);
 
@@ -337,13 +452,14 @@ void Note(unsigned __int64 at, DWORD wanted, DWORD fromFile, DWORD served) {
 }
 
 DWORD SupplyBeyondFile(unsigned __int64 readAt, char* buffer, DWORD wanted,
-                       DWORD alreadyRead, bool layout) {
+                       DWORD alreadyRead, bool layout, const Region& region) {
     DWORD have = alreadyRead;
     const unsigned __int64 readEnd = readAt + wanted;
 
     for (const Edit& edit : g_edits) {
         if (edit.stride != 0) continue;            // only a raw span can stand in
         if (edit.layout != layout) continue;
+        if (!EditFits(edit, region)) continue;
         if (edit.end <= readAt || edit.begin >= readEnd) continue;
 
         const unsigned __int64 from = readAt + have < edit.begin ? edit.begin
@@ -404,13 +520,14 @@ void Remember(HANDLE handle, const std::wstring& name) {
     if (handle == INVALID_HANDLE_VALUE || t_inside) return;
 
     const TrackFile kind = ClassifyName(name);
+    const Region region = kind == TrackFile::Other ? Region{} : RegionFromName(name);
 
     ::EnterCriticalSection(&g_lock);
     for (auto& known : g_handles)
-        if (known.first == handle) { known.second = kind; goto note; }
+        if (known.handle == handle) { known.kind = kind; known.region = region; goto note; }
 
     if (g_handles.size() > 256) g_handles.clear();
-    g_handles.emplace_back(handle, kind);
+    g_handles.push_back({ handle, kind, region });
 
 note:
     // A track is always worth recording; anything else only until the list is
@@ -440,16 +557,20 @@ note:
 // promise the ReadFile path already makes. So a mapping of a track file has its
 // protection upgraded on the way through, and the edits are spliced into each
 // view as it is handed out.
-TrackFile Classify(HANDLE handle);   // defined below, beside the read hook
+TrackFile Classify(HANDLE handle, Region* region = nullptr);   // beside the read hook
 
-std::vector<std::pair<HANDLE, TrackFile>> g_mappings;
+std::vector<KnownHandle> g_mappings;
 volatile LONG g_mappedViews = 0;
 
-TrackFile MappingKind(HANDLE mapping) {
+TrackFile MappingKind(HANDLE mapping, Region* region = nullptr) {
     ::EnterCriticalSection(&g_lock);
     TrackFile kind = TrackFile::Other;
     for (const auto& known : g_mappings)
-        if (known.first == mapping) { kind = known.second; break; }
+        if (known.handle == mapping) {
+            kind = known.kind;
+            if (region) *region = known.region;
+            break;
+        }
     ::LeaveCriticalSection(&g_lock);
     return kind;
 }
@@ -476,11 +597,12 @@ DWORD MappingProtection(HANDLE file, DWORD protection) {
 
 void RememberMapping(HANDLE file, HANDLE mapping) {
     if (!mapping) return;
-    const TrackFile kind = Classify(file);
+    Region region;
+    const TrackFile kind = Classify(file, &region);
 
     ::EnterCriticalSection(&g_lock);
     if (g_mappings.size() > 128) g_mappings.clear();
-    g_mappings.emplace_back(mapping, kind);
+    g_mappings.push_back({ mapping, kind, region });
     ::LeaveCriticalSection(&g_lock);
 }
 
@@ -515,7 +637,8 @@ LPVOID FinishView(HANDLE mapping, LPVOID view, unsigned __int64 offset,
                   SIZE_T length) {
     if (!view) return view;
 
-    const TrackFile kind = MappingKind(mapping);
+    Region region;
+    const TrackFile kind = MappingKind(mapping, &region);
     if (kind == TrackFile::Other || g_edits.empty()) return view;
 
     ::InterlockedIncrement(&g_mappedViews);
@@ -535,7 +658,7 @@ LPVOID FinishView(HANDLE mapping, LPVOID view, unsigned __int64 offset,
     const bool guarded =
         ::VirtualProtect(view, length, PAGE_WRITECOPY, &previous) != FALSE;
 
-    ApplyEdits(offset, (char*)view, (DWORD)length, kind == TrackFile::Layout);
+    ApplyEdits(offset, (char*)view, (DWORD)length, kind == TrackFile::Layout, region);
 
     if (guarded) ::VirtualProtect(view, length, previous, &previous);
     return view;
@@ -577,11 +700,13 @@ unsigned __int64 ReportedSize(HANDLE file, unsigned __int64 real) {
     // hundred kilobytes, and telling the game it is a hundred megabytes long --
     // which the first version of this did, because both count as track files --
     // has it sizing a buffer for a file that is not there.
-    if (Classify(file) != TrackFile::Stream) return real;
+    Region region;
+    if (Classify(file, &region) != TrackFile::Stream) return real;
 
     unsigned __int64 furthest = real;
     for (const Edit& edit : g_edits)
-        if (!edit.layout && edit.end > furthest) furthest = edit.end;
+        if (!edit.layout && EditFits(edit, region) && edit.end > furthest)
+            furthest = edit.end;
 
     return furthest;
 }
@@ -687,12 +812,13 @@ HANDLE WINAPI HookedCreateFileA(LPCSTR name, DWORD access, DWORD share,
     return handle;
 }
 
-TrackFile Classify(HANDLE handle) {
+TrackFile Classify(HANDLE handle, Region* regionOut) {
     ::EnterCriticalSection(&g_lock);
 
     for (const auto& known : g_handles)
-        if (known.first == handle) {
-            const TrackFile kind = known.second;
+        if (known.handle == handle) {
+            const TrackFile kind = known.kind;
+            if (regionOut) *regionOut = known.region;
             ::LeaveCriticalSection(&g_lock);
             return kind;
         }
@@ -707,6 +833,7 @@ TrackFile Classify(HANDLE handle) {
                                              FILE_NAME_NORMALIZED);
 
     TrackFile kind = TrackFile::Other;
+    Region region;
     if (length > 0 && length < MAX_PATH) {
         std::wstring name = path;
         for (wchar_t& c : name) c = (wchar_t)::towupper(c);
@@ -714,15 +841,18 @@ TrackFile Classify(HANDLE handle) {
         const bool inTracks = name.find(L"\\TRACKS\\") != std::wstring::npos;
         const bool isBun    = name.size() > 4 &&
                               name.compare(name.size() - 4, 4, L".BUN") == 0;
-        if (inTracks && isBun)
+        if (inTracks && isBun) {
             kind = name.find(L"\\STREAM") != std::wstring::npos ? TrackFile::Stream
                                                                 : TrackFile::Layout;
+            region = RegionFromName(name);
+        }
     }
 
     // Handles are reused after a file is closed, so the list cannot grow without
     // bound or a stale entry would misjudge a later file.
     if (g_handles.size() > 256) g_handles.clear();
-    g_handles.emplace_back(handle, kind);
+    g_handles.push_back({ handle, kind, region });
+    if (regionOut) *regionOut = region;
 
     ::LeaveCriticalSection(&g_lock);
     return kind;
@@ -766,7 +896,8 @@ BOOL WINAPI HookedReadFile(HANDLE file, LPVOID buffer, DWORD toRead,
     // A read of nothing is still worth looking at. A section that outgrew the
     // room around it is moved past the end of the file, where the real read
     // returns zero bytes -- and then this is the only thing that can answer it.
-    const TrackFile kind = Classify(file);
+    Region region;
+    const TrackFile kind = Classify(file, &region);
     if (kind == TrackFile::Other) {
         if (got) ::InterlockedIncrement(&g_otherReads);
         return ok;
@@ -785,7 +916,7 @@ BOOL WINAPI HookedReadFile(HANDLE file, LPVOID buffer, DWORD toRead,
         if (g_firstStreamAt == ~0ull) g_firstStreamAt = readAt;
     }
 
-    ApplyEdits(readAt, (char*)buffer, got, kind == TrackFile::Layout);
+    ApplyEdits(readAt, (char*)buffer, got, kind == TrackFile::Layout, region);
 
     // Now the part the file could not supply.
     //
@@ -794,7 +925,7 @@ BOOL WINAPI HookedReadFile(HANDLE file, LPVOID buffer, DWORD toRead,
     // happened to leave, because it does not have to be in the file at all.
     const DWORD fromFile = got;
     const DWORD supplied = SupplyBeyondFile(readAt, (char*)buffer, toRead, got,
-                                            kind == TrackFile::Layout);
+                                            kind == TrackFile::Layout, region);
     if (supplied > got) {
         got = supplied;
         if (readOut) *readOut = got;
@@ -1000,6 +1131,7 @@ int InstallHooks() {
 DWORD WINAPI Start(LPVOID) {
     // The log, the lock and the file replacements were set up in DllMain.
     LoadEdits();
+    CheckPublishedTargets();
 
     if (g_edits.empty() && g_redirects.empty()) {
         Log("nothing to apply; the game will read its own files unchanged");
@@ -1109,12 +1241,13 @@ DWORD WINAPI Start(LPVOID) {
         lastApplied = g_editsApplied;
 
         Log("reads: %ld through the hook, %ld of a track file (%ld of the table), "
-            "%ld of anything else with a known offset; %ld edits applied; "
+            "%ld of anything else with a known offset; %ld edits applied, "
+            "%ld held back as another region's; "
             "%ld mapped views of a track; %ld reads answered from beyond the "
             "file's end, %ld sizes reported larger; first track byte at %lld, "
             "first table byte at %lld",
             lastAll, lastStream, g_layoutReads, lastOther, lastApplied,
-            lastViews, lastSupplied, g_sizeAnswers,
+            g_otherRegion, lastViews, lastSupplied, g_sizeAnswers,
             g_firstStreamAt == ~0ull ? -1ll : (long long)g_firstStreamAt,
             g_firstLayoutAt == ~0ull ? -1ll : (long long)g_firstLayoutAt);
     }
@@ -1181,8 +1314,8 @@ void StartFileEdits() {
 
 void LogFileEditTotals() {
     Log("on the way out: %ld reads through the hook, %ld of a track stream, "
-        "%ld of other files, %ld edits applied",
-        g_allReads, g_streamReads, g_otherReads, g_editsApplied);
+        "%ld of other files, %ld edits applied, %ld held back as another region's",
+        g_allReads, g_streamReads, g_otherReads, g_editsApplied, g_otherRegion);
 }
 
 } // namespace frs

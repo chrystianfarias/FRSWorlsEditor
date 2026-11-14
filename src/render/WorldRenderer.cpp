@@ -762,7 +762,9 @@ void WorldRenderer::PickOne(const Ray& ray, const GpuObject& object, const Mat4&
                             int placement, int native) const {
     if (!object.source) return;
     if (placement >= 0 && placement == excludePlacement_ && sectionIndex == excludeSection_) return;
-    if (object.isBackdrop && !showBackdrop_) return;
+    // Pickable exactly when drawn: with the game look on, the panorama and
+    // distant pieces are drawn as ordinary scenery even with the backdrop off.
+    if (BackdropHidden(object)) return;
     if (HiddenBuilding(object)) return;   // MINIMAP PREVIEW (temporary)
     if (HiddenModel(object)) return;
 

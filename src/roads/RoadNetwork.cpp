@@ -886,6 +886,366 @@ void PlacePillars(const Segment& segment, const std::vector<Station>& stations,
 
 // Street lights along a stretch of road, every `poleSpacing` from half a
 // spacing in, on the sides the profile asks for.
+// Smooth random height in [-1, 1] at a point on the ground: value noise on a
+// lattice, two octaves, the same for the same seed wherever it is asked.
+float ReliefNoise(float x, float y, int seed) {
+    const auto lattice = [seed](int i, int j) {
+        u32 h = (u32)i * 73856093u ^ (u32)j * 19349663u ^ (u32)seed * 83492791u;
+        h ^= h >> 13; h *= 0x5BD1E995u; h ^= h >> 15;
+        return (float)(h & 0xFFFF) / 32767.5f - 1.0f;
+    };
+    const auto octave = [&](float px, float py) {
+        const float fx = std::floor(px), fy = std::floor(py);
+        const int i = (int)fx, j = (int)fy;
+        float u = px - fx, v = py - fy;
+        u = u * u * (3.0f - 2.0f * u);
+        v = v * v * (3.0f - 2.0f * v);
+        const float a = lattice(i, j), b = lattice(i + 1, j), c = lattice(i, j + 1), d = lattice(i + 1, j + 1);
+        return (a * (1 - u) + b * u) * (1 - v) + (c * (1 - u) + d * u) * v;
+    };
+    return octave(x / 18.0f, y / 18.0f) * 0.7f + octave(x / 6.0f + 31.7f, y / 6.0f - 12.3f) * 0.3f;
+}
+
+// What the ground beside a road needs from round it: the settings of the
+// road going on at each end (already turned to this road's sides, null where
+// there is none or it has no ground that side), the ground to meet, and --
+// out -- the row it ends with at each end and side, for junction corners.
+struct SideContext {
+    const RoadProfile* next[2][2] = {};          // [end][side: 0 left, 1 right]
+    const Network::GroundQuery* ground = nullptr;
+    std::vector<Vec3> ends[2][2];                // [end][side], from the road outwards
+};
+
+// A side's cross-section: the height at each offset out from the road.
+struct CrossSection {
+    std::vector<float> offset{ 0.0f }, height{ 0.0f };
+    float width = 0.0f;
+    float At(float x) const {
+        if (x <= 0.0f) return 0.0f;
+        for (size_t i = 1; i < offset.size(); ++i)
+            if (x <= offset[i]) {
+                const float f = (x - offset[i - 1]) / std::max(1e-4f, offset[i] - offset[i - 1]);
+                return height[i - 1] + (height[i] - height[i - 1]) * f;
+            }
+        return height.back();
+    }
+};
+
+CrossSection SectionOf(const RoadProfile::SideTerrain& t) {
+    CrossSection c;
+    for (const RoadProfile::TerrainBand& band : t.bands) {
+        if (band.width < 0.1f) continue;
+        const int steps = std::clamp((int)std::ceil(band.width / 1.5f), 2, 80);
+        const float o0 = c.offset.back(), h0 = c.height.back();
+        for (int i = 1; i <= steps; ++i) {
+            const float u = (float)i / steps;
+            c.offset.push_back(o0 + band.width * u);
+            c.height.push_back(h0 + band.rise * u * u * (3.0f - 2.0f * u));
+        }
+    }
+    c.width = c.offset.back();
+    return c;
+}
+
+// Texture coordinates in the world's own space, so neighbouring pieces carry
+// on seamlessly: from above for gentle ground, from the side (along the axis
+// the face looks least along) for steep ground.
+int Projection(const Vec3& normal) {
+    if (std::fabs(normal.z) > 0.72f) return 0;
+    return std::fabs(normal.x) > std::fabs(normal.y) ? 1 : 2;
+}
+Vec2 Project(const Vec3& q, int projection, float tile) {
+    switch (projection) {
+        case 1:  return { q.y / tile, -q.z / tile };
+        case 2:  return { q.x / tile, -q.z / tile };
+        default: return { q.x / tile, -q.y / tile };
+    }
+}
+
+// The ground beside a road (RoadProfile::terrain): rows across each side at
+// every station, from the road's outer edge (past a wall's thickness) at its
+// height, band after band outwards, the relief growing away from the road.
+// Over the last stretch before a node where another road with ground beside
+// it goes on, the two ease to halfway between their settings, so they meet
+// edge to edge. The outer edge is brought to the ground there when asked.
+// Steep, high ground turns to rock triangle by triangle -- grass, then the
+// grass-and-rock texture, then rock -- the thresholds jittered so the edge is
+// ragged. Grass collision, row by row.
+void BuildSideTerrain(const RoadProfile& p, const std::vector<Station>& stations, const std::string& grass,
+                      const std::string& rockTexture, const std::string& mixTexture, SideContext& context,
+                      MeshPiece& piece) {
+    if (stations.size() < 2) return;
+    constexpr float kGrassTile = 24.0f, kRockTile = 14.0f;
+    const auto smooth = [](float e0, float e1, float x) {
+        const float t = std::clamp((x - e0) / (e1 - e0), 0.0f, 1.0f);
+        return t * t * (3.0f - 2.0f * t);
+    };
+    const float total = stations.back().distance;
+    const float blend = std::min(30.0f, total * 0.45f);
+    for (int side = -1; side <= 1; side += 2) {
+        const int si = side < 0 ? 0 : 1;
+        const RoadProfile::SideTerrain& t = p.terrain[si];
+        if (!t.on || t.bands.empty() || t.Width() < 0.5f) continue;
+        // The settings this side mixes in: its own, and each neighbour's.
+        struct Source { const RoadProfile* profile; CrossSection section; float start, lift; };
+        const auto sourceOf = [&](const RoadProfile& q) {
+            Source src{ &q, SectionOf(q.terrain[si]), 0.0f, 0.0f };
+            const bool wall = side < 0 ? q.wallLeft : q.wallRight;
+            src.start = q.Edge(side) + (wall ? std::max(q.wallThickness, 0.05f) : 0.0f);
+            src.lift = q.Walk(side) ? q.sidewalkHeight : 0.0f;
+            return src;
+        };
+        Source own = sourceOf(p);
+        Source next[2];
+        bool hasNext[2] = { false, false };
+        for (int e = 0; e < 2; ++e)
+            if (const RoadProfile* q = context.next[e][si]) {
+                next[e] = sourceOf(*q);
+                hasNext[e] = next[e].section.width > 0.4f;
+            }
+        float widest = own.section.width;
+        for (int e = 0; e < 2; ++e)
+            if (hasNext[e]) widest = std::max(widest, next[e].section.width);
+        const size_t across = (size_t)std::clamp((int)std::ceil(widest / 2.5f), 2, 120) + 1;
+        const size_t count = stations.size();
+        std::vector<Vec3> pos(count * across);
+        std::vector<float> above(count * across);       // over the road's edge
+        const auto at = [across](size_t k, size_t i) { return k * across + i; };
+        for (size_t k = 0; k < count; ++k) {
+            const Station& st = stations[k];
+            // How much of each neighbour: half at the node, none `blend` away.
+            float w[2] = { 0.0f, 0.0f };
+            if (hasNext[0]) w[0] = 0.5f * (1.0f - smooth(0.0f, blend, st.distance));
+            if (hasNext[1]) w[1] = 0.5f * (1.0f - smooth(0.0f, blend, total - st.distance));
+            const float wo = 1.0f - w[0] - w[1];
+            const auto mix = [&](auto get) {
+                float v = get(own) * wo;
+                for (int e = 0; e < 2; ++e)
+                    if (w[e] > 0.0f) v += get(next[e]) * w[e];
+                return v;
+            };
+            const float width = mix([](const Source& src) { return src.section.width; });
+            const float start = mix([](const Source& src) { return src.start; });
+            const float lift = mix([](const Source& src) { return src.lift; });
+            const Vec3 edge = st.At(side * start, lift);
+            for (size_t i = 0; i < across; ++i) {
+                const float u = (float)i / (float)(across - 1);
+                Vec3 q = edge + st.right * (side * width * u);
+                const float x = width * u;
+                const float h = mix([&](const Source& src) {
+                    const RoadProfile::SideTerrain& st2 = src.profile->terrain[si];
+                    const float grow = std::min(1.0f, x / 10.0f);
+                    return src.section.At(src.section.width * u) +
+                           st2.relief * grow * ReliefNoise(q.x, q.y, st2.seed);
+                });
+                q.z = edge.z + h;
+                pos[at(k, i)] = q;
+            }
+            // The outer edge onto the ground there, the rest leaning with it.
+            const bool meet = mix([si](const Source& src) {
+                return src.profile->terrain[si].meetGround ? 1.0f : 0.0f; }) > 0.5f;
+            if (meet && context.ground && *context.ground) {
+                const Vec3 outer = pos[at(k, across - 1)];
+                float ground = 0.0f;
+                if ((*context.ground)(outer.x, outer.y, outer.z + 80.0f, ground) && ground > outer.z - 120.0f) {
+                    const float delta = ground - 0.05f - outer.z;
+                    for (size_t i = 1; i < across; ++i) {
+                        const float u = (float)i / (float)(across - 1);
+                        pos[at(k, i)].z += delta * smooth(0.0f, 1.0f, u);
+                    }
+                }
+            }
+            for (size_t i = 0; i < across; ++i) above[at(k, i)] = pos[at(k, i)].z - edge.z;
+        }
+        context.ends[0][si].assign(pos.begin(), pos.begin() + (ptrdiff_t)across);
+        context.ends[1][si].assign(pos.end() - (ptrdiff_t)across, pos.end());
+
+        // Smooth normals, and where along the road and how far up the
+        // ground's own surface each point is, for the rock's texture.
+        std::vector<Vec3> nrm(count * across);
+        std::vector<float> alongAt(count * across), upAt(count * across);
+        for (size_t k = 0; k < count; ++k) {
+            float up = 0.0f;
+            for (size_t i = 0; i < across; ++i) {
+                const Vec3 along = pos[at(std::min(k + 1, count - 1), i)] - pos[at(k > 0 ? k - 1 : 0, i)];
+                const Vec3 out = pos[at(k, std::min(i + 1, across - 1))] - pos[at(k, i > 0 ? i - 1 : 0)];
+                Vec3 n = Cross(along, out);
+                if (n.z < 0.0f) n = n * -1.0f;
+                nrm[at(k, i)] = Normalize(n);
+                if (i) up += Length(pos[at(k, i)] - pos[at(k, i - 1)]);
+                alongAt[at(k, i)] = stations[k].distance;
+                upAt[at(k, i)] = up;
+            }
+        }
+        // How much rock each point wants: steep, high, and a ragged edge from
+        // noise. The ground is cut exactly where this crosses each threshold,
+        // so grass turns to grass-and-rock and then to rock along smooth,
+        // irregular lines instead of the triangles' edges.
+        std::vector<float> want(count * across, 0.0f);
+        const bool rocky = t.rock && !rockTexture.empty();
+        if (rocky)
+            for (size_t k = 0; k < count; ++k)
+                for (size_t i = 0; i < across; ++i) {
+                    const size_t v = at(k, i);
+                    const float slope = Degrees(std::acos(std::clamp(nrm[v].z, 0.0f, 1.0f)));
+                    const float steep = smooth(t.rockAngle - 12.0f, t.rockAngle + 12.0f, slope);
+                    const float lifted = smooth(t.rockHeight - 2.0f, t.rockHeight + 5.0f, std::fabs(above[v]));
+                    want[v] = steep * (0.45f + 0.55f * lifted) +
+                              0.2f * ReliefNoise(pos[v].x * 1.4f, pos[v].y * 1.4f, t.seed + 977);
+                }
+        // The grass-and-rock texture is a strip: grass along one long edge,
+        // rock along the other, a ragged line between. It is laid across the
+        // band between the two limits -- grass edge against the grass, rock
+        // edge against the rock -- and runs on along the road.
+        const float limits[2] = { mixTexture.empty() ? 0.5f : 0.43f, mixTexture.empty() ? 0.5f : 0.57f };
+
+        const std::string names[3] = { t.texture.empty() ? grass : t.texture, mixTexture, rockTexture };
+        struct Point { Vec3 p, n; float w, along, up; };
+        const auto pointAt = [&](size_t v) { return Point{ pos[v], nrm[v], want[v], alongAt[v], upAt[v] }; };
+        const auto lerp = [](const Point& a, const Point& b, float f) {
+            return Point{ a.p + (b.p - a.p) * f, Normalize(a.n + (b.n - a.n) * f), a.w + (b.w - a.w) * f,
+                          a.along + (b.along - a.along) * f, a.up + (b.up - a.up) * f };
+        };
+        // The part of a polygon on one side of a threshold.
+        const auto clip = [&](const std::vector<Point>& in, float limit, bool keepAbove) {
+            std::vector<Point> out;
+            for (size_t i = 0; i < in.size(); ++i) {
+                const Point& a = in[i];
+                const Point& b = in[(i + 1) % in.size()];
+                const bool ina = keepAbove ? a.w >= limit : a.w < limit;
+                const bool inb = keepAbove ? b.w >= limit : b.w < limit;
+                if (ina) out.push_back(a);
+                if (ina != inb) out.push_back(lerp(a, b, (limit - a.w) / (b.w - a.w)));
+            }
+            return out;
+        };
+        // Grid points keep one vertex per texture; cut points get their own.
+        std::vector<int> slot[3];
+        for (auto& g : slot) g.assign(count * across, -1);
+        const auto add = [&](int g, const Point& q) -> u32 {
+            MeshGroup& group = piece.Group(names[g]);
+            MeshVertex v;
+            v.position = q.p;
+            v.normal = q.n;
+            if (g == 0) v.uv = Project(q.p, 0, kGrassTile);
+            else if (g == 1) {
+                const float across = std::clamp((q.w - limits[0]) / std::max(1e-4f, limits[1] - limits[0]), 0.0f, 1.0f);
+                v.uv = { 0.03f + 0.94f * across, -q.along / 20.0f };
+            } else {
+                // The game's cliff tiles only along its length (V): that runs
+                // along the road, and up the slope it is mirrored back and
+                // forth instead of wrapping, so no seam shows.
+                const float f = q.up / 20.0f;
+                const float mirrored = 1.0f - std::fabs((f - std::floor(f)) * 2.0f - 1.0f);
+                v.uv = { 0.02f + 0.96f * mirrored, -q.along / 24.0f };
+            }
+            group.vertices.push_back(v);
+            return (u32)(group.vertices.size() - 1);
+        };
+        const auto gridVertex = [&](int g, size_t v) -> u32 {
+            if (slot[g][v] < 0) slot[g][v] = (int)add(g, pointAt(v));
+            return (u32)slot[g][v];
+        };
+        const auto emit = [&](size_t i0, size_t i1, size_t i2) {
+            // Counter-clockwise from above.
+            if (Cross(pos[i1] - pos[i0], pos[i2] - pos[i0]).z < 0.0f) std::swap(i1, i2);
+            const size_t ids[3] = { i0, i1, i2 };
+            for (int g = 0; g < 3; ++g) {
+                if (g > 0 && !rocky) break;
+                const float lo = g == 0 ? -1e9f : limits[g - 1], hi = g == 2 ? 1e9f : limits[g];
+                if (lo >= hi) continue;
+                // Whole inside: the grid's shared vertices.
+                bool whole = true;
+                for (size_t id : ids) whole = whole && want[id] >= lo && want[id] < hi;
+                MeshGroup* group = nullptr;
+                if (whole) {
+                    const u32 a = gridVertex(g, i0), b = gridVertex(g, i1), c = gridVertex(g, i2);
+                    group = &piece.Group(names[g]);
+                    group->indices.insert(group->indices.end(), { a, b, c });
+                    continue;
+                }
+                std::vector<Point> poly{ pointAt(i0), pointAt(i1), pointAt(i2) };
+                if (g > 0) poly = clip(poly, lo, true);
+                if (g < 2 && poly.size() >= 3) poly = clip(poly, hi, false);
+                if (poly.size() < 3) continue;
+                std::vector<u32> fan;
+                for (const Point& q : poly) fan.push_back(add(g, q));
+                group = &piece.Group(names[g]);
+                for (size_t j = 1; j + 1 < fan.size(); ++j)
+                    group->indices.insert(group->indices.end(), { fan[0], fan[j], fan[j + 1] });
+            }
+        };
+        for (size_t k = 0; k + 1 < count; ++k)
+            for (size_t i = 0; i + 1 < across; ++i) {
+                const size_t a = at(k, i), b = at(k, i + 1), c = at(k + 1, i), d = at(k + 1, i + 1);
+                emit(a, b, c);
+                emit(b, d, c);
+            }
+        for (size_t i = 0; i + 1 < across; ++i) {
+            CollisionStrip strip;
+            strip.surface = kSurfaceGrass;
+            for (size_t k = 0; k < count; ++k) {
+                strip.left.push_back(pos[at(k, side < 0 ? i + 1 : i)]);
+                strip.right.push_back(pos[at(k, side < 0 ? i : i + 1)]);
+            }
+            piece.strips.push_back(std::move(strip));
+        }
+    }
+    // Groups a side left empty (no rock there) go.
+    piece.groups.erase(std::remove_if(piece.groups.begin(), piece.groups.end(),
+                                      [](const MeshGroup& g) { return g.indices.empty(); }),
+                       piece.groups.end());
+}
+
+// The gap between the ground beside two roads round a junction corner: the
+// two end rows joined, point for point along their length.
+void LoftCorner(const std::vector<Vec3>& a, const std::vector<Vec3>& b, const std::string& grass, MeshPiece& piece) {
+    if (a.size() < 2 || b.size() < 2) return;
+    const size_t n = std::max(a.size(), b.size());
+    const auto resample = [n](const std::vector<Vec3>& row) {
+        std::vector<float> along{ 0.0f };
+        for (size_t i = 1; i < row.size(); ++i) along.push_back(along.back() + Length(row[i] - row[i - 1]));
+        std::vector<Vec3> out;
+        for (size_t j = 0; j < n; ++j) {
+            const float d = along.back() * (float)j / (float)(n - 1);
+            size_t i = 1;
+            while (i + 1 < row.size() && along[i] < d) ++i;
+            const float f = std::clamp((d - along[i - 1]) / std::max(1e-4f, along[i] - along[i - 1]), 0.0f, 1.0f);
+            out.push_back(row[i - 1] + (row[i] - row[i - 1]) * f);
+        }
+        return out;
+    };
+    const std::vector<Vec3> ra = resample(a), rb = resample(b);
+    MeshGroup& group = piece.Group(grass);
+    const u32 base = (u32)group.vertices.size();
+    for (int r = 0; r < 2; ++r)
+        for (const Vec3& q : r ? rb : ra) {
+            MeshVertex v;
+            v.position = q;
+            v.normal = { 0.0f, 0.0f, 1.0f };
+            v.uv = Project(q, 0, 24.0f);
+            group.vertices.push_back(v);
+        }
+    const u32 m = (u32)n;
+    for (u32 j = 0; j + 1 < m; ++j) {
+        const u32 a0 = base + j, a1 = a0 + 1, b0 = base + m + j, b1 = b0 + 1;
+        for (const auto& tri : { std::array<u32, 3>{ a0, a1, b0 }, std::array<u32, 3>{ a1, b1, b0 } }) {
+            const Vec3& p0 = group.vertices[tri[0]].position, & p1 = group.vertices[tri[1]].position,
+                      & p2 = group.vertices[tri[2]].position;
+            if (Cross(p1 - p0, p2 - p0).z >= 0.0f) group.indices.insert(group.indices.end(), { tri[0], tri[1], tri[2] });
+            else group.indices.insert(group.indices.end(), { tri[0], tri[2], tri[1] });
+        }
+    }
+    CollisionStrip strip;
+    strip.surface = kSurfaceGrass;
+    // Its left on the left of the way the rows run out from the junction.
+    const Vec3 out = ra.back() - ra.front();
+    const bool bLeft = Cross(out, rb.front() - ra.front()).z > 0.0f;
+    strip.left = bLeft ? rb : ra;
+    strip.right = bLeft ? ra : rb;
+    piece.strips.push_back(std::move(strip));
+}
+
 void PlacePoles(const Segment& segment, const std::vector<Station>& stations, std::vector<Pole>& out) {
     const RoadProfile& p = segment.profile;
     if (p.poleModel.empty() || p.poleSpacing < 2.0f || stations.size() < 2) return;
@@ -2131,8 +2491,34 @@ u32 Network::SplitSegment(u32 segmentId, float t) {
     // The new node keeps the curve's direction, so the road does not bend.
     node->hasHeading = true;
     node->heading = Degrees(std::atan2(direction.y, direction.x));
-    AddSegment(copy.a, middle, copy.profile);
-    AddSegment(middle, copy.b, copy.profile);
+    Segment* added = AddSegment(copy.a, middle, copy.profile);
+    const u32 firstId = added ? added->id : 0;
+    added = AddSegment(middle, copy.b, copy.profile);
+    const u32 secondId = added ? added->id : 0;
+    // Found again: adding the second may have moved the first.
+    Segment* first = FindSegment(firstId);
+    Segment* second = FindSegment(secondId);
+    node = FindNode(middle);
+    if (first) first->shift = copy.shift;
+    if (second) second->shift = copy.shift;
+    if (copy.shape != 0 && first && second) {
+        // The two halves of the Bezier (de Casteljau), each with its own
+        // fixed directions and handles: the road keeps its exact line.
+        const Vec3 p01 = curve.p0 + (curve.p1 - curve.p0) * t, p12 = curve.p1 + (curve.p2 - curve.p1) * t;
+        const Vec3 p23 = curve.p2 + (curve.p3 - curve.p2) * t;
+        const Vec3 q0 = p01 + (p12 - p01) * t, q1 = p12 + (p23 - p12) * t;
+        const auto set = [](Segment& s, const Vec3& from, const Vec3& h0, const Vec3& h1, const Vec3& to) {
+            const Vec3 d0 = Horizontal(h0 - from), d1 = Horizontal(h1 - to);
+            s.shape = 2;
+            s.dirA = Degrees(std::atan2(d0.y, d0.x));
+            s.dirB = Degrees(std::atan2(d1.y, d1.x));
+            s.handleA = std::max(0.01f, Length(d0));
+            s.handleB = std::max(0.01f, Length(d1));
+        };
+        set(*first, curve.p0, p01, q0, point);
+        set(*second, point, q1, p23, curve.p3);
+        node->hasHeading = false;
+    }
     SetDirty();
     return middle;
 }
@@ -2143,9 +2529,37 @@ Curve Network::CurveOf(const Segment& segment) const {
     Curve curve;
     if (!a || !b) return curve;
 
+    // The direction a road with a fixed shape leaves `node` in.
+    const auto fixedLeaving = [&](const Segment& s, const Node& node, Vec3& out) {
+        const bool atA = s.a == node.id;
+        if (s.shape == 1) {
+            const Node* far = FindNode(atA ? s.b : s.a);
+            if (!far) return false;
+            out = HorizontalDirection(far->position - node.position);
+            return true;
+        }
+        if (s.shape == 2) {
+            const float d = Radians(atA ? s.dirA : s.dirB);
+            out = { std::cos(d), std::sin(d), 0.0f };
+            return true;
+        }
+        return false;
+    };
+
     // The direction a segment leaves `node` in, towards `other`.
     auto leaving = [&](const Node& node, const Node& other) {
         const Vec3 chord = HorizontalDirection(other.position - node.position);
+        Vec3 fixed;
+        if (fixedLeaving(segment, node, fixed)) return fixed;
+        // On from a road drawn with a fixed shape: the same tangent.
+        if (!node.hasHeading) {
+            const std::vector<u32> around = SegmentsAt(node.id);
+            if (around.size() == 2) {
+                const Segment* before = FindSegment(around[0] == segment.id ? around[1] : around[0]);
+                if (before && before->shape != 0 && fixedLeaving(*before, node, fixed) && Dot(fixed, chord) < 0.2f)
+                    return fixed * -1.0f;
+            }
+        }
         if (node.hasHeading) {
             const Vec3 h{ std::cos(Radians(node.heading)), std::sin(Radians(node.heading)), 0.0f };
             return Dot(h, chord) >= 0.0f ? h : h * -1.0f;
@@ -2344,6 +2758,11 @@ std::vector<MeshPiece> Network::BuildMesh(std::vector<Pole>* polesOut) const {
     // left, B right), for the gores between roads split apart.
     std::map<u32, std::array<float, 4>> wallSkips;
 
+    // The ground beside the roads: each road's end rows, for the corners of
+    // junctions, and the neighbours' settings it eases into.
+    std::map<std::pair<u32, int>, std::vector<Vec3>> sideEnds;      // (road, end * 2 + side)
+    std::map<std::pair<u32, int>, RoadProfile> sideNeighbours;
+
     // ---- segments ----------------------------------------------------------
     for (const Segment& s : segments_) {
         const Curve curve = CurveOf(s);
@@ -2398,6 +2817,41 @@ std::vector<MeshPiece> Network::BuildMesh(std::vector<Pole>* polesOut) const {
             if (!posts.walls.empty()) pieces.push_back(std::move(posts));
         }
         PlaceWallModels(s, stations, poles);
+        if (!s.profile.bridge && (s.profile.Terrain(-1) || s.profile.Terrain(1))) {
+            MeshPiece side;
+            char sideName[64];
+            std::snprintf(sideName, sizeof(sideName), "ROAD_G%u", s.id);
+            side.name = sideName;
+            side.segment = s.id;
+            SideContext context;
+            context.ground = &ground_;
+            for (int end = 0; end < 2; ++end) {
+                const u32 nodeId = end ? s.b : s.a;
+                const std::vector<u32> around = SegmentsAt(nodeId);
+                if (around.size() != 2) continue;
+                const Segment* o = FindSegment(around[0] == s.id ? around[1] : around[0]);
+                if (!o || o->profile.bridge) continue;
+                // Its sides as this road's: swapped when it runs the other way.
+                const bool sameWay = (s.a == nodeId) != (o->a == nodeId);
+                for (int si = 0; si < 2; ++si) {
+                    const int theirs = sameWay ? si : 1 - si;
+                    if (!o->profile.terrain[theirs].on) continue;
+                    // Their settings with that side put where this road has it.
+                    RoadProfile& turned = sideNeighbours[{ s.id, end * 2 + si }];
+                    turned = o->profile;
+                    if (!sameWay) {
+                        std::swap(turned.terrain[0], turned.terrain[1]);
+                        std::swap(turned.wallLeft, turned.wallRight);
+                        std::swap(turned.sidewalkLeft, turned.sidewalkRight);
+                    }
+                    context.next[end][si] = &turned;
+                }
+            }
+            BuildSideTerrain(s.profile, stations, groundTexture_, rockTexture_, rockMixTexture_, context, side);
+            for (int end = 0; end < 2; ++end)
+                for (int si = 0; si < 2; ++si) sideEnds[{ s.id, end * 2 + si }] = context.ends[end][si];
+            if (side.VertexCount()) pieces.push_back(std::move(side));
+        }
         if (s.profile.bridge) {
             MeshPiece pillars;
             char pillarName[64];
@@ -2652,6 +3106,32 @@ std::vector<MeshPiece> Network::BuildMesh(std::vector<Pole>* polesOut) const {
             first = last;
         }
     }
+
+    // ---- ground beside roads round junction corners ------------------------
+    // Between each road and the next round the junction, the side of one
+    // facing the other: the left of the first (looking out of the junction)
+    // and the right of the second.
+    if (!sideEnds.empty())
+        for (const auto& [nodeId, ends] : junctions) {
+            MeshPiece corner;
+            char cornerName[64];
+            std::snprintf(cornerName, sizeof(cornerName), "ROAD_GJ%u", nodeId);
+            corner.name = cornerName;
+            corner.node = nodeId;
+            for (size_t i = 0; i < ends.size(); ++i) {
+                const End& e0 = ends[i];
+                const End& e1 = ends[(i + 1) % ends.size()];
+                if (e0.segment == e1.segment) continue;
+                // Left looking out along a road leaving from its node a is its
+                // own left; leaving from node b, its right.
+                const int s0 = e0.atStart ? 0 : 1, s1 = e1.atStart ? 1 : 0;
+                const auto r0 = sideEnds.find({ e0.segment, (e0.atStart ? 0 : 2) + s0 });
+                const auto r1 = sideEnds.find({ e1.segment, (e1.atStart ? 0 : 2) + s1 });
+                if (r0 == sideEnds.end() || r1 == sideEnds.end()) continue;
+                LoftCorner(r0->second, r1->second, groundTexture_, corner);
+            }
+            if (corner.VertexCount()) pieces.push_back(std::move(corner));
+        }
 
     // ---- junctions made into the game's roads ---------------------------------
     for (const GameJunction& j : gameJunctions_) {
@@ -2921,6 +3401,45 @@ std::vector<MeshPiece> Network::BuildMesh(std::vector<Pole>* polesOut) const {
         }
         pieces.push_back(std::move(piece));
     }
+    BuildFills(pieces);
+    // The lights placed by hand, as street lights: they light what is built,
+    // and their posts are placed with the rest.
+    for (const Light& light : lights_) {
+        Pole pole;
+        pole.model = light.model;
+        pole.position = light.position;
+        pole.heading = light.heading;
+        pole.lamp = light.Lamp();
+        pole.color = light.color;
+        pole.radius = light.radius;
+        pole.strength = light.strength;
+        poles.push_back(pole);
+    }
+    // Trees and props, placed with the street lights; a tree's trunk is solid.
+    {
+        MeshPiece trunks;
+        trunks.name = "ROAD_TREES";
+        for (const Prop& prop : props_) {
+            Pole pole;
+            pole.model = prop.model;
+            pole.position = prop.position;
+            pole.heading = prop.heading;
+            pole.scale = prop.scale;
+            pole.lamp = prop.position;
+            poles.push_back(pole);
+            if (!prop.tree) continue;
+            const Vec3 c = prop.position;
+            const float w = 0.3f * prop.scale;
+            CollisionWall trunk;
+            trunk.barrier = false;
+            trunk.height = 4.0f * prop.scale;
+            trunk.surface = kSurfaceWall;
+            trunk.points = { { c.x - w, c.y - w, c.z }, { c.x + w, c.y - w, c.z }, { c.x + w, c.y + w, c.z },
+                             { c.x - w, c.y + w, c.z }, { c.x - w, c.y - w, c.z } };
+            trunks.walls.push_back(std::move(trunk));
+        }
+        if (!trunks.walls.empty()) pieces.push_back(std::move(trunks));
+    }
     LightPieces(pieces, poles, [this](const MeshPiece& piece) -> const RoadProfile* {
         if (piece.segment) {
             const Segment* segment = FindSegment(piece.segment);
@@ -2930,6 +3449,7 @@ std::vector<MeshPiece> Network::BuildMesh(std::vector<Pole>* polesOut) const {
             if (segment.a == piece.node || segment.b == piece.node) return &segment.profile;
         return nullptr;
     }, light_.get());
+    PlaceBuildings(poles, pieces);
     if (polesOut) *polesOut = std::move(poles);
     return pieces;
 }
@@ -2947,6 +3467,7 @@ bool Network::Save(const std::wstring& path) const {
     std::ofstream out(path, std::ios::binary | std::ios::trunc);
     if (!out) return false;
     out << "FRSROADS 2\n";
+    if (fillBetween_) out << "fill 1\n";
     out << "# node <id> <x> <y> <z> <hasHeading> <heading> <crosswalks>\n";
     out << "# segment <id> <a> <b> <lanesForward> <lanesBackward> <laneWidth> <textureLength> <laneCentre> "
            "<laneInner> <sidewalkWidth> <sidewalkHeight> <sidewalkTexture> <wallLeft> <wallRight> "
@@ -2986,8 +3507,25 @@ bool Network::Save(const std::wstring& path) const {
             << p.taperLength << " " << s.shift << " " << p.medianTaper << " " << p.wallThickness << " " << p.shoulderType << " "
             << p.shoulderWidth << " " << Token(p.shoulderTexture) << " " << (p.shoulderLine ? 1 : 0) << " "
             << (p.groundAuto ? 2 : 0) << " " << p.shoulderSides << " " << p.wallStartLeft << " "
-            << p.wallStartRight << " " << p.wallEndLeft << " " << p.wallEndRight << "\n";
+            << p.wallStartRight << " " << p.wallEndLeft << " " << p.wallEndRight << " " << p.zoneLeft << " "
+            << p.zoneRight << " " << p.zoneDepth << " " << p.zoneSetback << " " << p.zoneGap << " " << p.zoneSeed
+            << " " << p.zoneTurn << " " << s.shape << " " << s.dirA << " " << s.dirB;
+        for (const RoadProfile::SideTerrain& t : p.terrain) {
+            out << " " << (t.on ? 1 : 0) << " " << t.relief << " " << t.seed << " " << Token(t.texture) << " "
+                << t.bands.size();
+            for (const RoadProfile::TerrainBand& b : t.bands) out << " " << b.width << " " << b.rise;
+        }
+        for (const RoadProfile::SideTerrain& t : p.terrain)
+            out << " " << (t.rock ? 1 : 0) << " " << t.rockAngle << " " << t.rockHeight << " " << (t.meetGround ? 1 : 0);
+        out << "\n";
     }
+    for (const Prop& p : props_)
+        out << "prop " << p.id << " " << Token(p.model) << " " << p.position.x << " " << p.position.y << " "
+            << p.position.z << " " << p.heading << " " << p.scale << " " << (p.tree ? 1 : 0) << "\n";
+    for (const Light& l : lights_)
+        out << "light " << l.id << " " << l.position.x << " " << l.position.y << " " << l.position.z << " "
+            << l.height << " " << l.color << " " << l.radius << " " << l.strength << " " << Token(l.model) << " "
+            << l.heading << "\n";
     for (const GameJunction& j : gameJunctions_) {
         std::snprintf(line, sizeof(line),
                       "gjunction %u %.4f %.4f %.4f %.5f %.5f %d %.4f %.4f %.4f %.4f %.4f %.4f %s %s %d",
@@ -3052,7 +3590,27 @@ bool Network::Load(const std::wstring& path) {
         std::istringstream line(text);
         std::string kind;
         line >> kind;
-        if (kind == "node") {
+        if (kind == "prop") {
+            Prop p;
+            std::string model;
+            int tree = 0;
+            if (line >> p.id >> model >> p.position.x >> p.position.y >> p.position.z >> p.heading >> p.scale >> tree) {
+                p.model = Untoken(model);
+                p.tree = tree != 0;
+                if (!p.model.empty()) props_.push_back(p);
+            }
+        } else if (kind == "light") {
+            Light l;
+            std::string model;
+            if (line >> l.id >> l.position.x >> l.position.y >> l.position.z >> l.height >> l.color >> l.radius >>
+                l.strength >> model >> l.heading) {
+                l.model = Untoken(model);
+                lights_.push_back(l);
+            }
+        } else if (kind == "fill") {
+            int on = 0;
+            if (line >> on) fillBetween_ = on != 0;
+        } else if (kind == "node") {
             Node n;
             int heading = 0;
             line >> n.id >> n.position.x >> n.position.y >> n.position.z >> heading >> n.heading;
@@ -3206,6 +3764,54 @@ bool Network::Load(const std::wstring& path) {
                                         if (line >> endLeft >> endRight) {
                                             p.wallEndLeft = std::clamp(endLeft, -500.0f, 500.0f);
                                             p.wallEndRight = std::clamp(endRight, -500.0f, 500.0f);
+                                            int zl = 0, zr = 0, seed = 0, turn = 0;
+                                            float depth = 30.0f, setback = 1.5f, gap = 2.0f;
+                                            if (line >> zl >> zr >> depth >> setback >> gap >> seed >> turn) {
+                                                p.zoneLeft = std::clamp(zl, 0, kZoneKinds - 1);
+                                                p.zoneRight = std::clamp(zr, 0, kZoneKinds - 1);
+                                                p.zoneDepth = std::clamp(depth, 5.0f, 300.0f);
+                                                p.zoneSetback = std::clamp(setback, -10.0f, 100.0f);
+                                                p.zoneGap = std::clamp(gap, 0.0f, 100.0f);
+                                                p.zoneSeed = seed;
+                                                p.zoneTurn = ((turn % 360) + 360) % 360;
+                                                int shape = 0;
+                                                float dirA = 0.0f, dirB = 0.0f;
+                                                if (line >> shape >> dirA >> dirB) {
+                                                    s.shape = std::clamp(shape, 0, 2);
+                                                    s.dirA = dirA;
+                                                    s.dirB = dirB;
+                                                    for (RoadProfile::SideTerrain& t : p.terrain) {
+                                                        int on = 0, seed = 0;
+                                                        float relief = 1.5f;
+                                                        size_t count = 0;
+                                                        std::string texture;
+                                                        if (!(line >> on >> relief >> seed >> texture >> count)) break;
+                                                        t.on = on != 0;
+                                                        t.relief = std::clamp(relief, 0.0f, 50.0f);
+                                                        t.seed = seed;
+                                                        t.texture = Untoken(texture);
+                                                        t.bands.clear();
+                                                        for (size_t k = 0; k < count && k < 16; ++k) {
+                                                            RoadProfile::TerrainBand b;
+                                                            if (!(line >> b.width >> b.rise)) break;
+                                                            b.width = std::clamp(b.width, 0.5f, 300.0f);
+                                                            b.rise = std::clamp(b.rise, -200.0f, 200.0f);
+                                                            t.bands.push_back(b);
+                                                        }
+                                                        if (t.bands.empty()) t.bands.push_back({});
+                                                    }
+                                                    for (RoadProfile::SideTerrain& t : p.terrain) {
+                                                        int rock = 1;
+                                                        float angle = 32.0f, rockHeight = 3.0f;
+                                                        int meet = 1;
+                                                        if (!(line >> rock >> angle >> rockHeight >> meet)) break;
+                                                        t.meetGround = meet != 0;
+                                                        t.rock = rock != 0;
+                                                        t.rockAngle = std::clamp(angle, 1.0f, 89.0f);
+                                                        t.rockHeight = std::clamp(rockHeight, 0.0f, 200.0f);
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                 }
@@ -3237,6 +3843,8 @@ bool Network::Load(const std::wstring& path) {
     segments_.erase(std::remove_if(segments_.begin(), segments_.end(),
                                    [&](const Segment& s) { return !FindNode(s.a) || !FindNode(s.b); }),
                     segments_.end());
+    for (const Light& l : lights_) highest = std::max(highest, l.id);
+    for (const Prop& p : props_) highest = std::max(highest, p.id);
     nextId_ = highest + 1;
     dirty_ = true;
     LOG_INFO("roads: %zu nodes, %zu segments read from %S", nodes_.size(), segments_.size(), path.c_str());

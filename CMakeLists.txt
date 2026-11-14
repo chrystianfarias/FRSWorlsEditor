@@ -30,6 +30,7 @@ add_executable(FRSWorldEditor WIN32
     src/io/TpkBuild.cpp
     src/io/WorldProfiles.cpp
     src/io/WorldFile.cpp
+    src/io/WorldPublish.cpp
     src/io/SelectionExport.cpp
     src/io/SelectionImport.cpp
     src/nfs/ChunkReader.cpp
@@ -79,6 +80,7 @@ add_executable(FRSWorldEditor WIN32
     src/ui/PropertiesPanel.cpp
     src/ui/RoadsExtension.cpp
     src/roads/RoadNetwork.cpp
+    src/roads/CityZones.cpp
     src/roads/RoadBake.cpp
     src/roads/RoadRoutes.cpp
     src/nfs/Routes.cpp

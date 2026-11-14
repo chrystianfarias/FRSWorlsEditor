@@ -3,6 +3,8 @@
 #include "io/WorldProfiles.h"
 #include "ui/Resource.h"
 
+#include <cwctype>
+
 namespace {
 
 struct NewState {
@@ -118,4 +120,62 @@ bool ChooseWorldToOpen(HINSTANCE instance, HWND parent, const std::wstring& acti
         return false;
     chosen = state.chosen;
     return true;
+}
+
+namespace {
+
+std::wstring DialogText(HWND dialog, int id) {
+    const int length = ::GetWindowTextLengthW(::GetDlgItem(dialog, id));
+    std::wstring text((size_t)length + 1, L'\0');
+    ::GetDlgItemTextW(dialog, id, text.data(), length + 1);
+    text.resize((size_t)length);
+    while (!text.empty() && std::iswspace(text.back())) text.pop_back();
+    while (!text.empty() && std::iswspace(text.front())) text.erase(text.begin());
+    return text;
+}
+
+INT_PTR CALLBACK PublishProc(HWND dialog, UINT message, WPARAM wParam, LPARAM lParam) {
+    auto* details = (PublishDetails*)::GetWindowLongPtrW(dialog, GWLP_USERDATA);
+    switch (message) {
+        case WM_INITDIALOG:
+            details = (PublishDetails*)lParam;
+            ::SetWindowLongPtrW(dialog, GWLP_USERDATA, lParam);
+            ::SetDlgItemTextW(dialog, IDC_PUBLISH_NOTE, details->note.c_str());
+            ::SetDlgItemTextW(dialog, IDC_PUBLISH_NAME, details->name.c_str());
+            ::SetDlgItemTextW(dialog, IDC_PUBLISH_AUTHOR, details->author.c_str());
+            ::SetDlgItemTextW(dialog, IDC_PUBLISH_DESCRIPTION, details->description.c_str());
+            ::SendDlgItemMessageW(dialog, IDC_PUBLISH_NAME, EM_LIMITTEXT, 64, 0);
+            ::SendDlgItemMessageW(dialog, IDC_PUBLISH_AUTHOR, EM_LIMITTEXT, 64, 0);
+            ::SendDlgItemMessageW(dialog, IDC_PUBLISH_DESCRIPTION, EM_LIMITTEXT, 4000, 0);
+            return TRUE;
+
+        case WM_COMMAND:
+            if (LOWORD(wParam) == IDOK) {
+                const std::wstring name = DialogText(dialog, IDC_PUBLISH_NAME);
+                if (name.empty()) {
+                    ::MessageBoxW(dialog, L"The world needs a name: players see it in the README and the uninstaller.",
+                                  L"Publish world", MB_ICONINFORMATION | MB_OK);
+                    ::SetFocus(::GetDlgItem(dialog, IDC_PUBLISH_NAME));
+                    return TRUE;
+                }
+                details->name = name;
+                details->author = DialogText(dialog, IDC_PUBLISH_AUTHOR);
+                details->description = DialogText(dialog, IDC_PUBLISH_DESCRIPTION);
+                ::EndDialog(dialog, IDOK);
+                return TRUE;
+            }
+            if (LOWORD(wParam) == IDCANCEL) {
+                ::EndDialog(dialog, IDCANCEL);
+                return TRUE;
+            }
+            break;
+    }
+    return FALSE;
+}
+
+} // namespace
+
+bool AskPublishDetails(HINSTANCE instance, HWND parent, PublishDetails& details) {
+    return ::DialogBoxParamW(instance, MAKEINTRESOURCEW(IDD_PUBLISH_WORLD), parent, PublishProc,
+                             (LPARAM)&details) == IDOK;
 }

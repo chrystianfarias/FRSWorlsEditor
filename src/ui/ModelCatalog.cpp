@@ -16,6 +16,22 @@ constexpr int kNoPictureImage = 1;
 
 std::wstring Widen(const std::string& text) { return std::wstring(text.begin(), text.end()); }
 
+// What a row's picture is cached by: its model's hash, or for an extension's
+// row with a picture of its own, a hash of its owner and key (FNV-1a).
+u32 PictureKey(const ModelCatalog::Row& row) {
+    if (row.model) return row.model->hash;
+    u32 hash = 2166136261u;
+    const auto mix = [&hash](const void* data, size_t size) {
+        for (size_t i = 0; i < size; ++i) {
+            hash ^= ((const u8*)data)[i];
+            hash *= 16777619u;
+        }
+    };
+    mix(&row.owner, sizeof(row.owner));
+    mix(row.key.data(), row.key.size());
+    return hash;
+}
+
 std::wstring Lower(std::wstring text) {
     for (wchar_t& c : text) c = (wchar_t)std::towlower(c);
     return text;
@@ -135,9 +151,9 @@ void ModelCatalog::SetWorld(const nfs::World* world) {
             std::vector<Row> extra;
             extraRows_(extra);
             for (Row& row : extra)
-                if (row.model) rows_.push_back(std::move(row));
+                if (row.model || row.picture) rows_.push_back(std::move(row));
         }
-        for (size_t i = 0; i < rows_.size(); ++i) rowOf_[rows_[i].model->hash] = i;
+        for (size_t i = 0; i < rows_.size(); ++i) rowOf_[PictureKey(rows_[i])] = i;
     }
     FillShelves();
     Fill();
@@ -284,7 +300,7 @@ bool ModelCatalog::OnNotify(const NMHDR* header) {
             if (!(info->item.mask & LVIF_IMAGE)) return true;
             const size_t index = (size_t)info->item.lParam;
             if (index >= rows_.size()) return true;
-            const u32 hash = rows_[index].model->hash;
+            const u32 hash = PictureKey(rows_[index]);
             const auto found = imageOf_.find(hash);
             if (found != imageOf_.end()) {
                 info->item.iImage = found->second;
@@ -310,7 +326,11 @@ bool ModelCatalog::DrawPending(DWORD budgetMs) {
         if (imageOf_.count(hash)) continue;
         const auto row = rowOf_.find(hash);
         if (row == rowOf_.end()) continue;
-        imageOf_[hash] = thumbnail_(*rows_[row->second].model, pixels)
+        const Row& source = rows_[row->second];
+        pixels.clear();
+        const bool drawn = source.model ? thumbnail_(*source.model, pixels)
+                                        : source.picture && source.picture(pixels);
+        imageOf_[hash] = drawn && pixels.size() == (size_t)ModelThumbnails::kSize * ModelThumbnails::kSize
                              ? AddPicture(images_, pixels) : kNoPictureImage;
         added = true;
     }

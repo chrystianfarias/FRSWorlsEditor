@@ -20,6 +20,7 @@
 #include "io/SelectionImport.h"
 #include "io/WorldProfiles.h"
 #include "io/WorldFile.h"
+#include "io/WorldPublish.h"
 #include "minimap/MinimapBuildings.h"   // MINIMAP PREVIEW (temporary)
 #include "render/RenderExtension.h"
 #include "ui/Resource.h"
@@ -49,7 +50,7 @@ const wchar_t* kWindowTitle = L"FRS World Editor - Need for Speed Underground 2"
 const wchar_t* kSettingsKey = L"Software\\FRSWorldEditor";
 const wchar_t* kSupportUrl = L"https://buymeacoffee.com/chrystianfarias";
 // Bumped when the setup has something new to install; an older value runs it again.
-constexpr DWORD kSetupVersion = 1;
+constexpr DWORD kSetupVersion = 2;   // 2: loader applies edits only to their own region
 // Asks for the setup once the window is up, on the first run.
 constexpr UINT kRunSetupMessage = WM_APP + 1;
 // FRSFastTest reads its switch when the game starts; this long after the
@@ -898,12 +899,9 @@ void MainWindow::CreateToolbar() {
     toolbarImages_ = BuildToolbarIcons(iconSize);
     ::SendMessageW(toolbar_, TB_SETIMAGELIST, 0, (LPARAM)toolbarImages_);
 
-    // What a session keeps reaching for: its world, the game, the gizmo.
+    // What a session keeps reaching for: the game, then the tools. The world's
+    // own commands (new, open, save) are in the File menu and on Ctrl+S.
     const struct { int image; int id; const wchar_t* text; } items[] = {
-        { 0, ID_WORLD_NEW,  L"New world" },
-        { 1, ID_WORLD_OPEN, L"Open world" },
-        { 2, ID_WORLD_SAVE, L"Save" },
-        { -1, 0, nullptr },
         // Becomes Show map / Show game while the game runs (SetLaunchLabel).
         { 3, IDC_LAUNCH_GAME, L"Launch game" },
         { -1, 0, nullptr },
@@ -1033,7 +1031,7 @@ void MainWindow::StorePanelSizes() const {
 
 void MainWindow::OnCommand(int id, int notification, HWND control) {
     if (properties_.OnCommand(id)) return;
-    if (control && control == sideSearch_ && notification == EN_CHANGE && sideTab_ == 0) {
+    if (control && control == sideSearch_ && notification == EN_CHANGE && sideTab_ == 0 && !shell_) {
         PopulateSectionTree();
         return;
     }
@@ -1048,6 +1046,15 @@ void MainWindow::OnCommand(int id, int notification, HWND control) {
         return;
     }
 
+    // Move, rotate and scale are tools like the extensions' own: choosing one
+    // turns those off. Their keys (1, 2, 3) go to a tool that is on first.
+    if (id == ID_GIZMO_MOVE || id == ID_GIZMO_ROTATE || id == ID_GIZMO_SCALE) {
+        const int digit = id == ID_GIZMO_MOVE ? 1 : id == ID_GIZMO_ROTATE ? 2 : 3;
+        if (notification == 1)
+            for (auto& extension : extensions_)
+                if (extension->ToolActive() && extension->ToolDigit(digit)) return;
+        for (auto& extension : extensions_) extension->CloseTools();
+    }
     for (auto& extension : extensions_)
         if (extension->OnCommand(id)) return;
     if (id == kViewSkyCommand) {
@@ -1112,6 +1119,7 @@ void MainWindow::OnCommand(int id, int notification, HWND control) {
         case ID_WORLD_OPEN:      OpenWorld(); break;
         case ID_WORLD_SAVE:      SaveWorld(); break;
         case ID_WORLD_SAVE_AS:   SaveWorldAs(); break;
+        case ID_WORLD_PUBLISH:   PublishWorld(); break;
         case ID_WORLD_LOAD_ALL:  LoadAllSections(); break;
         case ID_WORLD_FRAME:
             if (world_) viewport_.FrameBounds(world_->TrackBounds());
@@ -1517,6 +1525,102 @@ void MainWindow::SaveWorldAs() {
     for (auto& extension : extensions_) extension->Save();
     if (world_ && !SavePlacements()) return;
     if (WriteWorldFile(path)) SetStatusText(2, Format(L"World saved as %s", path));
+}
+
+void MainWindow::PublishWorld() {
+    if (modelsFolder_.empty() || gameFolder_.empty()) {
+        SetStatusText(2, L"Choose the game folder first: a world is published from it.");
+        return;
+    }
+    // What is still only in the editor goes into the game files first: the
+    // zip is made from those, exactly as the game would read them now.
+    for (auto& extension : extensions_) extension->Save();
+    if (world_ && !SavePlacements()) return;
+
+    const std::vector<io::PublishedFile> files = io::CollectPublishedFiles(modelsFolder_);
+    if (files.empty()) {
+        ::MessageBoxW(window_,
+                      L"This world has nothing the game reads yet.\n\nEdits reach the game files when they are "
+                      L"saved (Ctrl+S); roads and terrain when they are baked.",
+                      kWindowTitle, MB_ICONINFORMATION | MB_OK);
+        return;
+    }
+    u64 bytes = 0;
+    for (const io::PublishedFile& file : files) bytes += file.size;
+
+    const wchar_t* kAuthorValue = L"PublishAuthor";
+    wchar_t author[128] = {};
+    DWORD authorSize = sizeof(author);
+    ::RegGetValueW(HKEY_CURRENT_USER, kSettingsKey, kAuthorValue, RRF_RT_REG_SZ, nullptr, author, &authorSize);
+
+    PublishDetails details;
+    details.name = WorldDisplayName();
+    details.author = author;
+    details.note = Format(
+        L"Makes a zip that players unpack into their game folder to play this world, with no editor. "
+        L"It carries what the game reads -- %zu files, %.1f MB -- and FRSWorldLoader.asi, but not the "
+        L"world file: it cannot be opened for editing. Roads and terrain go in only once baked.",
+        files.size(), bytes / (1024.0 * 1024.0));
+    if (!AskPublishDetails(instance_, window_, details)) return;
+    ::RegSetKeyValueW(HKEY_CURRENT_USER, kSettingsKey, kAuthorValue, REG_SZ, details.author.c_str(),
+                      (DWORD)((details.author.size() + 1) * sizeof(wchar_t)));
+
+    wchar_t path[MAX_PATH * 2] = {};
+    std::wstring suggested = details.name;
+    for (wchar_t& c : suggested)
+        if (c < 32 || std::wcschr(L"<>:\"/\\|?*", c)) c = L'_';
+    suggested += L".zip";
+    wcsncpy_s(path, suggested.c_str(), _TRUNCATE);
+    OPENFILENAMEW dialog{ sizeof(dialog) };
+    dialog.hwndOwner = window_;
+    dialog.lpstrFilter = L"Zip (*.zip)\0*.zip\0";
+    dialog.lpstrFile = path;
+    dialog.nMaxFile = MAX_PATH * 2;
+    dialog.lpstrDefExt = L"zip";
+    dialog.lpstrTitle = L"Publish World";
+    dialog.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
+    if (!::GetSaveFileNameW(&dialog)) return;
+
+    wchar_t exe[MAX_PATH] = {};
+    ::GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    std::wstring editorFolder = exe;
+    editorFolder.resize(editorFolder.find_last_of(L"\\/"));
+
+    io::PublishRequest request;
+    request.gameFolder = gameFolder_;
+    request.name = details.name;
+    request.author = details.author;
+    request.description = details.description;
+    request.editorVersion = io::FileVersionText(exe);
+    // The editor's own copy (the release lays it out in game\), then the one
+    // installed in the game: the newer of the two goes in.
+    request.loaderCandidates = { editorFolder + L"\\game\\scripts\\FRSWorldLoader.asi",
+                                 gameFolder_ + L"\\scripts\\FRSWorldLoader.asi" };
+    if (::GetFileAttributesW((editorFolder + L"\\game\\dinput8.dll").c_str()) != INVALID_FILE_ATTRIBUTES)
+        request.asiLoader = editorFolder + L"\\game\\dinput8.dll";
+    request.zipPath = path;
+
+    ::SetCursor(::LoadCursorW(nullptr, IDC_WAIT));
+    io::PublishResult result;
+    std::wstring error;
+    if (!io::PublishWorld(request, result, error)) {
+        ::MessageBoxW(window_, (L"The world was not published.\n\n" + error).c_str(), kWindowTitle,
+                      MB_ICONWARNING | MB_OK);
+        return;
+    }
+
+    std::wstring regions;
+    for (const std::wstring& region : result.regions) regions += (regions.empty() ? L"" : L", ") + region;
+    SetStatusText(2, Format(L"World \"%s\" published: %s", details.name.c_str(), path));
+    const std::wstring message = Format(
+        L"\"%s\" is published:\n%s\n\n%zu world files%s%s, %.1f MB, with FRSWorldLoader.asi %s.\n\n"
+        L"Players unpack it into their game folder; the README inside says how. Show it in Explorer?",
+        details.name.c_str(), path, result.files, regions.empty() ? L"" : L" for ", regions.c_str(),
+        result.bytes / (1024.0 * 1024.0), result.loaderVersion.empty() ? L"" : result.loaderVersion.c_str());
+    if (::MessageBoxW(window_, message.c_str(), kWindowTitle, MB_ICONINFORMATION | MB_YESNO) == IDYES) {
+        const std::wstring arguments = L"/select,\"" + std::wstring(path) + L"\"";
+        ::ShellExecuteW(window_, L"open", L"explorer.exe", arguments.c_str(), nullptr, SW_SHOWNORMAL);
+    }
 }
 
 void MainWindow::SwitchToWorld(const std::wstring& target, bool createNew) {
@@ -2526,6 +2630,8 @@ void MainWindow::LoadAllSections() {
     BuildTravelMenu();
 
     for (auto& extension : extensions_) extension->OnRegionLoaded();
+    // What the extensions list in the Library is known only now.
+    catalog_.Refresh();
     PopulateSectionTree();
 
     LOG_INFO("region loaded: parse %lu ms, upload %lu ms", parseMs, uploadMs);
@@ -2543,9 +2649,13 @@ void MainWindow::PopulateSectionTree() {
     }
     sceneSignature_ = SceneSignature();
 
-    wchar_t search[128] = {};
-    ::GetWindowTextW(sideSearch_, search, 128);
-    std::wstring needle = search;
+    // The scene's own filter in the panels; the shared box in the old window.
+    std::wstring needle = sceneFilter_;
+    if (!shell_) {
+        wchar_t search[128] = {};
+        ::GetWindowTextW(sideSearch_, search, 128);
+        needle = search;
+    }
     for (wchar_t& c : needle) c = (wchar_t)::towlower(c);
     const auto matches = [&](const std::wstring& text) {
         if (needle.empty()) return true;
@@ -2701,6 +2811,7 @@ size_t MainWindow::SceneSignature() const {
 
 void MainWindow::ShowSideTab(int tab) {
     sideTab_ = tab >= 0 && tab <= (shell_ ? 3 : 2) ? tab : 0;   // 3: Online, drawn only
+    focusPanel_ = sideTab_;     // in the panels, that one comes to the front
     if (sideTab_ == 3) return;
     const bool library = sideTab_ == 1;
     const bool edits = sideTab_ == 2;
@@ -2902,10 +3013,17 @@ void MainWindow::UpdateMenuChecks() {
     const GizmoMode gizmo = viewport_.GetGizmoMode();
     const int gizmoId = gizmo == GizmoMode::Move ? ID_GIZMO_MOVE
                         : gizmo == GizmoMode::Rotate ? ID_GIZMO_ROTATE : ID_GIZMO_SCALE;
-    ::CheckMenuRadioItem(menu_, ID_GIZMO_MOVE, ID_GIZMO_SCALE, gizmoId, MF_BYCOMMAND);
+    // While an extension's tool is on, none of the three is the tool in use.
+    bool otherTool = false;
+    for (auto& extension : extensions_) otherTool = otherTool || extension->ToolActive();
+    if (otherTool)
+        for (int id : { ID_GIZMO_MOVE, ID_GIZMO_ROTATE, ID_GIZMO_SCALE })
+            ::CheckMenuItem(menu_, id, MF_BYCOMMAND | MF_UNCHECKED);
+    else
+        ::CheckMenuRadioItem(menu_, ID_GIZMO_MOVE, ID_GIZMO_SCALE, gizmoId, MF_BYCOMMAND);
     // The toolbar shows the same choice, whichever of the three made it.
     for (int id : { ID_GIZMO_MOVE, ID_GIZMO_ROTATE, ID_GIZMO_SCALE })
-        ::SendMessageW(toolbar_, TB_CHECKBUTTON, id, MAKELPARAM(id == gizmoId, 0));
+        ::SendMessageW(toolbar_, TB_CHECKBUTTON, id, MAKELPARAM(!otherTool && id == gizmoId, 0));
 
     const RenderMode mode = viewport_.GetRenderer().Mode();
     for (int id : { ID_VIEW_TEXTURED, ID_VIEW_UNLIT, ID_VIEW_VERTEX_COLOR, ID_VIEW_WIREFRAME })
@@ -3066,7 +3184,8 @@ void MainWindow::Tick(float deltaSeconds) {
             TabCtrl_SetItem(sideTabs_, 2, &item);
         }
     }
-    if (sideTab_ == 1 && catalog_.DrawPending(8)) viewport_.GetRenderer().ReleaseThumbnailTargets();
+    // The Library's pictures: always on show in the panels, in the old window only on its tab.
+    if ((shell_ || sideTab_ == 1) && catalog_.DrawPending(8)) viewport_.GetRenderer().ReleaseThumbnailTargets();
     else if (!thumbsToWarm_.empty()) WarmThumbnails(6);
 
     // Twice a second is quick enough to feel immediate after a save in Blender.

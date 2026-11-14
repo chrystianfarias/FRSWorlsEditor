@@ -133,6 +133,53 @@ struct RoadProfile {
     bool  shoulderLine = true;
     int   shoulderSides = 0;       // 0 both, 1 left only, 2 right only (in the way it was drawn)
 
+    // Zoning, as a city builder has it: the game's buildings stood along each
+    // side, facing the road, in lots up to `zoneDepth` deep (ZoneKind). They
+    // are placements of the game's own models, chosen by `zoneSeed`, kept
+    // `zoneSetback` back from the edge and `zoneGap` apart; `zoneTurn` turns
+    // every one (0, 90, 180, 270) for models whose front is another side.
+    int   zoneLeft = 0, zoneRight = 0;
+    float zoneDepth = 30.0f;
+    float zoneSetback = 1.5f;
+    float zoneGap = 2.0f;
+    int   zoneSeed = 0;
+    int   zoneTurn = 0;
+    int   Zone(int side) const { return side < 0 ? zoneLeft : zoneRight; }
+
+    // Ground beside the road, beyond its edge and wall, each side its own:
+    // bands one after another outwards -- the outer edge extruded again and
+    // again -- each `width` wide and rising (or, negative, falling) by `rise`
+    // across it, with random relief of up to `relief` growing away from the
+    // road (from `seed`: the same everywhere for the same seed, so
+    // neighbouring roads meet). An empty texture is the region's own grass.
+    struct TerrainBand {
+        float width = 20.0f;
+        float rise = 6.0f;
+    };
+    struct SideTerrain {
+        bool on = false;
+        std::vector<TerrainBand> bands{ TerrainBand{} };
+        float relief = 1.5f;
+        int   seed = 0;
+        std::string texture;
+        // Rock where the ground is steep and high: from about `rockAngle`
+        // degrees of slope, more of it the higher above the road, through a
+        // grass-and-rock texture into bare rock, the edge broken up at random.
+        bool  rock = true;
+        float rockAngle = 32.0f;
+        float rockHeight = 3.0f;
+        // The outer edge comes down (or up) to the ground there -- the game's,
+        // or terrain made in the editor -- so the two meet without a gap.
+        bool  meetGround = true;
+        float Width() const {
+            float w = 0.0f;
+            for (const TerrainBand& b : bands) w += b.width;
+            return w;
+        }
+    };
+    SideTerrain terrain[2];        // left, right (in the way the road was drawn)
+    bool  Terrain(int side) const { return terrain[side < 0 ? 0 : 1].on; }
+
     // Sidewalks on each side, for roads whose inner side has none -- the two
     // halves of a split highway.
     bool sidewalkLeft = true, sidewalkRight = true;
@@ -187,6 +234,22 @@ struct RoadProfile {
     float Edge(int side) const { return HalfRoad() + (Walk(side) ? sidewalkWidth : 0.0f); }
 };
 
+// What a side of a road is zoned for.
+enum ZoneKind { kZoneNone = 0, kZoneHouses, kZoneShops, kZoneApartments, kZoneTowers, kZoneIndustry, kZoneMixed,
+                kZoneKinds };
+const wchar_t* ZoneName(int kind);
+
+// One of the game's buildings the zones can stand along a road: its bounds in
+// its own space, and the zone it suits.
+struct BuildingModel {
+    std::string name;
+    Vec3 min, max;
+    int  kind = kZoneNone;
+};
+// The zone a game model suits, from its name and size; kZoneNone for one that
+// is not a whole building standing on flat ground.
+int ClassifyBuilding(const std::string& name, const Vec3& min, const Vec3& max);
+
 // A street light as generated: the model and where it stands, and the lamp
 // it lights the road with.
 struct Pole {
@@ -198,6 +261,38 @@ struct Pole {
     u32   color = 0;
     float radius = 0.0f;
     float strength = 0.0f;
+    float scale = 1.0f;
+    // A zoned building, not a light: where it stands, for the overlay.
+    bool  building = false;
+    Vec3  corners[4];
+};
+
+// A light placed by hand: where it stands, its lamp above, the light it
+// casts (RRGGBB, how far, how strong) -- into the roads' and terrain's
+// vertex colours, and the game's own objects' -- and, if it has one, the
+// game's model it stands as (a street light; empty: the light alone).
+struct Light {
+    u32   id = 0;
+    Vec3  position;
+    float height = 7.0f;
+    u32   color = 0xFFD9A0;
+    float radius = 22.0f;
+    float strength = 1.0f;
+    std::string model;
+    float heading = 0.0f;     // degrees
+    Vec3  Lamp() const { return position + Vec3{ 0.0f, 0.0f, height }; }
+};
+
+// A game model placed by hand or painted: a tree (with a trunk of collision
+// round it) or a prop -- one of the game's smackables keeps the physics the
+// game gives that model.
+struct Prop {
+    u32   id = 0;
+    std::string model;
+    Vec3  position;
+    float heading = 0.0f;     // degrees
+    float scale = 1.0f;
+    bool  tree = false;
 };
 
 struct Node {
@@ -237,6 +332,12 @@ struct Segment {
     // the road was drawn: a lane gained or dropped on one side keeps the
     // other side's edge in line with the road before it.
     float shift = 0.0f;
+    // How the curve is shaped, as the road tools draw it: 0 automatically
+    // from the nodes and the roads beside it, 1 straight from node to node,
+    // 2 leaving each node in a fixed direction (degrees, from that node into
+    // the road) with the handles' lengths -- a curve drawn by hand.
+    int   shape = 0;
+    float dirA = 0.0f, dirB = 0.0f;
     // Where the cross-section's middle sits right of the road's line: the
     // shift, plus half the difference a shoulder on one side only makes --
     // so the lanes stay on the line whichever sides have one.
@@ -303,8 +404,8 @@ struct MeshPiece {
 class Network {
 public:
     void Clear() {
-        nodes_.clear(); segments_.clear(); cuts_.clear(); gameJunctions_.clear(); faceJunctions_.clear();
-        nextId_ = 1; SetDirty();
+        nodes_.clear(); segments_.clear(); cuts_.clear(); gameJunctions_.clear(); faceJunctions_.clear(); lights_.clear(); props_.clear();
+        nextId_ = 1; fillBetween_ = false; SetDirty();
     }
 
     const std::vector<Node>& Nodes() const { return nodes_; }
@@ -318,6 +419,52 @@ public:
     int SegmentIndex(u32 id) const;
 
     u32 AddNode(const Vec3& position);
+
+    // Lights placed by hand (they share the nodes' and roads' ids).
+    const std::vector<Light>& Lights() const { return lights_; }
+    u32 AddLight(Light light) {
+        light.id = nextId_++;
+        lights_.push_back(std::move(light));
+        SetDirty();
+        return lights_.back().id;
+    }
+    Light* FindLight(u32 id) {
+        for (Light& l : lights_)
+            if (l.id == id) return &l;
+        return nullptr;
+    }
+    const Light* FindLight(u32 id) const {
+        for (const Light& l : lights_)
+            if (l.id == id) return &l;
+        return nullptr;
+    }
+    // Trees and props (they share the ids too).
+    const std::vector<Prop>& Props() const { return props_; }
+    u32 AddProp(Prop prop) {
+        prop.id = nextId_++;
+        props_.push_back(std::move(prop));
+        SetDirty();
+        return props_.back().id;
+    }
+    Prop* FindProp(u32 id) {
+        for (Prop& p : props_)
+            if (p.id == id) return &p;
+        return nullptr;
+    }
+    const Prop* FindProp(u32 id) const {
+        for (const Prop& p : props_)
+            if (p.id == id) return &p;
+        return nullptr;
+    }
+    void RemoveProps(const std::function<bool(const Prop&)>& which) {
+        props_.erase(std::remove_if(props_.begin(), props_.end(), which), props_.end());
+        SetDirty();
+    }
+    void RemoveLight(u32 id) {
+        lights_.erase(std::remove_if(lights_.begin(), lights_.end(), [id](const Light& l) { return l.id == id; }),
+                      lights_.end());
+        SetDirty();
+    }
     // Null when either node is missing, they are the same, or already joined.
     Segment* AddSegment(u32 a, u32 b, const RoadProfile& profile);
 
@@ -403,7 +550,7 @@ public:
         std::vector<Pole> lamps;
     };
     void SetLightSources(std::shared_ptr<const LightSources> sources) { light_ = std::move(sources); SetDirty(); }
-    const LightSources* Light() const { return light_.get(); }
+    const LightSources* Lighting() const { return light_.get(); }
     // Removes the segment, and either end left with nothing.
     void RemoveSegment(u32 id);
 
@@ -438,6 +585,22 @@ public:
     using ModelBounds = std::function<bool(const std::string& model, Vec3& min, Vec3& max)>;
     void SetModelBounds(ModelBounds query) { modelBounds_ = std::move(query); }
 
+    // The game's buildings the zones choose from (ClassifyBuilding).
+    void SetBuildingModels(std::vector<BuildingModel> models) { buildings_ = std::move(models); SetDirty(); }
+    const std::vector<BuildingModel>& BuildingModels() const { return buildings_; }
+    // The texture of ground beside roads that do not name one: the region's grass.
+    void SetGroundTexture(const std::string& texture) { groundTexture_ = texture; SetDirty(); }
+    // The region's rock for steep ground, and its grass-into-rock texture
+    // between the two (empty: none, grass straight into rock).
+    void SetRockTextures(const std::string& rock, const std::string& mix) {
+        rockTexture_ = rock;
+        rockMixTexture_ = mix;
+        SetDirty();
+    }
+    // Ground filling every area the roads close all round (optional, saved).
+    bool FillBetween() const { return fillBetween_; }
+    void SetFillBetween(bool on) { fillBetween_ = on; SetDirty(); }
+
     // Save and load, as text.
     bool Save(const std::wstring& path) const;
     bool Load(const std::wstring& path);
@@ -454,9 +617,21 @@ private:
     std::vector<GameCut> cuts_;
     std::vector<GameJunction> gameJunctions_;
     std::vector<FaceJunction> faceJunctions_;
+    std::vector<Light> lights_;
+    std::vector<Prop> props_;
     GroundQuery ground_;
     ModelBounds modelBounds_;
+    std::vector<BuildingModel> buildings_;
+    std::string groundTexture_ = "TRN_OLDTOWNGRASS";
+    std::string rockTexture_ = "TRN_ROCKCLIFFA_KT", rockMixTexture_ = "TRN_GRASSACLIFFA";
     std::shared_ptr<const LightSources> light_;
+
+    // The zoned buildings along every road, after the roads themselves: each
+    // a pole that is a building, with a box of collision round it.
+    void PlaceBuildings(std::vector<Pole>& poles, std::vector<MeshPiece>& pieces) const;
+    // Ground in every area roads close all round, when fillBetween_.
+    void BuildFills(std::vector<MeshPiece>& pieces) const;
+    bool fillBetween_ = false;
     u32 nextId_ = 1;
     bool dirty_ = true;
     u64 revision_ = 1;

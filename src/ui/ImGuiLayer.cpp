@@ -201,15 +201,23 @@ void ImGuiLayer::BuildDefaultLayout(unsigned int dockspace) {
     // A layout from before the Explorer panel existed is rebuilt too.
     ImGuiDockNode* node = ImGui::DockBuilderGetNode(dockspace);
     ImGuiWindowSettings* explorer = ImGui::FindWindowSettingsByID(ImHashStr("###Explorer"));
-    if (node && node->IsSplitNode() && explorer) return;
+    // ... and one from before the Library, Online and Edits were panels of their own.
+    ImGuiWindowSettings* library = ImGui::FindWindowSettingsByID(ImHashStr("###Library"));
+    if (node && node->IsSplitNode() && explorer && library) return;
     ImGui::DockBuilderRemoveNode(dockspace);
     ImGui::DockBuilderAddNode(dockspace, ImGuiDockNodeFlags_DockSpace | ImGuiDockNodeFlags_PassthruCentralNode);
     ImGui::DockBuilderSetNodeSize(dockspace, ImGui::GetMainViewport()->Size);
     ImGuiID centre = dockspace;
     const ImGuiID right = ImGui::DockBuilderSplitNode(centre, ImGuiDir_Right, 0.27f, nullptr, &centre);
     const ImGuiID left = ImGui::DockBuilderSplitNode(centre, ImGuiDir_Left, 0.27f, nullptr, &centre);
+    ImGuiID leftTop = left;
+    const ImGuiID leftBottom = ImGui::DockBuilderSplitNode(leftTop, ImGuiDir_Down, 0.5f, nullptr, &leftTop);
+    const ImGuiID bottom = ImGui::DockBuilderSplitNode(centre, ImGuiDir_Down, 0.24f, nullptr, &centre);
     ImGui::DockBuilderDockWindow("###Properties", right);
-    ImGui::DockBuilderDockWindow("###Explorer", left);
+    ImGui::DockBuilderDockWindow("###Explorer", leftTop);
+    ImGui::DockBuilderDockWindow("###Library", leftBottom);
+    ImGui::DockBuilderDockWindow("###Online", leftBottom);
+    ImGui::DockBuilderDockWindow("###Edits", bottom);
     ImGui::DockBuilderFinish(dockspace);
 }
 

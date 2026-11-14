@@ -38,6 +38,10 @@ public:
         // shelf, when not one of the region's, is listed first.
         const void* owner = nullptr;
         std::string key;
+        // An extension's row with no model draws its own picture instead:
+        // ModelThumbnails::kSize square, BGRA. False shows the "no picture"
+        // swatch.
+        std::function<bool(std::vector<u32>& bgra)> picture;
         bool IsExtra() const { return owner != nullptr; }
     };
 

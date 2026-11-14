@@ -93,6 +93,14 @@ public:
     virtual bool ApplyProperties() { return false; }
     virtual bool DeleteSelection() { return false; }
     virtual bool MoveSelectionToView() { return false; }
+
+    // Tools are exclusive -- the gizmo's move, rotate and scale among them.
+    // Whether one of this extension's own tools is on; turn them all off
+    // (another tool, or the gizmo, is starting); and a 1/2/3 key the gizmo
+    // would take, offered to a tool that is on first (true: it used it).
+    virtual bool ToolActive() const { return false; }
+    virtual void CloseTools() {}
+    virtual bool ToolDigit(int digit) { (void)digit; return false; }
     // G and R on a point with a heading (Viewport::SetPointEditor).
     virtual bool GetPoint(Vec3& position, float& heading) { (void)position; (void)heading; return false; }
     virtual bool SetPoint(const Vec3& position, float heading, bool commit) {
