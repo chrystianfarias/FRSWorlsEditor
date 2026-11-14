@@ -13,6 +13,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 add_library(FRSWorldLoader SHARED
     src/Main.cpp
     src/FileEdits.cpp
+    src/Markers.cpp
     src/Recorder.cpp
     src/RouteProbe.cpp
     src/Version.rc

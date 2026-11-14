@@ -24,6 +24,7 @@
 #include "minimap/MinimapBuildings.h"   // MINIMAP PREVIEW (temporary)
 #include "render/RenderExtension.h"
 #include "ui/Resource.h"
+#include "ui/MarkersExtension.h"
 #include "ui/RoadsExtension.h"
 #include "ui/SetupWizard.h"
 #include "ui/WorldDialogs.h"
@@ -676,6 +677,8 @@ void MainWindow::OnCreate() {
 
     // Whatever this build adds, once everything it may build on is up.
     extensions_ = CreateEditorExtensions(*this);
+    // After the private ones: a click tries what stands in front of a beacon first.
+    extensions_.push_back(CreateMarkersExtension(*this));
     extensions_.push_back(CreateRoadsExtension(*this));
     // The mesh editor (ui/MeshTools.h), asked before the collision tools so
     // that while it edits, Ctrl+Z steps its own edit back.

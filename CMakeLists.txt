@@ -31,6 +31,10 @@ add_executable(FRSWorldEditor WIN32
     src/io/WorldProfiles.cpp
     src/io/WorldFile.cpp
     src/io/WorldPublish.cpp
+    src/io/MarkerWrite.cpp
+    src/io/MarkerEffects.cpp
+    src/nfs/Markers.cpp
+    src/ui/MarkersExtension.cpp
     src/io/SelectionExport.cpp
     src/io/SelectionImport.cpp
     src/nfs/ChunkReader.cpp

@@ -48,6 +48,7 @@ private:
     friend struct ExtensionAccess;
     // The procedural roads (ui/RoadsExtension.cpp), built into every editor.
     friend struct RoadsAccess;
+    friend struct MarkersAccess;
 
     static LRESULT CALLBACK WndProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
     LRESULT Handle(UINT message, WPARAM wParam, LPARAM lParam);

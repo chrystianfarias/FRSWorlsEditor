@@ -7,6 +7,7 @@
 //   FileEdits.cpp    meshes, sections and whole files from <game>\models
 //   Main.cpp         the log, the settings, the game-thread frame, the
 //                    player's pose, the launch pose, DllMain
+//   Markers.cpp      shops placed in the editor: discovered, on the road, on the minimap
 //   Recorder.cpp     a memory recorder for reverse engineering (off by default)
 //
 // A build can link parts of its own in (see CMakeLists.txt); this
@@ -71,6 +72,8 @@ bool PlayerPose(Pose& out);
 
 void StartFileEdits();      // from DllMain: the file replacements must be early
 void LogFileEditTotals();   // on the way out
+void InstallPlacedShopHooks();   // Markers.cpp, from DllMain on v1.2
+void PlacedShopsFrame();
 void StartRecorder();
 void StartRouteProbe();     // [RouteProbe] in the .ini; off by default
 void RouteProbeFrame();

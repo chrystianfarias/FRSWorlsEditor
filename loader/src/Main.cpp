@@ -305,6 +305,7 @@ void __cdecl Frame() {
         g_firstFrame = false;
         ReadLaunchPose();
     }
+    PlacedShopsFrame();
     ExtensionsFrame();
     LaunchPoseFrame();
     RouteProbeFrame();
@@ -354,6 +355,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
     }
     Log(HookVehicleUpdate() ? "player pose: vehicle update hooked at 0x5A5540"
                             : "player pose: 0x5A5540 is not the expected code; no launch pose");
+    InstallPlacedShopHooks();
     InstallExtensions();
     Log(HookMainLoop() ? "frame: main loop hooked at 0x581475"
                        : "frame: 0x581475 is not a call; the launch pose stays off");
