@@ -8,6 +8,8 @@
 #include <cfloat>
 #include <cmath>
 #include <cstring>
+#include <limits>
+#include <unordered_map>
 
 namespace nfs {
 
@@ -99,15 +101,179 @@ float CollisionPack::GroundHeightNear(const Vec3& point, float fallback) const {
     return height;
 }
 
+namespace {
+
+// Distance in plan from p to the segment a-b.
+float PlanDistance(const Vec3& p, const Vec3& a, const Vec3& b) {
+    const float dx = b.x - a.x, dy = b.y - a.y;
+    const float length = dx * dx + dy * dy;
+    float t = length > 1e-9f ? ((p.x - a.x) * dx + (p.y - a.y) * dy) / length : 0.0f;
+    t = std::clamp(t, 0.0f, 1.0f);
+    const float ex = a.x + dx * t - p.x, ey = a.y + dy * t - p.y;
+    return std::sqrt(ex * ex + ey * ey);
+}
+
+// The height of the triangle's plane at p, when p lies over it (or within
+// `reach` of it in plan).
+bool TriangleHeight(const Vec3& a, const Vec3& b, const Vec3& c, const Vec3& p, float reach, float& z) {
+    const float d = (b.y - c.y) * (a.x - c.x) + (c.x - b.x) * (a.y - c.y);
+    if (std::fabs(d) < 1e-6f) return false;   // seen edge on: a wall
+    const float u = ((b.y - c.y) * (p.x - c.x) + (c.x - b.x) * (p.y - c.y)) / d;
+    const float v = ((c.y - a.y) * (p.x - c.x) + (a.x - c.x) * (p.y - c.y)) / d;
+    const float w = 1.0f - u - v;
+    const bool inside = u >= 0.0f && v >= 0.0f && w >= 0.0f;
+    if (!inside && PlanDistance(p, a, b) > reach && PlanDistance(p, b, c) > reach && PlanDistance(p, c, a) > reach)
+        return false;
+    z = u * a.z + v * b.z + w * c.z;
+    return true;
+}
+
+} // namespace
+
+void CollisionPack::GroundHeightsAt(const Vec3& point, float reach, std::vector<float>& out) const {
+    out.clear();
+    for (const CollisionPolygon& polygon : polygons) {
+        if (polygon.barrier || polygon.Vertical()) continue;
+        float z = 0.0f;
+        const Vec3* c = polygon.corners;
+        bool found = TriangleHeight(c[0], c[1], c[2], point, reach, z);
+        if (!found && polygon.quad) found = TriangleHeight(c[0], c[2], c[3], point, reach, z);
+        if (!found) continue;
+        bool known = false;
+        for (float h : out) known |= std::fabs(h - z) < 0.5f;
+        if (!known) out.push_back(z);
+    }
+}
+
 void CollisionPack::BarrierQuad(const CollisionPolygon& barrier, Vec3 out[4]) const {
     const Vec3& a = barrier.corners[0];
     const Vec3& b = barrier.corners[2];
-    const float za = GroundHeightNear(a, 0.0f);
-    const float zb = GroundHeightNear(b, za);
+    float za = 0.0f, zb = 0.0f;
+    const ptrdiff_t index = &barrier - polygons.data();
+    if (barrierFor_ == polygons.data() && barrierSize_ == polygons.size() && index >= 0 &&
+        (size_t)index < barrierZ_.size() && barrierZ_[(size_t)index].first == barrierZ_[(size_t)index].first) {
+        za = barrierZ_[(size_t)index].first;
+        zb = barrierZ_[(size_t)index].second;
+    } else {
+        BarrierEnds(barrier, za, zb);
+    }
     out[0] = { a.x, a.y, za - kBarrierBelow };
     out[1] = { a.x, a.y, za + kBarrierAbove };
     out[2] = { b.x, b.y, zb + kBarrierAbove };
     out[3] = { b.x, b.y, zb - kBarrierBelow };
+}
+
+void CollisionPack::ResolveBarriers() const {
+    const size_t count = polygons.size();
+    const float unknown = std::numeric_limits<float>::quiet_NaN();
+    barrierZ_.assign(count, { unknown, unknown });
+    barrierFor_ = polygons.data();
+    barrierSize_ = count;
+
+    // The layers under each end; a barrier with one choice is settled.
+    std::vector<std::vector<float>> under(count * 2);
+    std::vector<char> settled(count, 0);
+    const auto key = [](const Vec3& p) {
+        return ((long long)std::lround(p.x * 10.0f) << 32) ^ (long long)(std::lround(p.y * 10.0f) & 0xFFFFFFFF);
+    };
+    std::unordered_map<long long, std::vector<size_t>> ends;   // spot -> barrier*2 + end
+    size_t barriers = 0;
+    for (size_t i = 0; i < count; ++i) {
+        const CollisionPolygon& p = polygons[i];
+        if (!p.barrier) continue;
+        ++barriers;
+        GroundHeightsAt(p.corners[0], 0.75f, under[i * 2]);
+        GroundHeightsAt(p.corners[2], 0.75f, under[i * 2 + 1]);
+        ends[key(p.corners[0])].push_back(i * 2);
+        ends[key(p.corners[2])].push_back(i * 2 + 1);
+        if (under[i * 2].size() <= 1 && under[i * 2 + 1].size() <= 1 &&
+            (!under[i * 2].empty() || !under[i * 2 + 1].empty())) {
+            float za = 0.0f, zb = 0.0f;
+            BarrierEnds(p, za, zb);
+            barrierZ_[i] = { za, zb };
+            settled[i] = 1;
+        }
+    }
+    if (!barriers) return;
+
+    // Outwards along the chains: an unsettled barrier takes, at an end it
+    // shares with a settled one, the layer nearest that one's height there.
+    for (int pass = 0; pass < 64; ++pass) {
+        bool changed = false;
+        for (size_t i = 0; i < count; ++i) {
+            const CollisionPolygon& p = polygons[i];
+            if (!p.barrier || settled[i]) continue;
+            float reference[2] = { 0.0f, 0.0f };
+            bool have[2] = { false, false };
+            for (int end = 0; end < 2; ++end) {
+                const auto found = ends.find(key(p.corners[end * 2]));
+                if (found == ends.end()) continue;
+                for (size_t other : found->second) {
+                    const size_t j = other / 2;
+                    if (j == i || !settled[j]) continue;
+                    reference[end] = (other & 1) ? barrierZ_[j].second : barrierZ_[j].first;
+                    have[end] = true;
+                    break;
+                }
+            }
+            if (!have[0] && !have[1]) continue;
+            // The pair of layers that agrees best with the neighbours and
+            // keeps the barrier level.
+            std::vector<float> atA = under[i * 2], atB = under[i * 2 + 1];
+            if (atA.empty()) atA.push_back(have[0] ? reference[0] : have[1] ? reference[1] : 0.0f);
+            if (atB.empty()) atB.push_back(have[1] ? reference[1] : have[0] ? reference[0] : 0.0f);
+            float za = atA.front(), zb = atB.front(), best = 1e30f;
+            for (float ha : atA)
+                for (float hb : atB) {
+                    const float score = (have[0] ? std::fabs(ha - reference[0]) : 0.0f) +
+                                        (have[1] ? std::fabs(hb - reference[1]) : 0.0f) + 2.0f * std::fabs(ha - hb);
+                    if (score < best) { best = score; za = ha; zb = hb; }
+                }
+            barrierZ_[i] = { za, zb };
+            settled[i] = 1;
+            changed = true;
+        }
+        if (!changed) break;
+    }
+    // Whatever no chain reached: each on its own.
+    for (size_t i = 0; i < count; ++i) {
+        if (!polygons[i].barrier || settled[i]) continue;
+        float za = 0.0f, zb = 0.0f;
+        BarrierEnds(polygons[i], za, zb);
+        barrierZ_[i] = { za, zb };
+    }
+}
+
+void CollisionPack::BarrierEnds(const CollisionPolygon& barrier, float& za, float& zb) const {
+    const Vec3& a = barrier.corners[0];
+    const Vec3& b = barrier.corners[2];
+    // A barrier stores no height. Each end stands on the ground under it --
+    // and where roads cross over each other there is more than one ground:
+    // the pair of layers that keeps the barrier most level is the one it
+    // belongs to (a barrier runs along one road, not from one deck to another).
+    std::vector<float> under[2];
+    GroundHeightsAt(a, 0.75f, under[0]);
+    GroundHeightsAt(b, 0.75f, under[1]);
+    za = 0.0f;
+    zb = 0.0f;
+    if (!under[0].empty() && !under[1].empty()) {
+        float best = 1e30f;
+        for (float ha : under[0])
+            for (float hb : under[1])
+                if (std::fabs(ha - hb) < best) { best = std::fabs(ha - hb); za = ha; zb = hb; }
+    } else if (!under[0].empty() || !under[1].empty()) {
+        // One end over nothing: the layer under the other end nearest where the
+        // nearest ground corner puts it, for both.
+        const bool haveA = !under[0].empty();
+        const float guess = GroundHeightNear(haveA ? b : a, 0.0f);
+        float known = (haveA ? under[0] : under[1]).front();
+        for (float h : haveA ? under[0] : under[1])
+            if (std::fabs(h - guess) < std::fabs(known - guess)) known = h;
+        za = zb = known;   // level with the end that stands on something
+    } else {
+        za = GroundHeightNear(a, 0.0f);
+        zb = GroundHeightNear(b, za);
+    }
 }
 
 // Recovers a global listing order from the cells: consecutive entries of a
@@ -431,12 +597,63 @@ bool EncodeCollision(const CollisionPack& pack, std::vector<u8>& chunk, std::wst
         }
     }
 
+    // The order within a cell matters to the game. Every shipped cell lists
+    // its ground first, then walls, then barriers, then the ground flagged
+    // 0x08 (14 550 cells of L4RA: nothing ever goes back to plain ground
+    // after another kind). The wheels read a cell's ground from the top and
+    // stop where the walls and barriers begin: plain ground listed after a
+    // barrier is there for the car's body but not for its wheels, which sink
+    // through it and lose their grip. A pack with the polygons it shipped
+    // with keeps its recovered order (byte for byte); any other is ordered
+    // by kind, file order within each.
     const bool ranked = pack.gridRank.size() == count;
-    for (auto& cell : cells)
-        if (ranked)
+    const auto kind = [&](u16 index) {
+        const CollisionPolygon& polygon = pack.polygons[index];
+        if (polygon.barrier) return 2;
+        if (polygon.attributes[3] & 0x02) return 1;   // the bytes the encoder writes
+        return (polygon.attributes[3] & 0x08) ? 3 : 0;
+    };
+    // Within its ground, the game's wheel takes the FIRST face of the list
+    // that lies under it (or less than 1 m over it) and stops looking (MW's
+    // WWorldPos::FindClosestFace, the same scheme). Where two grounds overlap
+    // -- a new road over the old one, the start of a ramp -- the lower one
+    // listed first wins, and the wheel sinks through the upper one. Listed
+    // highest first, a wheel on the upper one finds it, and a wheel under it
+    // (a road under a bridge, more than 1 m below) skips it to the next.
+    const auto groundHeight = [&](u16 index) {
+        const CollisionPolygon& polygon = pack.polygons[index];
+        const int n = polygon.quad ? 4 : 3;
+        float sum = 0.0f;
+        for (int c = 0; c < n; ++c) sum += polygon.corners[c].z;
+        return sum / (float)n;
+    };
+    const auto byKindThenHeight = [&](const auto& a, const auto& b) {
+        const int ka = kind(a.first), kb = kind(b.first);
+        if (ka != kb) return ka < kb;
+        if (ka == 0 || ka == 3) return groundHeight(a.first) > groundHeight(b.first);
+        return false;
+    };
+    for (auto& cell : cells) {
+        if (pack.edited) {
+            if (ranked)
+                std::stable_sort(cell.begin(), cell.end(), [&](const auto& a, const auto& b) {
+                    return pack.gridRank[a.first] < pack.gridRank[b.first];
+                });
+            std::stable_sort(cell.begin(), cell.end(), byKindThenHeight);
+            continue;
+        }
+        if (ranked) {
             std::stable_sort(cell.begin(), cell.end(), [&](const auto& a, const auto& b) {
                 return pack.gridRank[a.first] < pack.gridRank[b.first];
             });
+            // A rank read back from a file this editor wrote before the rule
+            // above may put plain ground late: brought to the front. No
+            // shipped cell is touched by this -- none has ground late.
+            std::stable_partition(cell.begin(), cell.end(), [&](const auto& e) { return kind(e.first) == 0; });
+        } else
+            std::stable_sort(cell.begin(), cell.end(),
+                             [&](const auto& a, const auto& b) { return kind(a.first) < kind(b.first); });
+    }
 
     std::vector<u8> refs, table((size_t)(width * height) * 4, 0);
     size_t first = 0;

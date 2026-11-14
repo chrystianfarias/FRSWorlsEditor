@@ -42,6 +42,7 @@ std::vector<std::pair<size_t, size_t>> RecordBodies(ByteSpan span) {
 bool Preculler::Parse(ByteSpan bunFile) {
     zones_.clear();
     visible_.clear();
+    records_.clear();
 
     ChunkReader reader(bunFile, 0);
     Chunk chunk;
@@ -77,6 +78,8 @@ bool Preculler::Parse(ByteSpan bunFile) {
                     zone.ring.push_back({ body.read<float>(4 + i * 8),
                                           body.read<float>(8 + i * 8), 0.0f });
 
+                zone.recordOffset = (u64)(child.data.data - bunFile.data) + offset;
+                zone.recordLength = (u32)length;
                 if (zone.ring.size() >= 3) zones_.push_back(std::move(zone));
             }
         } else if (child.id == kChunkZoneVisibility) {
@@ -93,6 +96,7 @@ bool Preculler::Parse(ByteSpan bunFile) {
                     sections.push_back(body.read<u16>(12 + i * 2));
 
                 visible_[id] = std::move(sections);
+                records_[id] = { (u64)(child.data.data - bunFile.data) + offset, (u32)length };
             }
         }
     }
@@ -122,6 +126,89 @@ bool Preculler::Listed(u32 sectionNumber) const {
         for (u32 number : sections)
             if (number == sectionNumber) return true;
     return false;
+}
+
+int Preculler::ListedZoneAt(const Vec3& point) const {
+    const Zone* best = nullptr;
+    float bestArea = 0.0f;
+    for (const Zone& zone : zones_) {
+        if (visible_.find(zone.id) == visible_.end() || !Contains(zone, point.x, point.y)) continue;
+        const float area = (zone.boundsMax.x - zone.boundsMin.x) * (zone.boundsMax.y - zone.boundsMin.y);
+        if (!best || area < bestArea) { best = &zone; bestArea = area; }
+    }
+    return best ? (int)best->id : -1;
+}
+
+void Preculler::ZoneIdsNear(const Vec3& point, float radius, std::vector<u32>& ids) const {
+    ids.clear();
+    for (const Zone& zone : zones_) {
+        if (visible_.find(zone.id) == visible_.end() || zone.ring.size() < 3) continue;
+        if (point.x < zone.boundsMin.x - radius || point.x > zone.boundsMax.x + radius ||
+            point.y < zone.boundsMin.y - radius || point.y > zone.boundsMax.y + radius)
+            continue;
+        bool close = Contains(zone, point.x, point.y);
+        for (size_t i = 0; i < zone.ring.size() && !close; ++i) {
+            const Vec3& a = zone.ring[i];
+            const Vec3& b = zone.ring[(i + 1) % zone.ring.size()];
+            const float dx = b.x - a.x, dy = b.y - a.y, length = dx * dx + dy * dy;
+            float t = length > 1e-9f ? ((point.x - a.x) * dx + (point.y - a.y) * dy) / length : 0.0f;
+            t = std::clamp(t, 0.0f, 1.0f);
+            const float ex = a.x + dx * t - point.x, ey = a.y + dy * t - point.y;
+            close = ex * ex + ey * ey <= radius * radius;
+        }
+        if (close) ids.push_back(zone.id);
+    }
+}
+
+void Preculler::ListsNear(const Vec3& point, float radius, std::vector<std::vector<u32>>& lists) const {
+    lists.clear();
+    for (const Zone& zone : zones_) {
+        const auto found = visible_.find(zone.id);
+        if (found == visible_.end() || zone.ring.size() < 3) continue;
+        if (point.x < zone.boundsMin.x - radius || point.x > zone.boundsMax.x + radius ||
+            point.y < zone.boundsMin.y - radius || point.y > zone.boundsMax.y + radius)
+            continue;
+        bool near = Contains(zone, point.x, point.y);
+        for (size_t i = 0; i < zone.ring.size() && !near; ++i) {
+            const Vec3& a = zone.ring[i];
+            const Vec3& b = zone.ring[(i + 1) % zone.ring.size()];
+            const float dx = b.x - a.x, dy = b.y - a.y, length = dx * dx + dy * dy;
+            float t = length > 1e-9f ? ((point.x - a.x) * dx + (point.y - a.y) * dy) / length : 0.0f;
+            t = std::clamp(t, 0.0f, 1.0f);
+            const float ex = a.x + dx * t - point.x, ey = a.y + dy * t - point.y;
+            near = ex * ex + ey * ey <= radius * radius;
+        }
+        if (!near) continue;
+        std::vector<u32> list = found->second;
+        std::sort(list.begin(), list.end());
+        list.erase(std::unique(list.begin(), list.end()), list.end());
+        lists.push_back(std::move(list));
+    }
+}
+
+int Preculler::ZoneAt(float x, float y) const {
+    int best = -1;
+    float bestArea = 0.0f;
+    for (size_t i = 0; i < zones_.size(); ++i) {
+        const Zone& zone = zones_[i];
+        if (visible_.find(zone.id) == visible_.end() || !Contains(zone, x, y)) continue;
+        const float area = (zone.boundsMax.x - zone.boundsMin.x) * (zone.boundsMax.y - zone.boundsMin.y);
+        if (best < 0 || area < bestArea) { best = (int)i; bestArea = area; }
+    }
+    return best;
+}
+
+const std::vector<u32>* Preculler::ListOf(u32 zoneId) const {
+    const auto found = visible_.find(zoneId);
+    return found == visible_.end() ? nullptr : &found->second;
+}
+
+bool Preculler::ListRecord(u32 zoneId, u64& fileOffset, u32& length) const {
+    const auto found = records_.find(zoneId);
+    if (found == records_.end()) return false;
+    fileOffset = found->second.first;
+    length = found->second.second;
+    return true;
 }
 
 bool Preculler::VisibleAt(const Vec3& point, std::vector<u32>& sections) const {

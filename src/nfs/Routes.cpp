@@ -221,6 +221,12 @@ bool Graph::AddSignpost(u16 srcRoute, u16 srcNode, u16 dstRoute, u16 dstNode, bo
     return true;
 }
 
+bool Graph::AddDeadEnd(u16 routeId, u16 node, std::wstring& error) {
+    if (!AddSignpost(routeId, node, routeId, node, node == 0, false, 7, 7, error)) return false;
+    signposts_.back().unk10 = 0;     // as on all 29 shipped ones
+    return true;
+}
+
 bool Graph::InsertNode(u16 routeId, u16 index, float x, float y, float z, std::wstring& error) {
     Route* r = Find(routeId);
     if (!r || index == 0 || index >= r->nodes.size()) { error = L"a node can only go inside a road"; return false; }

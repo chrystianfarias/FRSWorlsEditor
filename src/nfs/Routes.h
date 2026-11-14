@@ -119,6 +119,11 @@ public:
     // Appends a signpost and hooks it into the source node's first free slot.
     bool AddSignpost(u16 srcRoute, u16 srcNode, u16 dstRoute, u16 dstNode, bool backward, bool flip, int a,
                      int b, std::wstring& error);
+    // Marks a route end that leads nowhere the way the shipped routes do: a
+    // link from the end node to itself that nothing may take (A = B = 7),
+    // backward at a route's first node. A route end with no link at all is
+    // dropped by the game at load, and the route with it.
+    bool AddDeadEnd(u16 route, u16 node, std::wstring& error);
     // Inserts a node before `index` (1..count-1), copying the one before, and
     // renumbers every reference to the route's later nodes.
     bool InsertNode(u16 route, u16 index, float x, float y, float z, std::wstring& error);

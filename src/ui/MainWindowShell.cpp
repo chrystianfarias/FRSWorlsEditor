@@ -16,6 +16,7 @@
 #include "io/LightBake.h"
 #include "io/SelectionExport.h"
 #include "ui/MeshTools.h"
+#include "ui/ZoneTools.h"
 #include "ui/OnlineLibrary.h"
 #include "ui/Resource.h"
 
@@ -456,50 +457,98 @@ void MainWindow::DrawShellEdits() {
         ImGui::TextDisabled("No edits in this region yet.");
         return;
     }
-    const ImGuiTableFlags flags = ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_Resizable |
-                                  ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX | ImGuiTableFlags_SizingFixedFit;
-    if (!ImGui::BeginTable("##edits", columns + 1, flags)) return;
-    ImGui::TableSetupScrollFreeze(1, 1);
-    ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFrameHeight());
-    for (int c = 0; c < columns; ++c) {
-        wchar_t text[100] = {};
-        LVCOLUMNW column{};
-        column.mask = LVCF_TEXT;
-        column.pszText = text;
-        column.cchTextMax = 99;
-        ::SendMessageW(list, LVM_GETCOLUMNW, (WPARAM)c, (LPARAM)&column);
-        ImGui::TableSetupColumn(Utf8(text).c_str());
+
+    const auto cellText = [&](int i, int c) {
+        wchar_t text[300] = {};
+        LVITEMW item{};
+        item.iSubItem = c;
+        item.pszText = text;
+        item.cchTextMax = 299;
+        ::SendMessageW(list, LVM_GETITEMTEXTW, (WPARAM)i, (LPARAM)&item);
+        return Utf8(text);
+    };
+    const auto isTicked = [&](int i) {
+        const UINT state = (UINT)::SendMessageW(list, LVM_GETITEMSTATE, (WPARAM)i, LVIS_STATEIMAGEMASK);
+        return ((state & LVIS_STATEIMAGEMASK) >> 12) == 2;
+    };
+    const auto setTicked = [&](int i, bool ticked) {
+        LVITEMW item{};
+        item.stateMask = LVIS_STATEIMAGEMASK;
+        item.state = INDEXTOSTATEIMAGEMASK(ticked ? 2 : 1);
+        ::SendMessageW(list, LVM_SETITEMSTATE, (WPARAM)i, (LPARAM)&item);
+    };
+
+    // One group per kind of change (the Change column), in the order they
+    // first appear. A group's line runs the whole width, over the columns;
+    // its box ticks or clears every edit in it.
+    const int kindColumn = columns > 1 ? 1 : 0;
+    std::vector<std::pair<std::string, std::vector<int>>> groups;
+    for (int i = 0; i < items; ++i) {
+        const std::string kind = cellText(i, kindColumn);
+        auto found = std::find_if(groups.begin(), groups.end(), [&](const auto& g) { return g.first == kind; });
+        if (found == groups.end()) groups.push_back({ kind, { i } });
+        else found->second.push_back(i);
     }
-    ImGui::TableHeadersRow();
-    ImGuiListClipper clipper;
-    clipper.Begin(items);
-    while (clipper.Step()) {
-        for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; ++i) {
+
+    // The rows of every group are tables with one id, so their columns keep
+    // the same widths; the first one carries the headers.
+    const ImGuiTableFlags flags = ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_Resizable |
+                                  ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_NoSavedSettings;
+    const auto beginRows = [&](bool headers) {
+        if (!ImGui::BeginTable("##editrows", columns + 1, flags)) return false;
+        ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFrameHeight());
+        for (int c = 0; c < columns; ++c) {
+            wchar_t text[100] = {};
+            LVCOLUMNW column{};
+            column.mask = LVCF_TEXT;
+            column.pszText = text;
+            column.cchTextMax = 99;
+            ::SendMessageW(list, LVM_GETCOLUMNW, (WPARAM)c, (LPARAM)&column);
+            ImGui::TableSetupColumn(Utf8(text).c_str());
+        }
+        if (headers) ImGui::TableHeadersRow();
+        return true;
+    };
+
+    if (!ImGui::BeginChild("##editsscroll", ImVec2(0, 0), ImGuiChildFlags_None, ImGuiWindowFlags_HorizontalScrollbar)) {
+        ImGui::EndChild();
+        return;
+    }
+    if (beginRows(true)) ImGui::EndTable();
+    for (const auto& [kind, rows] : groups) {
+        size_t tickedCount = 0;
+        for (int i : rows) tickedCount += isTicked(i) ? 1 : 0;
+        ImGui::PushID(("group" + kind).c_str());
+        bool all = tickedCount == rows.size();
+        const bool mixed = tickedCount > 0 && !all;
+        if (mixed) ImGui::PushItemFlag(ImGuiItemFlags_MixedValue, true);
+        if (ImGui::Checkbox("##group", &all))
+            for (int i : rows) setTicked(i, mixed ? true : all);
+        if (mixed) ImGui::PopItemFlag();
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Tick every \"%s\" edit, to revert them together", kind.c_str());
+        ImGui::SameLine();
+        const std::string label = (kind.empty() ? std::string("Other") : kind) + "  (" + std::to_string(rows.size()) +
+                                  (tickedCount ? ", " + std::to_string(tickedCount) + " ticked" : std::string()) + ")";
+        const bool open = ImGui::TreeNodeEx("##node", ImGuiTreeNodeFlags_SpanAvailWidth | ImGuiTreeNodeFlags_DefaultOpen |
+                                                          ImGuiTreeNodeFlags_NoTreePushOnOpen | ImGuiTreeNodeFlags_Framed,
+                                            "%s", label.c_str());
+        ImGui::PopID();
+        if (!open || !beginRows(false)) continue;
+        for (int i : rows) {
             ImGui::TableNextRow();
             ImGui::PushID(i);
             ImGui::TableSetColumnIndex(0);
-            const UINT state = (UINT)::SendMessageW(list, LVM_GETITEMSTATE, (WPARAM)i, LVIS_STATEIMAGEMASK);
-            bool ticked = ((state & LVIS_STATEIMAGEMASK) >> 12) == 2;
-            if (ImGui::Checkbox("##tick", &ticked)) {
-                LVITEMW item{};
-                item.stateMask = LVIS_STATEIMAGEMASK;
-                item.state = INDEXTOSTATEIMAGEMASK(ticked ? 2 : 1);
-                ::SendMessageW(list, LVM_SETITEMSTATE, (WPARAM)i, (LPARAM)&item);
-            }
+            bool ticked = isTicked(i);
+            if (ImGui::Checkbox("##tick", &ticked)) setTicked(i, ticked);
             for (int c = 0; c < columns; ++c) {
                 ImGui::TableSetColumnIndex(c + 1);
-                wchar_t text[300] = {};
-                LVITEMW item{};
-                item.iSubItem = c;
-                item.pszText = text;
-                item.cchTextMax = 299;
-                ::SendMessageW(list, LVM_GETITEMTEXTW, (WPARAM)i, (LPARAM)&item);
-                ImGui::TextUnformatted(Utf8(text).c_str());
+                ImGui::TextUnformatted(cellText(i, c).c_str());
             }
             ImGui::PopID();
         }
+        ImGui::EndTable();
     }
-    ImGui::EndTable();
+    ImGui::EndChild();
 }
 
 void MainWindow::DrawViewModes() {
@@ -517,7 +566,7 @@ void MainWindow::DrawViewModes() {
                                    ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav |
                                    ImGuiWindowFlags_NoMove;
     if (ImGui::Begin("##viewmodes", nullptr, flags)) {
-        const bool editing = meshTools_ && meshTools_->Active();
+        const bool editing = (meshTools_ && meshTools_->Active()) || (zoneTools_ && zoneTools_->Editing());
         const auto& selection = viewport_.GetRenderer().Selection();
         const bool oneObject = selection.size() == 1 && selection.front().object;
 
@@ -538,14 +587,25 @@ void MainWindow::DrawViewModes() {
                     editing ? "Back to objects: the mesh edit is written (Tab)" : "Select, move, turn and place objects"))
             if (editing) ::PostMessageW(window_, WM_COMMAND, MAKEWPARAM(MeshTools::kFinishCommand, 0), 0);
         ImGui::SameLine();
-        const bool collisionPicked = !viewport_.GetRenderer().CollisionSelection().empty();
-        if (segment(ICON_PH_PENCIL_SIMPLE "  Edit Mode", editing, editing || oneObject || collisionPicked,
-                    oneObject || editing ? "Edit the selected object's vertices, edges and faces (Tab)"
-                    : collisionPicked    ? "Edit the picked collision's vertices, edges and faces (Tab)"
+        const bool collisionPicked = !viewport_.GetRenderer().CollisionSelection().empty() ||
+                                     viewport_.GetRenderer().CollisionVisible();
+        const bool zonePicked = zoneTools_ && zoneTools_->HasPick();
+        if (segment(ICON_PH_PENCIL_SIMPLE "  Edit Mode", editing, editing || oneObject || collisionPicked || zonePicked,
+                    zonePicked           ? "Move the corners of the picked visibility zone (Tab)"
+                    : oneObject || editing ? "Edit the selected object's vertices, edges and faces (Tab)"
+                    : collisionPicked    ? "Edit the collision around the camera: vertices, edges and faces (Tab)"
                                          : "Select one object or collision polygons first"))
             if (!editing) ::PostMessageW(window_, WM_COMMAND, MAKEWPARAM(MeshTools::kEditCommand, 0), 0);
 
-        if (editing) {
+        // The collision layer, on or off (Ctrl+K).
+        ImGui::SameLine();
+        ImGui::SeparatorEx(ImGuiSeparatorFlags_Vertical, 1.0f);
+        ImGui::SameLine();
+        if (segment(ICON_PH_SHIELD "##collision", viewport_.GetRenderer().CollisionVisible(), true,
+                    "Show or hide the collision (Ctrl+K). With it shown, a click picks collision polygons."))
+            ::PostMessageW(window_, WM_COMMAND, MAKEWPARAM(ID_VIEW_COLLISION, 0), 0);
+
+        if (editing && meshTools_ && meshTools_->Active()) {
             // What a click picks, as the 1 / 2 / 3 keys choose.
             ImGui::SameLine();
             ImGui::SeparatorEx(ImGuiSeparatorFlags_Vertical, 1.0f);
@@ -563,6 +623,21 @@ void MainWindow::DrawViewModes() {
     }
     ImGui::End();
     ImGui::PopStyleVar(3);
+
+    // What extensions show over the view.
+    for (auto& extension : extensions_)
+        extension->DrawHud(centre->Pos.x, centre->Pos.y, centre->Size.x, centre->Size.y);
+
+    // The box of an area pick in the edit mode.
+    int left = 0, top = 0, right = 0, bottom = 0;
+    if (meshTools_ && meshTools_->BoxRect(left, top, right, bottom)) {
+        ImDrawList* draw = ImGui::GetForegroundDrawList();
+        const ImVec4 accent = ImGui::GetStyleColorVec4(ImGuiCol_CheckMark);
+        draw->AddRectFilled(ImVec2((float)left, (float)top), ImVec2((float)right, (float)bottom),
+                            ImGui::GetColorU32(ImVec4(accent.x, accent.y, accent.z, 0.12f)));
+        draw->AddRect(ImVec2((float)left, (float)top), ImVec2((float)right, (float)bottom),
+                      ImGui::GetColorU32(ImVec4(accent.x, accent.y, accent.z, 0.9f)), 0.0f, 0, 1.5f);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -770,7 +845,9 @@ void MainWindow::DrawShellPanels() {
             }
         }
 
-        // Scene / Library / Edits
+        // Scene / Library / Edits (FRS_SIDE_TAB picks one at start, for captures)
+        static bool sideTabFromEnv = false;
+        if (!sideTabFromEnv) { sideTabFromEnv = true; if (const char* t = std::getenv("FRS_SIDE_TAB")) sideTab_ = std::atoi(t); }
         int wanted = sideTab_;
         ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6.0f, ImGui::GetStyle().FramePadding.y));
         const bool tabs = ImGui::BeginTabBar("##sidetabs", ImGuiTabBarFlags_FittingPolicyResizeDown);

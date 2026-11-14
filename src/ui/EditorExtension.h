@@ -59,6 +59,14 @@ public:
     // The edits were just written to the game (Ctrl+Shift+S or Save World),
     // before the region reopens: a record kept beside them is written now.
     virtual void OnSaved() {}
+    // Just before the editor starts the game: the moment to put into the
+    // game's files what is still only in the editor.
+    virtual void OnBeforeLaunch() {}
+    // Inside the ImGui frame: something of the extension's own over the
+    // view (the 3D area's rectangle, in screen pixels).
+    virtual void DrawHud(float x, float y, float width, float height) {
+        (void)x; (void)y; (void)width; (void)height;
+    }
 
     // ---- the scene tree
 

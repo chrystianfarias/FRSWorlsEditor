@@ -869,7 +869,17 @@ bool CreateNewObject(const nfs::World& world, const std::wstring& objPath,
     for (const Vec3& p : source->positions) box.Add(FromBlender(p) + origin);
     const Vec3 pivot{ (box.min.x + box.max.x) * 0.5f, (box.min.y + box.max.y) * 0.5f, box.min.z };
 
-    const size_t target = world.SectionForPlacement(pivot);
+    // In a section the game keeps loaded all along it: its corners, a few
+    // dozen at most, each in its visibility zone.
+    std::vector<Vec3> along;
+    const size_t step = std::max<size_t>(1, source->positions.size() / 48);
+    for (size_t k = 0; k < source->positions.size(); k += step) along.push_back(FromBlender(source->positions[k]) + origin);
+    size_t target = world.SectionForPlacementAlong(along);
+    if (target == SIZE_MAX) {
+        target = world.SectionForPlacement(pivot);
+        LOG_WARN("import: %s crosses visibility zones that share no section; it may vanish in part of them",
+                 objectName.c_str());
+    }
     const nfs::LoadedSection* loaded =
         target < world.Loaded().size() ? world.Loaded()[target].get() : nullptr;
     if (!loaded || !loaded->info) { why = L"no section where it stands can take scenery"; return false; }

@@ -50,6 +50,15 @@ public:
         bool removed = false;
         // Mode::Extension: what the two buttons say, empty to disable one.
         std::wstring moveLabel, removeLabel;
+        // Mode::Extension: more buttons under those, each posting its command
+        // to the parent window as a menu item would.
+        struct Action {
+            std::wstring label;
+            int command = 0;
+            std::wstring group;     // buttons of a group sit together, two to a row
+            std::wstring help;      // shown at the foot while the pointer is on it
+        };
+        std::vector<Action> actions;
     };
 
     // `parent` receives the commands. The font is unused: ImGui has its own.

@@ -6,6 +6,8 @@
 #include "ui/CollisionTools.h"
 #include "ui/CrashReport.h"
 #include "ui/MeshTools.h"
+#include "ui/HiddenItems.h"
+#include "ui/ZoneTools.h"
 #include "ui/OnlineLibrary.h"
 #include "io/PlacementWrite.h"
 #include "io/SectionEdits.h"
@@ -687,9 +689,49 @@ void MainWindow::OnCreate() {
         host.importQuietly = [this](const std::wstring& path) { ImportObj(path, true); };
         host.undoCommand = CollisionTools::kUndoCommand;
         host.collision = [this] { return collisionTools_; };
+        host.otherBegin = [this] { return zoneTools_ && zoneTools_->BeginEdit(); };
+        host.otherActive = [this] { return zoneTools_ && zoneTools_->Editing(); };
+        host.otherEnd = [this] { if (zoneTools_) zoneTools_->EndEdit(); };
         auto mesh = std::make_unique<MeshTools>(std::move(host));
         meshTools_ = mesh.get();
         extensions_.push_back(std::move(mesh));
+    }
+    // Objects hidden in the editor only (ui/HiddenItems.h): H, Alt+H.
+    {
+        HiddenItemsHost host;
+        host.window = window_;
+        host.menu = menu_;
+        host.viewport = &viewport_;
+        host.world = [this] { return world_.get(); };
+        host.modelsFolder = [this] { return modelsFolder_; };
+        host.status = [this](const std::wstring& text) { SetStatusText(2, text); };
+        host.menuChecks = [this] { UpdateMenuChecks(); };
+        extensions_.push_back(std::make_unique<HiddenItems>(std::move(host)));
+    }
+    // The game's visibility zones, seen and their lists edited (ui/ZoneTools.h).
+    {
+        ZoneToolsHost host;
+        host.window = window_;
+        host.menu = menu_;
+        host.viewport = &viewport_;
+        host.properties = &properties_;
+        host.world = [this] { return world_.get(); };
+        host.modelsFolder = [this] { return modelsFolder_; };
+        host.status = [this](const std::wstring& text) { SetStatusText(2, text); };
+        host.menuChecks = [this] { UpdateMenuChecks(); };
+        host.reopenRegion = [this] {
+            if (!world_) return;
+            Camera& camera = viewport_.GetCamera();
+            const Vec3 position = camera.Position();
+            const float yaw = camera.Yaw(), pitch = camera.Pitch();
+            OpenRegion(world_->Region());
+            camera.SetPosition(position);
+            camera.SetYawPitch(yaw, pitch);
+        };
+        host.busy = [this] { return meshTools_ && meshTools_->Active(); };
+        auto zones = std::make_unique<ZoneTools>(std::move(host));
+        zoneTools_ = zones.get();
+        extensions_.push_back(std::move(zones));
     }
     // Collision editing (ui/CollisionTools.h) is part of every build, asked
     // after the build's own extensions.
@@ -1534,6 +1576,10 @@ void MainWindow::LaunchGame() {
         if (answer == IDYES) { RunSetup(); return; }
         if (answer == IDCANCEL) return;
     }
+
+    // What is still only in the editor (roads, terrain) goes into the game's
+    // files first, so the game starts with the world as it is edited.
+    for (auto& extension : extensions_) extension->OnBeforeLaunch();
 
     WriteLaunchPose();
 
@@ -2979,6 +3025,18 @@ bool MainWindow::HasUnsavedPlacements() const {
 
 bool MainWindow::ConfirmUnsavedPlacements() {
     if (!HasUnsavedPlacements()) return true;
+    // Asked from inside a save already under way (a save reopens the region,
+    // and opening a region asks): go on with it rather than ask again.
+    static bool asking = false;
+    if (asking) {
+        LOG_WARN("unsaved edits: asked again while answering; going on with the save under way");
+        return true;
+    }
+    struct Asking {
+        bool& flag;
+        explicit Asking(bool& f) : flag(f) { flag = true; }
+        ~Asking() { flag = false; }
+    } guard(asking);
     const int answer = ::MessageBoxW(
         window_,
         L"There are placed objects or collision edits that have not been written to the game.\n\n"
@@ -3440,8 +3498,13 @@ bool MainWindow::SavePlacements() {
     PlacementSavePlan plan;
     const bool planned = PlanPlacementSave(*world_, modelsFolder_, plan);
     if (!planned && plan.ok && plan.spans.empty()) {
-        // Only placements that were never written, and none are left.
-        for (const auto& section : world_->Loaded()) section->placementsChanged = false;
+        // Only placements that were never written, and none are left -- or
+        // collision changed and changed back.
+        for (const auto& section : world_->Loaded()) {
+            section->placementsChanged = false;
+            section->collisionChanged = false;
+            section->changedCollisionPacks.clear();
+        }
         SetStatusText(2, L"No placements to write.");
         return true;
     }
@@ -3460,7 +3523,14 @@ bool MainWindow::SavePlacements() {
                                L"The log has why.", kWindowTitle, MB_ICONWARNING | MB_OK);
         return false;
     }
-    for (const auto& section : world_->Loaded()) section->placementsChanged = false;
+    // Everything is on disk now. The collision flags must clear as well: the
+    // reopen below asks about unsaved edits, and a flag left up would ask
+    // again, save again, reopen again, without end.
+    for (const auto& section : world_->Loaded()) {
+        section->placementsChanged = false;
+        section->collisionChanged = false;
+        section->changedCollisionPacks.clear();
+    }
     for (auto& extension : extensions_) extension->OnSaved();
 
     // Reopened so the viewport shows exactly what the game will read, from
@@ -3484,8 +3554,16 @@ void MainWindow::ShowRegionEditList() {
 
 void MainWindow::RevertTickedEdits() {
     if (!world_) return;
-    // The list is read from what is on disk, so pending changes go first.
-    if (!ConfirmUnsavedPlacements()) return;
+    // The list is read from what is on disk, so pending changes go first. A
+    // save reopens the region, which leaves the list pointing at sections
+    // that are gone: it is made again, and the same rows ticked again.
+    if (HasUnsavedPlacements()) {
+        const std::vector<std::wstring> ticked = edits_.TickedKeys();
+        if (!ConfirmUnsavedPlacements()) return;
+        if (!world_) return;
+        edits_.Refresh(world_.get(), modelsFolder_);
+        edits_.TickKeys(ticked);
+    }
 
     std::wstring summary;
     if (!edits_.RevertTicked(window_, summary)) return;

@@ -11,6 +11,7 @@
 #include <cstring>
 
 #include <algorithm>
+#include <iterator>
 
 namespace nfs {
 
@@ -96,6 +97,7 @@ bool World::Open(const std::wstring& tracksDirectory, const std::wstring& region
     // Visibility is optional: a region without it simply falls back to
     // drawing by distance, which is worse but not fatal.
     preculler_.Parse(layout_.Span());
+    shippedVisibility_ = preculler_;
 
     // The edits live beside the game, not in it, so they are gathered here and
     // applied to each mesh as its section is parsed. That way the viewport and
@@ -118,9 +120,22 @@ bool World::Open(const std::wstring& tracksDirectory, const std::wstring& region
 
     // The table corrections come after it is parsed, so a section that moved is
     // looked for where its bytes now are.
+    bool layoutEdited = false;
     for (const SpanOverlay& span : spans_)
-        if (span.layoutFile)
+        if (span.layoutFile) {
             table_.ApplyBytes(span.fileOffset, span.bytes.data(), span.bytes.size());
+            layoutEdited = true;
+        }
+    // Edited visibility lists (ui/ZoneTools.h) are spans of the layout file
+    // too: the zones are read again from the file as the game will see it.
+    if (layoutEdited) {
+        const ByteSpan original = layout_.Span();
+        std::vector<u8> patched(original.data, original.data + original.size);
+        for (const SpanOverlay& span : spans_)
+            if (span.layoutFile && span.fileOffset + span.bytes.size() <= patched.size())
+                std::copy(span.bytes.begin(), span.bytes.end(), patched.begin() + (ptrdiff_t)span.fileOffset);
+        preculler_.Parse(ByteSpan{ patched.data(), patched.size() });
+    }
 
     OpenGlobalPacks(tracksDirectory);
     ReadRaceBarrierGroups();
@@ -129,6 +144,34 @@ bool World::Open(const std::wstring& tracksDirectory, const std::wstring& region
     region_ = region;
     sectionToLoaded_.assign(table_.Sections().size(), -1);
     return true;
+}
+
+std::vector<size_t> World::SectionsLoadedThroughout(const std::vector<Vec3>& points) const {
+    std::vector<size_t> out;
+    if (preculler_.IsEmpty() || points.empty()) return out;
+    std::vector<u32> common;
+    bool first = true;
+    const auto narrow = [&](std::vector<u32> listed) {
+        std::sort(listed.begin(), listed.end());
+        if (first) { common = std::move(listed); first = false; return; }
+        std::vector<u32> both;
+        std::set_intersection(common.begin(), common.end(), listed.begin(), listed.end(), std::back_inserter(both));
+        common.swap(both);
+    };
+    for (const Vec3& point : points) {
+        std::vector<u32> listed;
+        if (preculler_.VisibleAt(point, listed)) { narrow(std::move(listed)); continue; }
+        // No zone claims it: the car keeps the zone it came from, any of the
+        // ones around -- every one of them must load it.
+        std::vector<std::vector<u32>> around;
+        preculler_.ListsNear(point, 80.0f, around);
+        for (auto& list : around) narrow(std::move(list));
+    }
+    for (size_t s = 0; s < loaded_.size(); ++s)
+        if (loaded_[s]->info && !IsLibrary(*loaded_[s]) &&
+            std::binary_search(common.begin(), common.end(), loaded_[s]->info->number))
+            out.push_back(s);
+    return out;
 }
 
 // 32-byte records {u32 hash, u32 polygon count, u8 1, char name[23]}, the
@@ -521,6 +564,28 @@ size_t World::SectionForPlacement(const Vec3& point) const {
         }
     }
     return best != SIZE_MAX ? best : nearest;
+}
+
+size_t World::SectionForPlacementAlong(const std::vector<Vec3>& points) const {
+    if (points.empty()) return SIZE_MAX;
+    Vec3 middle{};
+    for (const Vec3& p : points) middle = middle + p;
+    middle = middle * (1.0f / (float)points.size());
+    if (preculler_.IsEmpty()) return SectionForPlacement(middle);
+    const size_t usual = SectionForPlacement(middle);
+    size_t best = SIZE_MAX;
+    float bestDistance = 1e30f;
+    for (size_t i : SectionsLoadedThroughout(points)) {
+        const LoadedSection& candidate = *loaded_[i];
+        if (!candidate.info || IsLibrary(candidate) || IsUnusedAlternate(*candidate.info)) continue;
+        if (std::find(candidate.sceneryNumbers.begin(), candidate.sceneryNumbers.end(), candidate.info->number) ==
+            candidate.sceneryNumbers.end())
+            continue;
+        if (i == usual) return i;
+        const float dx = candidate.info->position.x - middle.x, dy = candidate.info->position.y - middle.y;
+        if (dx * dx + dy * dy < bestDistance) { bestDistance = dx * dx + dy * dy; best = i; }
+    }
+    return best;
 }
 
 std::vector<const SolidObject*> World::AllModels() const {

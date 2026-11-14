@@ -37,21 +37,49 @@ public:
     // Returns false when no zone claims the point at all.
     bool VisibleAt(const Vec3& point, std::vector<u32>& sections) const;
 
+    // Where no zone claims a point, the game keeps the zone the car came
+    // from: the lists of every zone within `radius` of the point, any of
+    // which may be the one in force there.
+    void ListsNear(const Vec3& point, float radius, std::vector<std::vector<u32>>& lists) const;
+
+    // The same choices by zone id: the zone the game is in at a point (the
+    // smallest with a list; -1 for none), and every zone with a list within
+    // `radius` of it.
+    int ListedZoneAt(const Vec3& point) const;
+    void ZoneIdsNear(const Vec3& point, float radius, std::vector<u32>& ids) const;
+
     // Whether any zone's list names the section: what the game ever loads.
     bool Listed(u32 sectionNumber) const;
 
-private:
     struct Zone {
         Vec3              boundsMin;
         Vec3              boundsMax;
         std::vector<Vec3> ring;       // ground-plane polygon, z unused
         u32               id = 0;
+        // Where its outline record sits in the layout file: the body after
+        // its marker -- u16 id, u16 point count, the bounding box as two
+        // points (min, max), then the ring, x and y floats.
+        u64               recordOffset = 0;
+        u32               recordLength = 0;
     };
-
+    const std::vector<Zone>& Zones() const { return zones_; }
+    // The zone the game is in standing at a point (the smallest holding it),
+    // as an index into Zones(); -1 where none is.
+    int ZoneAt(float x, float y) const;
+    // A zone's section list, or nullptr.
+    const std::vector<u32>* ListOf(u32 zoneId) const;
+    // Where the zone's list record sits in the layout file: the body after
+    // its marker -- u16 id, two words, u32 count at +8, u16 section numbers
+    // from +12 -- and how long it is up to the next record. The zeros after
+    // the numbers are room the list can grow into without moving anything.
+    bool ListRecord(u32 zoneId, u64& fileOffset, u32& length) const;
     bool Contains(const Zone& zone, float x, float y) const;
+
+private:
 
     std::vector<Zone>                          zones_;
     std::unordered_map<u32, std::vector<u32>>  visible_;   // zone id -> section numbers
+    std::unordered_map<u32, std::pair<u64, u32>> records_;  // zone id -> list record (offset, length)
 };
 
 } // namespace nfs

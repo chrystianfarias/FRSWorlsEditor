@@ -23,6 +23,8 @@ public:
     // Every move while the view is not being turned. Not consumable.
     virtual void MouseMove(int x, int y) { (void)x; (void)y; }
     virtual bool MouseWheel(int notches, WPARAM keys) { (void)notches; (void)keys; return false; }
+    // The left button let go (after a MouseDown the tool took).
+    virtual bool MouseUp(int x, int y, WPARAM keys) { (void)x; (void)y; (void)keys; return false; }
     // `repeat` is the keyboard's auto-repeat.
     virtual bool KeyDown(WPARAM key, bool repeat) { (void)key; (void)repeat; return false; }
     // Something of the tool's own under the gizmo -- vertices being edited:
@@ -130,6 +132,8 @@ public:
     void SetGizmoMode(GizmoMode mode) { gizmoMode_ = mode; }
     GizmoMode GetGizmoMode() const { return gizmoMode_; }
     bool GizmoDragging() const { return gizmoActive_ != kGizmoNone; }
+    // The pointer is over one of the gizmo's handles: a click there drags it.
+    bool GizmoHot() const { return gizmoHot_ != kGizmoNone; }
 
     // Height of whatever is under `point`, ignoring the placement itself.
     bool GroundBelow(const Vec3& point, u32 loadedSection, int placement, float& height);
@@ -147,6 +151,9 @@ public:
 
     // A tool that sees the mouse and keys first. Not owned.
     void AddTool(ViewportTool* tool) { tools_.push_back(tool); }
+    // Ahead of every other tool: its clicks are not taken by a terrain brush
+    // or a road tool left on.
+    void AddToolFirst(ViewportTool* tool) { tools_.insert(tools_.begin(), tool); }
     // The view the gizmo is measured in, for a tool projecting points to pixels.
     GizmoView ToolView() const { return CurrentGizmoView(); }
     bool Looking() const { return looking_; }

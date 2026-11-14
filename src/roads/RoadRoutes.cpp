@@ -194,8 +194,18 @@ bool AddRoutes(const Network& network, Graph& graph, RouteReport& report, bool r
             for (int k = 0; k < p.lanesBackward; ++k)
                 backward.push_back(-(-half + (k + 0.5f) * lane));
             if (rp.reversed) std::swap(forward, backward);
-            for (size_t k = 0; k < forward.size() && k < 4; ++k) n.lanes[k] = LaneByte(forward[k], half);
-            for (size_t k = 0; k < backward.size() && k < 4; ++k) n.lanes[4 + k] = LaneByte(backward[k], half);
+            // Slots as the game's own routes fill them: left to right, the
+            // outermost lane always in slot 2 -- one lane in slot 2, two in 1
+            // and 2, three in 0 to 2. Slot 3 is never used by the shipped
+            // routes, and a route with a lane only there is dropped at load.
+            const auto place = [&](std::vector<float> offsets, int base) {
+                std::sort(offsets.begin(), offsets.end());
+                if (offsets.size() > 4) offsets.erase(offsets.begin(), offsets.end() - 4);
+                const int first = offsets.size() >= 4 ? 0 : 3 - (int)offsets.size();
+                for (size_t k = 0; k < offsets.size(); ++k) n.lanes[base + first + (int)k] = LaneByte(offsets[k], half);
+            };
+            place(forward, 0);
+            place(backward, 4);
             u32 flags = route.header.id | nfs::routes::kBit12 | nfs::routes::kNoIntersection << 19;
             const bool fw = !forward.empty(), bw = !backward.empty();
             if (p.gps && !race) {
@@ -276,17 +286,33 @@ bool AddRoutes(const Network& network, Graph& graph, RouteReport& report, bool r
     std::set<u16> ours;
     for (const auto& [id, chain] : made) ours.insert(id);
     struct Mouth { u32 node; Vec3 centre; float reach; };
+    constexpr float kEndReach = 20.0f;   // how near a road's loose end must come to a game road to join it
     std::vector<Mouth> mouths;
     for (const GameJunction& j : network.GameJunctions()) mouths.push_back({ leader(j.node), j.centre, j.halfRoad + 4.0f });
     for (const GameCut& c : network.Cuts()) {
+        if (!c.corners.empty()) continue;    // a face of a junction made of the game's faces
         bool junction = false;
         for (const GameJunction& j : network.GameJunctions()) junction |= j.node == c.node;
         if (!junction) mouths.push_back({ leader(c.node), c.centre, c.halfWidth + 4.0f });
+    }
+    // A junction made of the game's faces joins the game's route nearest its
+    // road's end, where the road's line meets it.
+    for (const FaceJunction& j : network.FaceJunctions())
+        if (const Node* n = network.FindNode(j.node)) mouths.push_back({ leader(j.node), n->position, 30.0f });
+    // Any other road that just ends near one of the game's roads joins it
+    // too: an end left unjoined is a road the game does not count as one
+    // (free roam puts a car on it back on the nearest road it knows).
+    for (const Node& n : network.Nodes()) {
+        if (network.SegmentsAt(n.id).size() != 1) continue;
+        bool taken = false;
+        for (const Mouth& m : mouths) taken |= m.node == leader(n.id);
+        if (!taken) mouths.push_back({ leader(n.id), n.position, kEndReach });
     }
     for (const Mouth& m : mouths) {
         // The game's route under the junction: the nearest with lanes.
         const Route* best = nullptr;
         float bestDistance = m.reach;
+        float bestZ = m.centre.z;     // the game's road height there
         for (const Route& r : graph.Routes()) {
             if (ours.count(r.header.id)) continue;
             bool lanes = false;
@@ -294,10 +320,18 @@ bool AddRoutes(const Network& network, Graph& graph, RouteReport& report, bool r
             if (!lanes) continue;
             int k = 0;
             float t = 0.0f, d = 0.0f;
-            if (graph.Project(r, m.centre.x, m.centre.y, k, t, d) && d < bestDistance) { bestDistance = d; best = &r; }
+            if (graph.Project(r, m.centre.x, m.centre.y, k, t, d) && d < bestDistance) {
+                bestDistance = d;
+                best = &r;
+                if (k >= 0 && (size_t)k < r.nodes.size()) {
+                    const size_t next = std::min((size_t)k + 1, r.nodes.size() - 1);
+                    bestZ = (r.nodes[(size_t)k].height8 + (r.nodes[next].height8 - r.nodes[(size_t)k].height8) * t) / 8.0f;
+                }
+            }
         }
         if (!best) {
-            if (!race) report.problems += L"A junction into the game's road found no route of the game's under it.\n";
+            if (!race && m.reach != kEndReach)
+                report.problems += L"A junction into the game's road found no route of the game's under it.\n";
             continue;
         }
         const u16 gameRoute = best->header.id;
@@ -306,17 +340,32 @@ bool AddRoutes(const Network& network, Graph& graph, RouteReport& report, bool r
                 const u32 node = side ? chain->endNode : chain->startNode;
                 if (node != m.node) continue;
                 // Its own node of the game's route for every road joining here.
-                const int at = graph.JunctionNode(gameRoute, m.centre.x, m.centre.y, m.centre.z, error);
+                const int at = graph.JunctionNode(gameRoute, m.centre.x, m.centre.y, bestZ, error);
                 const Segment* segment = side ? chain->legs.back().segment : chain->legs.front().segment;
                 if (at < 0 || !graph.ConnectEnd(id, side == 0, gameRoute, (u16)at, segment->profile.traffic, error)) {
                     report.problems += L"A road could not be joined to the game's: " + error + L"\n";
                     continue;
                 }
                 report.gameLinks += 4;
+                LOG_INFO("routes: road end node %u (route %u) joined to the game's route %u at its node %d, %.1f away",
+                         m.node, (unsigned)id, (unsigned)gameRoute, at, bestDistance);
             }
         }
     }
 
+    // Every end that leads nowhere is marked so, as the game's own are.
+    size_t deadEnds = 0;
+    for (const auto& [id, chain] : made) {
+        const Route* r = graph.Find(id);
+        if (!r || r->nodes.empty()) continue;
+        for (const u16 end : { (u16)0, (u16)(r->nodes.size() - 1) }) {
+            const RNode& n = graph.Find(id)->nodes[end];
+            if (n.slots[0] != nfs::routes::kNoSlot || n.slots[1] != nfs::routes::kNoSlot) continue;
+            if (graph.AddDeadEnd(id, end, error)) ++deadEnds;
+            else report.problems += L"A road's dead end could not be marked: " + error + L"\n";
+        }
+    }
+    if (deadEnds) LOG_INFO("routes: %zu dead ends marked", deadEnds);
     for (const std::string& problem : graph.Check()) report.problems += std::wstring(problem.begin(), problem.end()) + L"\n";
     LOG_INFO("routes: %zu roads made routes (%zu nodes), %zu links between them, %zu into the game's", report.routes,
              report.nodes, report.links, report.gameLinks);

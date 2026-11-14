@@ -113,9 +113,14 @@ nfs::CollisionPolygon MakeGround(const Vec3* corners, int count, u8 surface) {
     nfs::CollisionPolygon polygon;
     count = std::clamp(count, 3, 4);
     polygon.quad = count == 4;
-    for (int c = 0; c < 4; ++c) polygon.corners[c] = corners[std::min(c, count - 1)];
     std::vector<Vec3> outline(corners, corners + count);
-    const bool vertical = std::fabs(PlanArea(outline)) < 1e-3;
+    const double area = PlanArea(outline);
+    const bool vertical = std::fabs(area) < 1e-3;
+    // Ground faces up: counter-clockwise seen from above, as nine in ten of
+    // the game's own are (the rest are ceilings and undersides). Stored the
+    // other way round it faces down, and a car drives straight through it.
+    if (!vertical && area < 0.0) std::reverse(outline.begin(), outline.end());
+    for (int c = 0; c < 4; ++c) polygon.corners[c] = outline[(size_t)std::min(c, count - 1)];
     polygon.attributes[0] = 0;
     polygon.attributes[2] = surface;
     polygon.attributes[3] = (u8)((polygon.quad ? kFlagQuad : 0) | (vertical ? kFlagVertical : 0));
@@ -288,6 +293,7 @@ void Editor::Remember(const std::wstring& label, std::vector<std::pair<u32, u32>
 void Editor::Changed(u32 section, u32 pack) {
     nfs::LoadedSection* loaded = world_->MutableLoaded(section);
     if (!loaded) return;
+    if (pack < loaded->collision.size()) loaded->collision[pack].edited = true;
     loaded->MarkCollisionChanged(pack);
     if (std::find(touched_.begin(), touched_.end(), section) == touched_.end())
         touched_.push_back(section);
@@ -383,6 +389,67 @@ std::vector<std::pair<u32, u32>> Editor::PacksFor(const nfs::CollisionPolygon& p
         }
     }
     if (out.empty() && nearestPack.first != UINT32_MAX) out.push_back(nearestPack);
+
+    // The game streams by zone: wherever on the polygon the car is, it stands
+    // in one visibility zone, and only the sections that zone lists are
+    // loaded. A pack whose section that zone does not list is gone while the
+    // car is there -- the road vanishes under it. So for every zone the
+    // polygon reaches, it also goes into a pack that zone loads: the one
+    // nearest to it.
+    const nfs::Preculler& visibility = world_->Visibility();
+    if (!visibility.IsEmpty()) {
+        const auto numberOf = [&](size_t s) { return loaded[s]->info ? loaded[s]->info->number : UINT32_MAX; };
+        // Each zone's list as the game shipped it: a section an edited list
+        // added is drawn in that zone, but the game does not take its
+        // collision there (the car loses the ground at the zone's border).
+        // Only a zone with no shipped list uses its edited one.
+        const nfs::Preculler& shipped = world_->ShippedVisibility();
+        const auto listOf = [&](u32 id) {
+            const std::vector<u32>* list = shipped.ListOf(id);
+            if (!list) list = visibility.ListOf(id);
+            std::vector<u32> out = list ? *list : std::vector<u32>{};
+            std::sort(out.begin(), out.end());
+            out.erase(std::unique(out.begin(), out.end()), out.end());
+            return out;
+        };
+        std::vector<std::vector<u32>> needs;   // each: a zone's list, one of whose packs must hold it
+        for (const Vec3& sample : samples) {
+            const int zone = visibility.ListedZoneAt(sample);
+            if (zone >= 0) {
+                std::vector<u32> listed = listOf((u32)zone);
+                if (!listed.empty()) { needs.push_back(std::move(listed)); continue; }
+            }
+            // No zone claims the spot: the car keeps the zone it came from,
+            // any of the ones around.
+            std::vector<u32> around;
+            visibility.ZoneIdsNear(sample, 80.0f, around);
+            for (u32 id : around) {
+                std::vector<u32> listed = listOf(id);
+                if (!listed.empty()) needs.push_back(std::move(listed));
+            }
+        }
+        for (std::vector<u32>& listed : needs) {
+            const Vec3 sample = middle;
+            std::sort(listed.begin(), listed.end());
+            const auto isListed = [&](size_t s) { return std::binary_search(listed.begin(), listed.end(), numberOf(s)); };
+            bool covered = false;
+            for (const auto& [s, p] : out) covered |= isListed(s);
+            if (covered) continue;
+            float best = 1e30f;
+            std::pair<u32, u32> pick{ UINT32_MAX, UINT32_MAX };
+            for (size_t s = 0; s < loaded.size(); ++s) {
+                if (!isListed(s) || !loaded[s]->info || world_->IsLibrary(*loaded[s])) continue;
+                for (size_t p = 0; p < loaded[s]->collision.size(); ++p) {
+                    const nfs::CollisionPack& pack = loaded[s]->collision[p];
+                    if (pack.polygons.empty() || !pack.bounds.Valid()) continue;
+                    const float cx = std::clamp(sample.x, pack.bounds.min.x, pack.bounds.max.x) - sample.x;
+                    const float cy = std::clamp(sample.y, pack.bounds.min.y, pack.bounds.max.y) - sample.y;
+                    if (cx * cx + cy * cy < best) { best = cx * cx + cy * cy; pick = { (u32)s, (u32)p }; }
+                }
+            }
+            if (pick.first != UINT32_MAX && std::find(out.begin(), out.end(), pick) == out.end()) out.push_back(pick);
+        }
+    }
     return out;
 }
 

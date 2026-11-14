@@ -28,8 +28,8 @@ const wchar_t* kFieldHelp[8] = {
 };
 
 constexpr size_t kBufferSize = 256;
-constexpr int kListPicture = 32;       // beside a choice
-constexpr int kPreviewPicture = 72;    // under the rows
+constexpr int kListPicture = 64;       // beside a choice in a drop-down
+constexpr int kCellPicture = 40;       // beside the chosen value in its row
 
 PropertiesPanel::ImageProvider g_images;
 unsigned g_imagesGeneration = 0;   // counts SetImageProvider calls
@@ -158,7 +158,10 @@ void PropertiesPanel::Post(int id) const {
 void PropertiesPanel::Show(const View& view) {
     const bool sameObject = haveShown_ && view.mode == shown_.mode && view.title == shown_.title &&
                             view.removed == shown_.removed;
-    if (sameObject && SameRows(view.rows, shown_.rows, false)) return;
+    if (sameObject && SameRows(view.rows, shown_.rows, false)) {
+        shown_.actions = view.actions;
+        return;
+    }
 
     if (sameObject && SameRows(view.rows, shown_.rows, true)) {
         // Only the transform moved: the values change in place, except in a
@@ -245,7 +248,14 @@ void PropertiesPanel::DrawRow(size_t index, IDirect3DDevice9* device) {
     const std::string value = Utf8(values_[index]);
 
     if (row.editable && !row.choices.empty()) {
-        if (ImGui::BeginCombo("##value", value.c_str(), ImGuiComboFlags_HeightLarge)) {
+        if (row.preview)
+            if (void* picture = Picture(device, values_[index], kCellPicture)) {
+                ImGui::Image((ImTextureID)picture, ImVec2((float)kCellPicture, (float)kCellPicture));
+                ImGui::SameLine();
+                ImGui::SetCursorPosY(ImGui::GetCursorPosY() + (kCellPicture - ImGui::GetFrameHeight()) * 0.5f);
+                ImGui::SetNextItemWidth(-FLT_MIN);
+            }
+        if (ImGui::BeginCombo("##value", value.c_str(), ImGuiComboFlags_HeightLargest)) {
             for (size_t c = 0; c < row.choices.size(); ++c) {
                 const std::string choice = Utf8(row.choices[c]);
                 const bool selected = row.choices[c] == values_[index];
@@ -281,9 +291,8 @@ void PropertiesPanel::DrawRow(size_t index, IDirect3DDevice9* device) {
         ValueInput(index, numeric || (row.field >= 1 && row.field <= 7));
     } else {
         if (row.preview)
-            if (void* picture = Picture(device, values_[index], kListPicture)) {
-                const float side = ImGui::GetFrameHeight();
-                ImGui::Image((ImTextureID)picture, ImVec2(side, side));
+            if (void* picture = Picture(device, values_[index], kCellPicture)) {
+                ImGui::Image((ImTextureID)picture, ImVec2((float)kCellPicture, (float)kCellPicture));
                 ImGui::SameLine();
             }
         ImGui::TextWrapped("%s", value.c_str());
@@ -418,13 +427,25 @@ void PropertiesPanel::Draw(IDirect3DDevice9* device) {
     if (toggle(ImGuiLayer::kIconSort, sorted_, "By name")) sorted_ = true;
     ImGui::Separator();
 
-    // --- the footer's room: description, pictures, buttons ---------------------
-    const bool anyPreview = g_images && std::any_of(shown_.rows.begin(), shown_.rows.end(),
-                                                    [](const Row& row) { return row.preview; });
+    // --- the footer's room: description and buttons -------------------------------
+    // The buttons go two to a row, the extension's own under a heading per
+    // group (shown in the order they first appear).
     const float buttonHeight = ImGui::GetFrameHeight();
     const float helpHeight = ImGui::GetTextLineHeightWithSpacing() * 3.2f;
-    const float previewHeight = anyPreview ? kPreviewPicture + ImGui::GetTextLineHeightWithSpacing() * 2 + 8 : 0.0f;
-    const float footer = helpHeight + previewHeight + 4 * (buttonHeight + style.ItemSpacing.y) + style.ItemSpacing.y * 3;
+    std::vector<std::wstring> groups;
+    for (const View::Action& a : shown_.actions)
+        if (std::find(groups.begin(), groups.end(), a.group) == groups.end()) groups.push_back(a.group);
+    const bool ownButtons = shown_.mode == Mode::Extension && !shown_.actions.empty();
+    float buttonRows = 2.0f;
+    if (ownButtons) {
+        buttonRows = 1.0f;
+        for (const std::wstring& g : groups) {
+            size_t n = 0;
+            for (const View::Action& a : shown_.actions) n += a.group == g;
+            buttonRows += (float)((n + 1) / 2) + (g.empty() ? 0.0f : 1.0f);
+        }
+    }
+    const float footer = helpHeight + buttonRows * (buttonHeight + style.ItemSpacing.y) + style.ItemSpacing.y * 4;
 
     // --- the rows ------------------------------------------------------------------
     if (ImGui::BeginChild("##rows", ImVec2(0, std::max(80.0f, ImGui::GetContentRegionAvail().y - footer)))) {
@@ -509,56 +530,47 @@ void PropertiesPanel::Draw(IDirect3DDevice9* device) {
     }
     ImGui::EndChild();
 
-    // --- pictures of the preview rows ------------------------------------------------
-    if (anyPreview) {
-        const float cell = kPreviewPicture + 12.0f;
-        float x = 0.0f;
-        const float width = ImGui::GetContentRegionAvail().x;
-        ImGui::BeginGroup();
-        for (size_t i = 0; i < shown_.rows.size(); ++i) {
-            const Row& row = shown_.rows[i];
-            if (!row.preview) continue;
-            if (x > 0.0f && x + cell > width) break;
-            if (x > 0.0f) ImGui::SameLine();
-            ImGui::BeginGroup();
-            ImGui::PushID((int)i);
-            if (void* picture = Picture(device, values_[i], kPreviewPicture))
-                ImGui::Image((ImTextureID)picture, ImVec2((float)kPreviewPicture, (float)kPreviewPicture));
-            else
-                ImGui::Dummy(ImVec2((float)kPreviewPicture, (float)kPreviewPicture));
-            ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + kPreviewPicture);
-            ImGui::TextDisabled("%s", Utf8(row.name).c_str());
-            ImGui::TextUnformatted(Utf8(values_[i]).c_str());
-            ImGui::PopTextWrapPos();
-            ImGui::PopID();
-            ImGui::EndGroup();
-            x += cell;
-        }
-        ImGui::EndGroup();
-    }
-
     // --- actions ---------------------------------------------------------------------
     const Mode mode = shown_.mode;
     const bool extension = mode == Mode::Extension;
     const bool mesh = mode == Mode::Placement || mode == Mode::Native || mode == Mode::Library || mode == Mode::Several;
-    const auto action = [&](const char* icon, const std::string& label, bool enabled, int id) {
+    const float half = (ImGui::GetContentRegionAvail().x - style.ItemSpacing.x) * 0.5f;
+    // A button half the width; every second one goes beside the one before.
+    int column = 0;
+    const auto button = [&](const std::string& text, bool enabled, int id, const std::wstring& help) {
+        if (column == 1) ImGui::SameLine();
         ImGui::BeginDisabled(!enabled);
-        const std::string text = std::string(icon) + "  " + label;
-        if (ImGui::Button(text.c_str(), ImVec2(-FLT_MIN, buttonHeight))) Post(id);
+        ImGui::PushID(id);
+        if (ImGui::Button(text.c_str(), ImVec2(half, buttonHeight))) Post(id);
+        ImGui::PopID();
         ImGui::EndDisabled();
+        if (!help.empty() && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) hoverHelp_ = help;
+        column ^= 1;
     };
+    const auto icon = [](const char* glyph, const std::string& label) { return std::string(glyph) + "  " + label; };
     ImGui::Spacing();
-    action(ImGuiLayer::kIconDown,
-           extension && !shown_.moveLabel.empty() ? Utf8(shown_.moveLabel) : std::string("Snap to ground"),
-           mode == Mode::Placement || (extension && !shown_.moveLabel.empty()), IDC_PROP_SNAP);
+    button(icon(ImGuiLayer::kIconDown,
+                extension && !shown_.moveLabel.empty() ? Utf8(shown_.moveLabel) : std::string("Snap to ground")),
+           mode == Mode::Placement || (extension && !shown_.moveLabel.empty()), IDC_PROP_SNAP, L"");
     const bool canRemove = mode == Mode::Placement || mode == Mode::Native || mode == Mode::Several ||
                            (extension && !shown_.removeLabel.empty());
-    action(ImGuiLayer::kIconDelete,
-           mode == Mode::Native ? std::string("Remove from the world")
-           : extension && !shown_.removeLabel.empty() ? Utf8(shown_.removeLabel) : std::string("Delete"),
-           canRemove && !shown_.removed, IDC_PROP_REMOVE);
-    action(ImGuiLayer::kIconEdit, "Edit in Blender", mesh, IDC_PROP_BLENDER);
-    action(ImGuiLayer::kIconShield, "Make collision", mesh, IDC_PROP_COLLISION);
+    button(icon(ImGuiLayer::kIconDelete,
+                mode == Mode::Native ? std::string("Remove from the world")
+                : extension && !shown_.removeLabel.empty() ? Utf8(shown_.removeLabel) : std::string("Delete")),
+           canRemove && !shown_.removed, IDC_PROP_REMOVE, L"");
+    if (ownButtons) {
+        // The extension's own, in place of the mesh buttons, which do not
+        // apply to what it shows.
+        for (const std::wstring& group : groups) {
+            column = 0;
+            if (!group.empty()) ImGui::SeparatorText(Utf8(group).c_str());
+            for (const View::Action& a : shown_.actions)
+                if (a.group == group) button(Utf8(a.label), true, a.command, a.help);
+        }
+    } else {
+        button(icon(ImGuiLayer::kIconEdit, "Edit in Blender"), mesh, IDC_PROP_BLENDER, L"");
+        button(icon(ImGuiLayer::kIconShield, "Make collision"), mesh, IDC_PROP_COLLISION, L"");
+    }
 
     ImGui::End();
 }

@@ -639,7 +639,10 @@ void WorldRenderer::Render(const Camera& camera) {
 
         if (!showScenery_) continue;
 
-        for (const GpuInstance& instance : section.instances) {
+        const std::vector<char>& hiddenHere = HiddenFlags(i);
+        for (size_t k = 0; k < section.instances.size(); ++k) {
+            const GpuInstance& instance = section.instances[k];
+            if (hiddenHere[k]) continue;   // hidden in the editor
             if (culling_ && instance.worldBounds.Valid() &&
                 !frustum.Intersects(instance.worldBounds)) continue;
 
@@ -914,6 +917,32 @@ bool WorldRenderer::DumpPlacements(const std::wstring& path) const {
     return true;
 }
 
+std::string WorldRenderer::InstanceKey(const std::string& section, int native, int placement) {
+    if (native >= 0) return "N " + section + " " + std::to_string(native);
+    if (placement >= 0) return "P " + section + " " + std::to_string(placement);
+    return {};
+}
+
+std::string WorldRenderer::HiddenKey(const PickResult& picked) const {
+    if (picked.loadedSection >= sections_.size()) return {};
+    return InstanceKey(sections_[picked.loadedSection].name, picked.native, picked.placement);
+}
+
+const std::vector<char>& WorldRenderer::HiddenFlags(size_t i) const {
+    const SectionRender& section = sections_[i];
+    if (section.hiddenVersion != hiddenVersion_ || section.hidden.size() != section.instances.size()) {
+        section.hidden.assign(section.instances.size(), 0);
+        if (!hiddenKeys_.empty())
+            for (size_t k = 0; k < section.instances.size(); ++k) {
+                const std::string key =
+                    InstanceKey(section.name, section.instances[k].native, section.instances[k].placement);
+                if (!key.empty() && hiddenKeys_.count(key)) section.hidden[k] = 1;
+            }
+        section.hiddenVersion = hiddenVersion_;
+    }
+    return section.hidden;
+}
+
 bool WorldRenderer::Pick(const Ray& ray, PickResult& out) const {
     PickResult best;
 
@@ -930,7 +959,10 @@ bool WorldRenderer::Pick(const Ray& ray, PickResult& out) const {
 
         if (!showScenery_) continue;
 
-        for (const GpuInstance& instance : section.instances) {
+        const std::vector<char>& hiddenHere = HiddenFlags(i);
+        for (size_t k = 0; k < section.instances.size(); ++k) {
+            const GpuInstance& instance = section.instances[k];
+            if (hiddenHere[k]) continue;
             const GpuObject& object =
                 sections_[instance.section].gpu->Objects()[instance.object];
             PickOne(ray, object, instance.transform, instance.worldBounds, true, i,

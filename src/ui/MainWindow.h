@@ -227,6 +227,7 @@ private:
     // Object / Edit mode, floating in a corner of the view.
     void DrawViewModes();
     class MeshTools* meshTools_ = nullptr;   // one of extensions_
+    class ZoneTools* zoneTools_ = nullptr;   // one of extensions_
     // The Explorer's Online tab: Sketchfab models (ui/OnlineLibrary.h).
     std::unique_ptr<OnlineLibrary> online_;
     void PlaceOnlineModel();

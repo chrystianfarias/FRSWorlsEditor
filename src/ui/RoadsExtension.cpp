@@ -31,6 +31,8 @@
 #include "ui/UndoRegistry.h"
 #include "ui/Viewport.h"
 
+#include "imgui.h"
+
 #include <shlobj.h>
 
 #include <algorithm>
@@ -52,6 +54,7 @@ struct RoadsAccess {
 
     HWND Window() const { return w.window_; }
     HMENU Menu() const { return w.menu_; }
+    HWND Toolbar() const { return w.toolbar_; }
     HACCEL& Accelerators() const { return w.accelerators_; }
     Viewport& View() const { return w.viewport_; }
     WorldRenderer& Renderer() const { return w.viewport_.GetRenderer(); }
@@ -104,9 +107,15 @@ constexpr int ID_GROUND_FIT         = ID_ROADS_FIRST + 30;
 constexpr int ID_GROUND_DISCARD     = ID_ROADS_FIRST + 31;
 constexpr int ID_TERRAIN_OUTLINE    = ID_ROADS_FIRST + 32;
 constexpr int ID_TERRAIN_ALONG      = ID_ROADS_FIRST + 33;
-constexpr int ID_ROAD_JUNCTION_GAME = ID_ROADS_FIRST + 34;
 constexpr int ID_ROAD_SPLIT_WAYS    = ID_ROADS_FIRST + 35;
 constexpr int ID_VIEW_ROAD_GRAPH    = ID_ROADS_FIRST + 36;
+constexpr int ID_ROAD_FACE_JUNCTION = ID_ROADS_FIRST + 37;
+constexpr int ID_ROAD_LANE_ADD      = ID_ROADS_FIRST + 38;
+constexpr int ID_ROAD_LANE_DROP     = ID_ROADS_FIRST + 39;
+constexpr int ID_ROAD_LANE_SPLIT    = ID_ROADS_FIRST + 40;
+constexpr int ID_ROAD_DRAW          = ID_ROADS_FIRST + 41;
+constexpr int ID_ROAD_INSERT_MIDDLE = ID_ROADS_FIRST + 42;
+constexpr int ID_ROAD_DRAW_FROM     = ID_ROADS_FIRST + 43;
 
 // A terrain patch's selection id: the patch's id with this bit.
 constexpr int kTerrainBit = 0x40000000;
@@ -126,6 +135,8 @@ enum Field {
     kBridge = 90, kDeckThickness, kPillarSpacing, kPillarWidth, kDeckTexture, kPillarTexture,
     kBankMode = 96, kBankMax, kDesignSpeed, kBankAngle,
     kTraffic = 150, kGps, kSpeedLimit,
+    kPillarCount = 170, kPillarModel, kPillarModelTurn,
+    kTaperLength = 180,
     kMedianType = 130, kMedianWidth, kMedianHeight, kMedianTexture, kWalkLeft, kWalkRight,
     kWallStyle, kWallModel, kWallModelSpacing, kWallModelTurn,
     kLayerTexture = 100,     // + layer * 4: texture, tile, surface
@@ -443,10 +454,17 @@ public:
         network_.SetGroundQuery([this](float x, float y, float top, float& height) {
             return GroundBelow(x, y, top, height);
         });
+        network_.SetModelBounds([this](const std::string& name, Vec3& min, Vec3& max) {
+            const auto found = modelsByName_.find(Widen(name));
+            if (found == modelsByName_.end() || !found->second->bounds.Valid()) return false;
+            min = found->second->bounds.min;
+            max = found->second->bounds.max;
+            return true;
+        });
         // The baked models stand where the procedural roads are drawn; the
         // editor shows the description, which is what is being edited.
         app_.Renderer().SetHiddenModels([this](const nfs::SolidObject& model) {
-            return visible_ && roads::IsBakedRoadModel(model.name);
+            return visible_ && (roads::IsBakedRoadModel(model.name) || faceHidden_.count(model.hash) != 0);
         });
         AddMenu();
         AddAccelerators();
@@ -476,8 +494,26 @@ public:
             case ID_TERRAIN_NEW:       NewTerrain(); return true;
             case ID_TERRAIN_OUTLINE:   StartOutline(); return true;
             case ID_TERRAIN_ALONG:     TerrainAlongRoad(); return true;
-            case ID_ROAD_JUNCTION_GAME: StartJunctionPick(); return true;
+            case ID_ROAD_FACE_JUNCTION: StartFaceWizard(); return true;
             case ID_ROAD_SPLIT_WAYS:   SplitCarriageways(); return true;
+            case ID_ROAD_LANE_ADD:     ChangeLanesAfterNode(1); return true;
+            case ID_ROAD_LANE_DROP:    ChangeLanesAfterNode(-1); return true;
+            case ID_ROAD_LANE_SPLIT:   SplitOffOuterLane(); return true;
+            case ID_ROAD_DRAW:         if (drawTool_) CloseDrawTool(); else StartDrawTool(0); return true;
+            case ID_ROAD_DRAW_FROM:
+                if (const roads::Node* node = SelectedNode()) StartDrawTool(node->id);
+                return true;
+            case ID_ROAD_INSERT_MIDDLE:
+                if (const roads::Segment* s = SelectedSegment()) {
+                    const u32 id = s->id;
+                    if (const u32 middle = network_.SplitSegment(id, 0.5f)) {
+                        if (roads::Node* n = network_.FindNode(middle)) n->hasHeading = false;
+                        Changed(true);
+                        Select((int)middle);
+                        app_.Status(Fmt(L"A node put in the middle of road %u", id));
+                    }
+                }
+                return true;
             case ID_VIEW_ROAD_GRAPH:
                 graphView_ = !graphView_;
                 graphBuilt_ = 0;
@@ -512,6 +548,8 @@ public:
     void UpdateMenuChecks(HMENU menu) override {
         ::CheckMenuItem(menu, ID_VIEW_ROADS, MF_BYCOMMAND | (visible_ ? MF_CHECKED : MF_UNCHECKED));
         ::CheckMenuItem(menu, ID_VIEW_ROAD_GRAPH, MF_BYCOMMAND | (graphView_ ? MF_CHECKED : MF_UNCHECKED));
+        ::CheckMenuItem(menu, ID_ROAD_DRAW, MF_BYCOMMAND | (drawTool_ ? MF_CHECKED : MF_UNCHECKED));
+        SyncToolbar();
         ::CheckMenuItem(menu, ID_GROUND_FIT, MF_BYCOMMAND | (fitGround_ ? MF_CHECKED : MF_UNCHECKED));
         for (int b = 0; b < terrain::kBrushCount; ++b)
             ::CheckMenuItem(menu, ID_TERRAIN_BRUSH + b, MF_BYCOMMAND | ((int)brush_ == b ? MF_CHECKED : MF_UNCHECKED));
@@ -544,6 +582,9 @@ public:
         terrainBatches_.clear();
         stroking_ = false;
         strokeGround_ = false;
+        if (wizard_ != kWizardOff) EndFaceWizard(nullptr);
+        faceRemainder_.clear();
+        faceHidden_.clear();
         groundModels_.clear();
         ground_.Clear();
         batches_.clear();
@@ -564,7 +605,7 @@ public:
     // street lights, collision and routes leave the game with it. Reverting
     // the baked row takes everything baked out of the game.
 
-    enum class EditKind : size_t { Segment = 1, GameJunction, Cut, Patch, Ground, Baked };
+    enum class EditKind : size_t { Segment = 1, GameJunction, Cut, Patch, Ground, Baked, FaceJunction };
     static size_t EditIndex(EditKind kind, size_t i) { return ((size_t)kind << 24) | (i & 0xFFFFFF); }
 
     size_t BakedModels() const {
@@ -599,6 +640,15 @@ public:
         for (size_t i = 0; i < junctions.size(); ++i)
             add(EditKind::GameJunction, i, Fmt(L"Junction at %.0f, %.0f", junctions[i].centre.x, junctions[i].centre.y),
                 Fmt(L"into the game's road, %.1f wide%s", junctions[i].halfRoad * 2.0f, state), L"Road junction");
+        const auto& faceJunctions = network_.FaceJunctions();
+        for (size_t i = 0; i < faceJunctions.size(); ++i) {
+            const roads::FaceJunction& fj = faceJunctions[i];
+            Vec3 at{};
+            for (const roads::GameFace& f : fj.faces) at = at + f.p[0];
+            if (!fj.faces.empty()) at = at * (1.0f / fj.faces.size());
+            add(EditKind::FaceJunction, i, Fmt(L"Junction at %.0f, %.0f", at.x, at.y),
+                Fmt(L"%zu faces of %S replaced%s", fj.faces.size(), fj.model.c_str(), state), L"Road junction");
+        }
         const auto& cuts = network_.StoredCuts();
         for (size_t i = 0; i < cuts.size(); ++i)
             add(EditKind::Cut, i, Fmt(L"Cut at %.0f, %.0f", cuts[i].centre.x, cuts[i].centre.y),
@@ -629,6 +679,7 @@ public:
                     break;
                 case EditKind::GameJunction: network_.RemoveGameJunction(i); changed = true; break;
                 case EditKind::Cut:          network_.RemoveCut(i); changed = true; break;
+                case EditKind::FaceJunction: network_.RemoveFaceJunction(i); changed = true; break;
                 case EditKind::Patch:
                     if (i < terrain_.Patches().size()) patches.push_back(terrain_.Patches()[i].id);
                     break;
@@ -690,17 +741,8 @@ public:
     bool MouseDown(int x, int y, WPARAM keys) override {
         (void)keys;
         if (!visible_) return false;
-        if (pickingJunction_) {
-            pickingJunction_ = false;
-            const Ray ray = app_.View().RayAt(x, y);
-            PickResult hit;
-            if (!app_.Renderer().Pick(ray, hit)) {
-                app_.Status(L"Nothing under the cursor there");
-                return true;
-            }
-            JunctionOnGameRoad(ray.origin + ray.direction * hit.distance);
-            return true;
-        }
+        if (wizard_ != kWizardOff) return WizardMouseDown(x, y);
+        if (drawTool_) return DrawToolMouseDown(x, y);
         if (drawing_) {
             Vec3 point;
             if (AnythingUnder(x, y, point)) outline_.push_back(point);
@@ -751,9 +793,21 @@ public:
         return true;
     }
 
+    bool MouseUp(int x, int y, WPARAM keys) override {
+        (void)x; (void)y; (void)keys;
+        if (wizard_ == kWizardOff) return false;
+        wizardPainting_ = false;
+        return true;
+    }
+
     void MouseMove(int x, int y) override {
         cursorX_ = x;
         cursorY_ = y;
+        if (wizard_ != kWizardOff) { WizardMouseMove(x, y); return; }
+        if (drawTool_) {
+            drawHover_ = DrawHitAt(x, y);
+            return;
+        }
         if (drawing_) {
             hoverValid_ = AnythingUnder(x, y, hover_);
             return;
@@ -770,10 +824,17 @@ public:
 
     bool KeyDown(WPARAM key, bool repeat) override {
         (void)repeat;
-        if (pickingJunction_ && key == VK_ESCAPE) {
-            pickingJunction_ = false;
-            app_.Status(L"Junction cancelled");
-            return true;
+        if (wizard_ != kWizardOff && WizardKey(key)) return true;
+        if (drawTool_) {
+            if (key == VK_ESCAPE) {
+                if (drawFrom_ || drawPending_) EndDrawChain();
+                else CloseDrawTool();
+                return true;
+            }
+            if (key == VK_RETURN) {
+                EndDrawChain();
+                return true;
+            }
         }
         if (drawing_) {
             if (key == VK_ESCAPE) {
@@ -1055,8 +1116,8 @@ public:
         }
         if (roads::Segment* s = SelectedHandleMutable()) {
             // A handle is not deleted, it goes back to automatic.
-            if (id & kHandleAtStart) s->handleA = 0.0f;
-            else s->handleB = 0.0f;
+            if (id & kHandleAtStart) { s->handleA = 0.0f; s->liftSetA = false; }
+            else { s->handleB = 0.0f; s->liftSetB = false; }
             Changed(true);
             return true;
         }
@@ -1101,6 +1162,7 @@ public:
     }
 
     bool SetPoint(const Vec3& position, float heading, bool commit) override {
+        if (commit && wizard_ == kWizardPreview) wizardRefresh_ = true;   // once the move is in
         if (terrain::Patch* patch = SelectedPatchMutable()) {
             (void)heading;
             patchDragging_ = !commit;
@@ -1125,6 +1187,30 @@ public:
                 node->hasHeading = true;
                 node->heading = Degrees(std::atan2(offset.y, offset.x));
                 (atStart ? s->handleA : s->handleB) = std::max(0.5f, length);
+            }
+            // Up or down: the road leaves the node on that slope -- a ramp.
+            // A road going on through the node takes the same slope, so the
+            // two meet smoothly.
+            const Vec3 current = HandlePoint(*s, atStart);
+            if (std::fabs(position.z - current.z) > 1e-3f) {
+                const float lift = position.z - node->position.z;
+                (atStart ? s->liftSetA : s->liftSetB) = true;
+                (atStart ? s->liftA : s->liftB) = lift;
+                const float reach = std::max(0.5f, Length(Vec3{ current.x - node->position.x,
+                                                                current.y - node->position.y, 0.0f }));
+                const float slope = lift / reach;
+                const std::vector<u32> around = network_.SegmentsAt(node->id);
+                if (around.size() == 2)
+                    for (u32 otherId : around) {
+                        roads::Segment* other = network_.FindSegment(otherId);
+                        if (!other || other == s) continue;
+                        const bool otherStart = other->a == node->id;
+                        const Vec3 h = HandlePoint(*other, otherStart);
+                        const float otherReach = std::max(0.5f, Length(Vec3{ h.x - node->position.x,
+                                                                             h.y - node->position.y, 0.0f }));
+                        (otherStart ? other->liftSetA : other->liftSetB) = true;
+                        (otherStart ? other->liftA : other->liftB) = -slope * otherReach;
+                    }
             }
             network_.SetDirty();
             if (commit) Changed(true);
@@ -1163,7 +1249,7 @@ public:
             device->SetTransform(D3DTS_WORLD, &world);
             renderer.DrawModel(device, *object, false);
         }
-        if (batches_.empty() && terrainBatches_.empty()) return;
+        if (batches_.empty() && terrainBatches_.empty() && faceRemainder_.empty()) return;
         renderer.BeginUserMesh(device);
         const auto draw = [&](const DrawBatch& batch) {
             renderer.BindUserTexture(device, batch.texture);
@@ -1172,6 +1258,7 @@ public:
                                            batch.vertices.data(), sizeof(nfs::SolidVertex));
         };
         for (const DrawBatch& batch : batches_) draw(batch);
+        for (const DrawBatch& batch : faceRemainder_) draw(batch);
         for (const auto& [id, list] : terrainBatches_)
             for (const DrawBatch& batch : list) draw(batch);
     }
@@ -1290,6 +1377,66 @@ private:
             }
         }
         return out;
+    }
+
+    // ---- the bake as the game starts
+    //
+    // What the last bake (or unbake) was made from, as a fingerprint of the
+    // roads' and the terrain's files, kept beside them. When the game is
+    // started from the editor and the source has moved on since, it is baked
+    // first, so the game always has the roads as they are in the editor. A
+    // source that was unbaked on purpose and not changed since stays out.
+
+    std::wstring BakeStampPath() const {
+        const std::wstring region = app_.World() ? app_.World()->Region() : L"";
+        return app_.ModelsFolder() + L"\\roads-baked-" + region + L".txt";
+    }
+
+    std::string SourceStamp() const {
+        u64 hash = 1469598103934665603ull;
+        const auto mix = [&](const std::string& bytes) {
+            for (unsigned char c : bytes) { hash ^= c; hash *= 1099511628211ull; }
+            hash ^= 0xFF;
+            hash *= 1099511628211ull;
+        };
+        // The bake's own version: raised when what a bake writes changes
+        // (2: ground collision faces up; 3: loose road ends join the game's routes; 4: lane slots as the game fills them; 5: dead ends marked; 6: pieces kept in sections loaded all along them), so the next start bakes again.
+        mix("bake 7");
+        for (const std::wstring& path : { NetworkPath(), TerrainPath() }) {
+            std::ifstream in(path, std::ios::binary);
+            mix(in ? std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()) : std::string());
+        }
+        char text[32];
+        std::snprintf(text, sizeof(text), "%016llX", (unsigned long long)hash);
+        return text;
+    }
+
+    void WriteBakeStamp() {
+        if (!app_.World() || app_.ModelsFolder().empty()) return;
+        std::ofstream out(BakeStampPath(), std::ios::binary | std::ios::trunc);
+        out << SourceStamp() << "\n";
+    }
+
+    bool NeedsBake() const {
+        if (!app_.World() || app_.ModelsFolder().empty()) return false;
+        if (!ground_.Empty()) return true;                 // sculpted ground not yet in the game
+        std::ifstream in(BakeStampPath(), std::ios::binary);
+        std::string stamp;
+        if (in) in >> stamp;
+        if (!in.is_open()) {
+            // Never baked: only when there is something to bake.
+            return !network_.Segments().empty() || !terrain_.Patches().empty() || !network_.GameJunctions().empty();
+        }
+        return stamp != SourceStamp();
+    }
+
+    void OnBeforeLaunch() override {
+        SaveNetwork();
+        SaveTerrain();
+        if (!NeedsBake()) return;
+        LOG_INFO("roads: the roads or terrain changed since the last bake -- baking before the game starts");
+        app_.Status(L"Baking the roads and terrain before the game starts...");
+        Bake();
     }
 
     std::wstring NetworkPath() const {
@@ -1474,6 +1621,171 @@ private:
                     L"pull more road out of them (Ctrl+Shift+R). They stay joined to this road's end.");
     }
 
+    // ---- highway lanes at a node
+    //
+    // A road's lanes change at a node: one more after it (a lane gained, the
+    // extra lane widening out of nothing over the taper length), one fewer (a
+    // lane dropped, narrowing away before the node), or the outer lane leaving
+    // as a road of its own -- an exit -- while the rest go on. Lanes counted
+    // in the direction of travel away from the node; the outer one is on the
+    // right.
+
+    // A profile as seen travelling the other way along its road.
+    static roads::RoadProfile Flipped(roads::RoadProfile p) {
+        std::swap(p.lanesForward, p.lanesBackward);
+        std::swap(p.sidewalkLeft, p.sidewalkRight);
+        std::swap(p.wallLeft, p.wallRight);
+        return p;
+    }
+
+    // The road going on from the selected node: with two, the one drawn
+    // leaving it; alone, the only one. Null (with a message) when none.
+    roads::Segment* RoadOnFrom(const roads::Node& node, bool& leaving) {
+        const std::vector<u32> around = network_.SegmentsAt(node.id);
+        if (around.empty() || around.size() > 2) {
+            app_.Message(L"Select a node with one or two roads (not a junction).");
+            return nullptr;
+        }
+        roads::Segment* chosen = network_.FindSegment(around.back());
+        for (u32 id : around) {
+            roads::Segment* s = network_.FindSegment(id);
+            if (s && s->a == node.id) { chosen = s; break; }
+        }
+        leaving = chosen && chosen->a == node.id;
+        return chosen;
+    }
+
+    void ChangeLanesAfterNode(int change) {
+        const roads::Node* node = SelectedNode();
+        if (!node) {
+            app_.Message(L"Select a node first: the lanes change on the road going on from it.");
+            return;
+        }
+        bool leaving = false;
+        roads::Segment* road = RoadOnFrom(*node, leaving);
+        if (!road) return;
+        int& lanes = leaving ? road->profile.lanesForward : road->profile.lanesBackward;
+        if (lanes + change < 1) {
+            app_.Message(L"That road has one lane that way: it cannot lose it (split it off, or delete the road).");
+            return;
+        }
+        const float halfBefore = road->profile.HalfRoad();
+        lanes = std::min(8, lanes + change);
+        const std::vector<u32> around = network_.SegmentsAt(node->id);
+        const bool through = around.size() == 2;
+        if (through) {
+            // The lane comes or goes on the outer (right) side only: the
+            // other edge stays in line with the road before the node.
+            const roads::Segment* before = network_.FindSegment(around[0] == road->id ? around[1] : around[0]);
+            const bool sameWay = (road->a == node->id) != (before->a == node->id);
+            const float otherShift = sameWay ? before->shift : -before->shift;
+            const float otherHalf = before->profile.HalfRoad();
+            const float half = road->profile.HalfRoad();
+            road->shift = leaving ? otherShift + half - otherHalf : otherShift + otherHalf - half;
+        } else {
+            road->shift += (road->profile.HalfRoad() - halfBefore) * (leaving ? 1.0f : -1.0f);
+        }
+        Changed(true);
+        Select((int)road->id);
+        app_.Status(Fmt(L"Road %u now has %d lanes going on from the node%s", road->id, lanes,
+                        through ? (change > 0 ? L": the new lane widens in over the taper length"
+                                              : L": the dropped lane narrows away before the node")
+                                : L""));
+    }
+
+    void SplitOffOuterLane() {
+        const roads::Node* selected = SelectedNode();
+        if (!selected) {
+            app_.Message(L"Select a node first: the outer lane of the road going on from it leaves there.");
+            return;
+        }
+        const u32 nodeId = selected->id;
+        const std::vector<u32> around = network_.SegmentsAt(nodeId);
+        bool leaving = false;
+        roads::Segment* found = RoadOnFrom(*selected, leaving);
+        if (!found) return;
+        const roads::Segment road = *found;
+        const bool alone = around.size() == 1;
+        // With one road the lanes go on past its end; with two, the road
+        // going on is rebuilt from the split.
+        const roads::Curve curve = network_.CurveOf(road);
+        Vec3 away;
+        bool flip = false;
+        if (alone) {
+            const bool endsHere = road.b == nodeId;
+            away = HorizontalDirection(endsHere ? curve.Tangent(1.0f) : curve.Tangent(0.0f) * -1.0f);
+            flip = !endsHere;
+        } else {
+            away = HorizontalDirection(leaving ? curve.Tangent(0.0f) : curve.Tangent(1.0f) * -1.0f);
+            flip = !leaving;
+        }
+        const roads::RoadProfile p = flip ? Flipped(road.profile) : road.profile;
+        if (p.lanesForward < 2) {
+            app_.Message(L"The road has a single lane going on from that node: there is no outer lane to split off.");
+            return;
+        }
+        const Vec3 right{ away.y, -away.x, 0.0f };
+        roads::RoadProfile main = p, exit = p;
+        main.lanesForward -= 1;
+        main.sidewalkRight = false;      // the side the exit leaves from
+        exit.lanesForward = 1;
+        exit.lanesBackward = 0;
+        exit.medianType = 0;
+        exit.medianTexture.clear();
+        exit.sidewalkLeft = false;
+        // Walls on both sides of both when the road had one there: between
+        // them they start where the two roads have parted (the gore).
+        main.wallRight = p.wallRight;
+        exit.wallLeft = p.wallRight;
+        if (exit.poleSides == 4) exit.poleSides = 0;
+        const float half = p.HalfRoad();
+        const float shiftAway = flip ? -road.shift : road.shift;   // the road's cross-section off its curve
+        const float mainOffset = -half + main.HalfRoad() + shiftAway;
+        const float exitOffset = half - exit.HalfRoad() + shiftAway;
+
+        roads::Node* node = network_.FindNode(nodeId);
+        node->hasHeading = true;
+        node->heading = Degrees(std::atan2(away.y, away.x));
+        const auto follower = [&](float offset) {
+            const Vec3 start = network_.FindNode(nodeId)->position + right * offset;
+            const u32 id = network_.AddNode(start);
+            roads::Node* n = network_.FindNode(id);
+            n->follow = nodeId;
+            n->followOffset = offset;
+            n->hasHeading = true;
+            n->heading = network_.FindNode(nodeId)->heading;
+            return id;
+        };
+        const u32 mainStart = follower(mainOffset);
+        const u32 exitStart = follower(exitOffset);
+        const Vec3 mainAt = network_.FindNode(mainStart)->position;
+        const Vec3 exitAt = network_.FindNode(exitStart)->position;
+        if (alone) {
+            const Vec3 tip = mainAt + away * 60.0f;
+            network_.AddSegment(mainStart, network_.AddNode({ tip.x, tip.y, mainAt.z }), main);
+        } else {
+            // The road going on now starts from the main lanes' side.
+            const u32 farEnd = leaving ? road.b : road.a;
+            if (roads::Segment* r = network_.AddSegment(mainStart, farEnd, main)) {
+                r->handleA = leaving ? road.handleA : road.handleB;
+                r->handleB = leaving ? road.handleB : road.handleA;
+                r->liftSetA = leaving ? road.liftSetA : road.liftSetB;
+                r->liftA = leaving ? road.liftA : road.liftB;
+                r->liftSetB = leaving ? road.liftSetB : road.liftSetA;
+                r->liftB = leaving ? road.liftB : road.liftA;
+            }
+            network_.RemoveSegment(road.id);
+        }
+        // The exit: away and out to the right.
+        const Vec3 exitTip = exitAt + away * 60.0f + right * 14.0f;
+        const u32 tip = network_.AddNode({ exitTip.x, exitTip.y, exitAt.z });
+        network_.AddSegment(exitStart, tip, exit);
+        Changed(true);
+        Select((int)tip);
+        app_.Status(L"The outer lane leaves as a road of its own: move its end with the gizmo and pull more road out "
+                    L"of it (Ctrl+Shift+R); drop an end on another node to join them.");
+    }
+
     void Extend() {
         u32 from = 0;
         if (const roads::Node* node = SelectedNode()) {
@@ -1518,6 +1830,30 @@ private:
 
     // Where a dragged node lands: on another node they become one; on the
     // middle of a road, the road is split there and joined.
+    // The node a dragged one would be joined to if let go now, or 0.
+    u32 SnapTarget(u32 moved) const {
+        const roads::Node* node = network_.FindNode(moved);
+        if (!node) return 0;
+        const Vec3 at = node->position;
+        std::set<u32> neighbours;
+        for (u32 id : network_.SegmentsAt(moved)) {
+            const roads::Segment& s = *network_.FindSegment(id);
+            neighbours.insert(s.a == moved ? s.b : s.a);
+        }
+        float snap = 3.0f;
+        for (u32 id : network_.SegmentsAt(moved))
+            snap = std::max(snap, network_.FindSegment(id)->profile.HalfRoad() * 0.75f);
+        u32 target = 0;
+        float best = snap;
+        for (const roads::Node& other : network_.Nodes()) {
+            if (other.id == moved || neighbours.count(other.id)) continue;
+            if (other.follow == moved || node->follow == other.id) continue;
+            const float d = Length(Vec3{ other.position.x - at.x, other.position.y - at.y, 0.0f });
+            if (d < best && std::fabs(other.position.z - at.z) < 4.0f) { best = d; target = other.id; }
+        }
+        return target;
+    }
+
     void Snap(u32 moved) {
         const roads::Node* node = network_.FindNode(moved);
         if (!node) return;
@@ -1632,6 +1968,7 @@ private:
         field_.Build(network_, [](const roads::Segment& segment) { return !segment.profile.bridge; });
         batches_.clear();
         poles_.clear();
+        BuildFaceRemainder();
         const std::vector<roads::MeshPiece> pieces = network_.BuildMesh(&poles_);
         for (const roads::MeshPiece& piece : pieces) {
             for (const roads::MeshGroup& group : piece.groups) {
@@ -1710,6 +2047,23 @@ private:
                 n.find("WALL") != std::string::npos)
                 wallModels_.push_back(Widen(n));
         }
+        pillarModels_.clear();
+        pillarModels_.push_back(L"-");
+        for (const nfs::SolidObject* model : world.AllModels()) {
+            if (!model || model->IsTerrain() || roads::IsBakedRoadModel(model->name)) continue;
+            const std::string& n = model->name;
+            if (n.find("PILLAR") != std::string::npos || n.find("SUPPORT") != std::string::npos ||
+                n.find("COLUMN") != std::string::npos || n.find("PIER") != std::string::npos ||
+                n.find("STANCHION") != std::string::npos) {
+                // Only models built around their own origin: one built in
+                // place in the city would stand far off the bridge.
+                const Aabb& box = model->bounds;
+                if (box.Valid() && std::fabs(box.min.x + box.max.x) < 40.0f && std::fabs(box.min.y + box.max.y) < 40.0f)
+                    pillarModels_.push_back(Widen(n));
+            }
+        }
+        std::sort(pillarModels_.begin() + 1, pillarModels_.end());
+        pillarModels_.erase(std::unique(pillarModels_.begin() + 1, pillarModels_.end()), pillarModels_.end());
         std::sort(wallModels_.begin() + 1, wallModels_.end());
         wallModels_.erase(std::unique(wallModels_.begin() + 1, wallModels_.end()), wallModels_.end());
         if (wallModels_.size() > 300) wallModels_.resize(300);
@@ -1867,247 +2221,10 @@ private:
         Select(kTerrainBit | (int)id);
     }
 
-    // ---- a junction on one of the game's roads
-
-    // A triangle of the game's ground near a point, in world space.
-    struct GroundTriangle {
-        Vec3 a, b, c;
-        Vec2 ua, ub, uc;
-        u32  colour = 0;
-        std::string texture;
-    };
-
-    std::vector<GroundTriangle> GroundTrianglesNear(const Vec3& point, float radius) const {
-        std::vector<GroundTriangle> out;
-        const nfs::World* world = app_.World();
-        if (!world) return out;
-        for (const GroundModel& g : groundModels_) {
-            if (point.x < g.bounds.min.x - radius || point.x > g.bounds.max.x + radius ||
-                point.y < g.bounds.min.y - radius || point.y > g.bounds.max.y + radius)
-                continue;
-            const nfs::SolidObject& model = *g.model;
-            for (const nfs::SolidMaterial& material : model.materials) {
-                const u32 hash = material.textureIndex < model.textureHashes.size()
-                                     ? model.textureHashes[material.textureIndex] : 0;
-                const nfs::Texture* texture = hash ? world->FindTexture(hash) : nullptr;
-                const size_t last = std::min<size_t>((size_t)material.firstIndex + material.indexCount,
-                                                     model.indices.size());
-                for (size_t k = material.firstIndex; k + 2 < last; k += 3) {
-                    const u32 ia = model.indices[k], ib = model.indices[k + 1], ic = model.indices[k + 2];
-                    const Vec3 centre = (g.world[ia] + g.world[ib] + g.world[ic]) * (1.0f / 3.0f);
-                    const float dx = centre.x - point.x, dy = centre.y - point.y;
-                    if (dx * dx + dy * dy > radius * radius || std::fabs(centre.z - point.z) > 15.0f) continue;
-                    GroundTriangle t;
-                    t.a = g.world[ia]; t.b = g.world[ib]; t.c = g.world[ic];
-                    t.ua = model.vertices[ia].uv; t.ub = model.vertices[ib].uv; t.uc = model.vertices[ic].uv;
-                    t.colour = model.vertices[ia].color;
-                    t.texture = texture ? texture->name : std::string();
-                    out.push_back(std::move(t));
-                }
-            }
-        }
-        return out;
-    }
-
+    // The game's road textures: its road surfaces, and the lane markings among them.
     static bool IsRoadTexture(const std::string& name) { return name.rfind("RDP_", 0) == 0; }
     static bool IsLaneTexture(const std::string& name) {
         return name.rfind("RDP_LANE", 0) == 0 || name.rfind("RDP_ROADSTRIP", 0) == 0;
-    }
-    static bool IsWalkTexture(const std::string& name) {
-        return name.find("SIDEWALK") != std::string::npos || name.find("CURB") != std::string::npos ||
-               name.find("KERB") != std::string::npos;
-    }
-
-    // The triangle under (x, y) nearest the height `z`.
-    static const GroundTriangle* SurfaceAt(const std::vector<GroundTriangle>& triangles, float x, float y, float z,
-                                           float& height) {
-        const GroundTriangle* best = nullptr;
-        float gap = 1e30f;
-        for (const GroundTriangle& t : triangles) {
-            const float d = (t.b.y - t.c.y) * (t.a.x - t.c.x) + (t.c.x - t.b.x) * (t.a.y - t.c.y);
-            if (std::fabs(d) < 1e-6f) continue;
-            const float l1 = ((t.b.y - t.c.y) * (x - t.c.x) + (t.c.x - t.b.x) * (y - t.c.y)) / d;
-            const float l2 = ((t.c.y - t.a.y) * (x - t.c.x) + (t.a.x - t.c.x) * (y - t.c.y)) / d;
-            const float l3 = 1.0f - l1 - l2;
-            if (l1 < -1e-4f || l2 < -1e-4f || l3 < -1e-4f) continue;
-            const float h = t.a.z * l1 + t.b.z * l2 + t.c.z * l3;
-            if (std::fabs(h - z) < gap) { gap = std::fabs(h - z); best = &t; height = h; }
-        }
-        return best;
-    }
-
-    void StartJunctionPick() {
-        if (!app_.World()) {
-            app_.Message(L"Open a region first.");
-            return;
-        }
-        visible_ = true;
-        SetBrush(terrain::Brush::None);
-        drawing_ = false;
-        pickingJunction_ = true;
-        ::SetFocus(app_.View().Handle());
-        app_.Status(L"Junction on a game road: click the middle of the game's road where the junction goes "
-                    L"(Esc cancels)");
-    }
-
-    // A texture mapping read off the game's triangle under a point.
-    static roads::UvMap MappingAt(const std::vector<GroundTriangle>& triangles, const Vec3& p, bool (*accept)(const std::string&),
-                                  std::string* texture) {
-        roads::UvMap map;
-        float h = 0.0f;
-        const GroundTriangle* t = SurfaceAt(triangles, p.x, p.y, p.z, h);
-        if (!t || (accept && !accept(t->texture))) return map;
-        const float det = (t->b.x - t->a.x) * (t->c.y - t->a.y) - (t->c.x - t->a.x) * (t->b.y - t->a.y);
-        if (std::fabs(det) < 1e-6f) return map;
-        const auto gradient = [&](float fa, float fb, float fc) {
-            const float d1 = fb - fa, d2 = fc - fa;
-            return Vec2{ (d1 * (t->c.y - t->a.y) - d2 * (t->b.y - t->a.y)) / det,
-                         (d2 * (t->b.x - t->a.x) - d1 * (t->c.x - t->a.x)) / det };
-        };
-        map.gu = gradient(t->ua.x, t->ub.x, t->uc.x);
-        map.gv = gradient(t->ua.y, t->ub.y, t->uc.y);
-        map.origin = t->a;
-        map.uv = t->ua;
-        map.valid = true;
-        if (texture) *texture = t->texture;
-        return map;
-    }
-
-    // Reads the game's road under `point` -- its direction from the way its
-    // lane textures run, its width from where they end, the sidewalks beyond
-    // and how they are mapped -- and makes a junction into it on the side
-    // that was clicked: the road stays the game's, a box across it is rebuilt
-    // and a new road leaves from its mouth.
-    void JunctionOnGameRoad(const Vec3& point) {
-        const std::vector<GroundTriangle> triangles = GroundTrianglesNear(point, 45.0f);
-        // The direction: where the lane textures' V runs, averaged as an axis
-        // (the doubled angle), weighted by area and by nearness.
-        float sx = 0.0f, sy = 0.0f;
-        u32 r = 0, g = 0, b = 0, n = 0;
-        for (const GroundTriangle& t : triangles) {
-            if (!IsLaneTexture(t.texture)) continue;
-            const float det = (t.b.x - t.a.x) * (t.c.y - t.a.y) - (t.c.x - t.a.x) * (t.b.y - t.a.y);
-            if (std::fabs(det) < 1e-4f) continue;
-            const float dv1 = t.ub.y - t.ua.y, dv2 = t.uc.y - t.ua.y;
-            const float gx = (dv1 * (t.c.y - t.a.y) - dv2 * (t.b.y - t.a.y)) / det;
-            const float gy = (dv2 * (t.b.x - t.a.x) - dv1 * (t.c.x - t.a.x)) / det;
-            if (std::sqrt(gx * gx + gy * gy) < 1e-5f) continue;
-            const float angle = std::atan2(gy, gx);
-            const Vec3 middle = (t.a + t.b + t.c) * (1.0f / 3.0f);
-            const float weight = std::fabs(det) / (1.0f + Length(Vec3{ middle.x - point.x, middle.y - point.y, 0 }) / 8.0f);
-            sx += std::cos(2.0f * angle) * weight;
-            sy += std::sin(2.0f * angle) * weight;
-            r += (t.colour >> 16) & 0xFF; g += (t.colour >> 8) & 0xFF; b += t.colour & 0xFF; ++n;
-        }
-        if (std::fabs(sx) + std::fabs(sy) < 1e-6f) {
-            app_.Message(L"No lane markings of the game's roads were found there. Click on a street (its lane "
-                         L"texture), on the side the new road should leave from.");
-            return;
-        }
-        const float angle = 0.5f * std::atan2(sy, sx);
-        const Vec3 forward{ std::cos(angle), std::sin(angle), 0.0f };
-        const Vec3 right{ forward.y, -forward.x, 0.0f };
-
-        // The road's edges either side of the click, then the sidewalks.
-        const auto walk = [&](float side, bool (*accept)(const std::string&), float from, float limit, float& z) {
-            float reach = from;
-            float h = point.z;
-            for (float d = from; d <= limit; d += 0.25f) {
-                const Vec3 p = point + right * (d * side);
-                float height = 0.0f;
-                const GroundTriangle* t = SurfaceAt(triangles, p.x, p.y, h, height);
-                if (!t || !accept(t->texture)) break;
-                reach = d;
-                h = height;
-            }
-            z = h;
-            return reach;
-        };
-        float zl = 0, zr = 0, wl = 0, wr = 0;
-        const float left = walk(-1.0f, IsRoadTexture, 0.0f, 30.0f, zl);
-        const float rightEdge = walk(1.0f, IsRoadTexture, 0.0f, 30.0f, zr);
-        const float walkLeft = walk(-1.0f, IsWalkTexture, left + 0.5f, left + 10.0f, wl) - left;
-        const float walkRight = walk(1.0f, IsWalkTexture, rightEdge + 0.5f, rightEdge + 10.0f, wr) - rightEdge;
-        const float width = left + rightEdge;
-        if (width < 3.0f) {
-            app_.Message(L"The road there is too narrow to read; click on its surface.");
-            return;
-        }
-        Vec3 centre = point + right * ((rightEdge - left) * 0.5f);
-        {
-            float h = 0.0f;
-            if (SurfaceAt(triangles, centre.x, centre.y, point.z, h)) centre.z = h;
-        }
-        // The new road leaves from the side that was clicked.
-        const int side = Dot(point - centre, right) >= 0.0f ? 1 : -1;
-        const float half = width * 0.5f;
-        roads::GameJunction j;
-        j.centre = centre;
-        j.forward = forward;
-        j.side = side;
-        j.halfRoad = half;
-        j.walkNear = std::max(0.0f, side > 0 ? walkRight : walkLeft);
-        j.walkFar = std::max(0.0f, side > 0 ? walkLeft : walkRight);
-        if (j.walkNear < 0.6f) j.walkNear = 0.0f;
-        if (j.walkFar < 0.6f) j.walkFar = 0.0f;
-        const float walkTop = j.walkNear > 0 ? (side > 0 ? wr : wl) : (side > 0 ? wl : wr);
-        j.walkHeight = std::clamp(walkTop - centre.z, 0.05f, 0.5f);
-
-        // The new road: two lanes the width of the game's, sidewalks like the
-        // ones it leaves from.
-        roads::RoadProfile profile = lastProfile_;
-        const int lanes = std::max(1, (int)std::lround(width / 4.0f));
-        profile.laneWidth = std::clamp(width / lanes, 2.5f, 6.0f);
-        profile.lanesForward = 1;
-        profile.lanesBackward = 1;
-        profile.medianType = 0;
-        profile.sidewalkWidth = j.walkNear;
-        profile.sidewalkLeft = profile.sidewalkRight = true;
-        profile.sidewalkHeight = j.walkHeight;
-        profile.wallLeft = profile.wallRight = false;
-        profile.poleModel.clear();
-        profile.bridge = false;
-        profile.bankMode = 0;
-        profile.keepGround = false;
-        if (n) profile.ambient = ((r / n) << 16) | ((g / n) << 8) | (b / n);
-
-        const float L = j.HalfLength(profile.HalfRoad(), profile.sidewalkWidth);
-        {
-            float h = 0.0f;
-            const Vec3 a = centre - forward * L, z = centre + forward * L;
-            j.zStart = SurfaceAt(GroundTrianglesNear(a, 6.0f), a.x, a.y, centre.z, h) ? h : centre.z;
-            j.zEnd = SurfaceAt(GroundTrianglesNear(z, 6.0f), z.x, z.y, centre.z, h) ? h : centre.z;
-        }
-        // The sidewalks' own texture mapping, read just past the box.
-        const Vec3 out = j.Out();
-        if (j.walkNear > 0.0f) {
-            const Vec3 p = centre - forward * (L + 0.6f) + out * (half + j.walkNear * 0.5f) + Vec3{ 0, 0, j.walkHeight };
-            j.uvNear = MappingAt(triangles, p, IsWalkTexture, &j.walkTextureNear);
-            if (!j.uvNear.valid) j.walkTextureNear = profile.sidewalkTexture;
-            else profile.sidewalkTexture = j.walkTextureNear;
-        }
-        if (j.walkFar > 0.0f) {
-            const Vec3 p = centre - forward * (L + 0.6f) - out * (half + j.walkFar * 0.5f) + Vec3{ 0, 0, j.walkHeight };
-            j.uvFar = MappingAt(triangles, p, IsWalkTexture, &j.walkTextureFar);
-            if (!j.uvFar.valid) j.walkTextureFar = profile.sidewalkTexture;
-        }
-
-        // The mouth node, placed by the junction, and the first stretch of the new road.
-        const Vec3 mouth = j.At(0.0f, half + j.walkNear, 1.0f);
-        const u32 start = network_.AddNode(mouth);
-        const u32 tip = network_.AddNode(mouth + out * 30.0f);
-        network_.AddSegment(start, tip, profile);
-        j.node = start;
-        network_.AddGameJunction(j);
-        Changed(true);
-        Select((int)tip);
-        LOG_INFO("roads: junction into the game's road at (%.1f, %.1f, %.1f), heading %.1f, road %.2f wide, "
-                 "sidewalks %.2f near / %.2f far (%s / %s), box %.1f long", centre.x, centre.y, centre.z,
-                 Degrees(angle), width, j.walkNear, j.walkFar, j.walkTextureNear.c_str(), j.walkTextureFar.c_str(),
-                 L * 2.0f);
-        app_.Status(Fmt(L"Junction made into the game's road (%.1f wide): its box is rebuilt with the game's own "
-                        L"sidewalks; drag the new road's end with the gizmo, Ctrl+Shift+R pulls more road.",
-                        width));
     }
 
     // ---- the game's own ground
@@ -2119,6 +2236,750 @@ private:
         std::vector<Vec3> world;     // its vertices where the game has them now
         bool shown = false;          // drawn moved
     };
+
+    // ---- the road drawing tool
+    //
+    // Click by click, as in a road editor: on open ground a node, joined by
+    // a road to the one before; on a node, a road into it (and the drawing
+    // goes on from there); on a road away from its nodes, a node in it --
+    // the road is split there and the new road joins it. Each click is a
+    // step of its own for Ctrl+Z. Enter ends the road being drawn, Esc too
+    // and then closes the tool.
+
+    void StartDrawTool(u32 from) {
+        if (!app_.World()) {
+            app_.Message(L"Open a region first.");
+            return;
+        }
+        if (wizard_ != kWizardOff) EndFaceWizard(nullptr);
+        visible_ = true;
+        SetBrush(terrain::Brush::None);
+        drawing_ = false;
+        drawTool_ = true;
+        drawFrom_ = from;
+        drawPending_ = false;
+        drawProfile_ = lastProfile_;
+        if (from)
+            for (u32 id : network_.SegmentsAt(from))
+                if (const roads::Segment* s = network_.FindSegment(id)) { drawProfile_ = s->profile; break; }
+        ::SetFocus(app_.View().Handle());
+        SyncToolbar();
+        app_.Status(L"Drawing roads: click open ground for nodes, a node to join it, a road to put a node in it. "
+                    L"Enter ends the road, Esc closes the tool.");
+    }
+
+    void EndDrawChain() {
+        drawFrom_ = 0;
+        drawPending_ = false;
+    }
+
+    void CloseDrawTool() {
+        drawTool_ = false;
+        EndDrawChain();
+        SyncToolbar();
+        app_.Status(L"Road drawing closed");
+    }
+
+    // What the cursor is over for the tool: a node, a road (and where along
+    // it), or open ground.
+    struct DrawHit {
+        enum Kind { None, Node, Road, Ground } kind = None;
+        u32 node = 0, segment = 0;
+        float t = 0.0f;
+        Vec3 point;
+    };
+
+    DrawHit DrawHitAt(int x, int y) const {
+        DrawHit hit;
+        const Ray ray = app_.View().RayAt(x, y);
+        // A node near the ray.
+        float bestMiss = 1e30f;
+        for (const roads::Node& node : network_.Nodes()) {
+            if (node.follow) continue;
+            const Vec3 d = node.position - ray.origin;
+            const float t = std::max(0.0f, Dot(d, ray.direction));
+            const float miss = Length(d - ray.direction * t);
+            if (miss < std::max(NodeSize(node) * 1.3f, t * 0.015f) && miss < bestMiss) {
+                bestMiss = miss;
+                hit.kind = DrawHit::Node;
+                hit.node = node.id;
+                hit.point = node.position;
+            }
+        }
+        if (hit.kind == DrawHit::Node) return hit;
+        // A road's surface.
+        float nearest = -1.0f;
+        u32 owner = 0;
+        for (const DrawBatch& batch : batches_)
+            for (size_t k = 0; k + 2 < batch.indices.size(); k += 3) {
+                const float d = IntersectRayTriangle(ray, batch.vertices[batch.indices[k]].position,
+                                                     batch.vertices[batch.indices[k + 1]].position,
+                                                     batch.vertices[batch.indices[k + 2]].position);
+                if (d < 0.0f || (nearest >= 0.0f && d >= nearest)) continue;
+                nearest = d;
+                owner = batch.owner;
+            }
+        if (nearest >= 0.0f) {
+            const Vec3 at = ray.origin + ray.direction * nearest;
+            if (const roads::Segment* s = network_.FindSegment(owner)) {
+                float t = 0.0f, distance = 0.0f;
+                network_.NearestOnSegment(*s, at, t, distance);
+                if (t > 0.03f && t < 0.97f) {
+                    hit.kind = DrawHit::Road;
+                    hit.segment = s->id;
+                    hit.t = t;
+                    hit.point = network_.CurveOf(*s).At(t);
+                    return hit;
+                }
+            }
+        }
+        Vec3 ground;
+        if (AnythingUnder(x, y, ground)) {
+            hit.kind = DrawHit::Ground;
+            hit.point = ground;
+        }
+        return hit;
+    }
+
+    // The road being drawn, from the last node (or the first click) to `to`.
+    bool DrawRoadTo(u32 to) {
+        if (drawPending_) {
+            const u32 start = network_.AddNode(drawStart_);
+            drawPending_ = false;
+            drawFrom_ = start;
+        }
+        if (!drawFrom_ || drawFrom_ == to) return false;
+        for (u32 id : network_.SegmentsAt(drawFrom_)) {
+            const roads::Segment* s = network_.FindSegment(id);
+            if (s && (s->a == to || s->b == to)) return false;     // already joined
+        }
+        return network_.AddSegment(drawFrom_, to, drawProfile_) != nullptr;
+    }
+
+    bool DrawToolMouseDown(int x, int y) {
+        const DrawHit hit = DrawHitAt(x, y);
+        const bool drawingRoad = drawFrom_ || drawPending_;
+        switch (hit.kind) {
+            case DrawHit::Node:
+                if (!drawingRoad) {
+                    // Start from it, with the profile of a road it has.
+                    StartDrawTool(hit.node);
+                    Select((int)hit.node);
+                    return true;
+                }
+                if (DrawRoadTo(hit.node)) {
+                    Changed(true);
+                    app_.Status(Fmt(L"Joined to node %u -- go on from it, or Enter to end the road", hit.node));
+                }
+                drawFrom_ = hit.node;
+                Select((int)hit.node);
+                return true;
+            case DrawHit::Road: {
+                const u32 middle = network_.SplitSegment(hit.segment, hit.t);
+                if (!middle) return true;
+                if (roads::Node* joined = network_.FindNode(middle)) joined->hasHeading = false;
+                if (drawingRoad) {
+                    DrawRoadTo(middle);
+                    EndDrawChain();
+                    app_.Status(Fmt(L"A node put in road %u and the new road joined to it", hit.segment));
+                } else {
+                    drawFrom_ = middle;    // and on from it, if the next click is elsewhere
+                    app_.Status(Fmt(L"A node put in road %u: click on to draw a road out of it, Enter to stop",
+                                    hit.segment));
+                }
+                Changed(true);
+                Select((int)middle);
+                return true;
+            }
+            case DrawHit::Ground: {
+                if (!drawingRoad) {
+                    drawPending_ = true;
+                    drawStart_ = hit.point;
+                    app_.Status(L"Road started: click where it goes next");
+                    return true;
+                }
+                const u32 node = network_.AddNode(hit.point);
+                DrawRoadTo(node);
+                drawFrom_ = node;
+                Changed(true);
+                Select((int)node);
+                return true;
+            }
+            default: return true;
+        }
+    }
+
+    // The tool's panel over the view.
+    void DrawToolHud(float x, float y, float width) {
+        ImGui::SetNextWindowPos(ImVec2(x + width * 0.5f, y + 52.0f), ImGuiCond_Always, ImVec2(0.5f, 0.0f));
+        ImGui::SetNextWindowBgAlpha(0.9f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12.0f, 10.0f));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 8.0f);
+        const ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+                                       ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoDocking |
+                                       ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav |
+                                       ImGuiWindowFlags_NoMove;
+        if (ImGui::Begin("##drawroads", nullptr, flags)) {
+            const ImVec4 accent = ImGui::GetStyleColorVec4(ImGuiCol_CheckMark);
+            ImGui::TextColored(accent, "Draw roads");
+            ImGui::SameLine();
+            ImGui::TextDisabled("%d+%d lanes, %.1f wide", drawProfile_.lanesForward, drawProfile_.lanesBackward,
+                                drawProfile_.HalfWidth() * 2.0f);
+            ImGui::Separator();
+            if (drawFrom_ || drawPending_)
+                ImGui::TextUnformatted("Click where the road goes next. On a node it joins it; on a road it makes a node there.");
+            else
+                ImGui::TextUnformatted("Click open ground to start a road, a node to draw from it, a road to put a node in it.");
+            ImGui::TextDisabled("Green: a node to join   Cyan: a node goes into that road   White: a new node");
+            ImGui::Spacing();
+            ImGui::BeginDisabled(!drawFrom_ && !drawPending_);
+            if (ImGui::Button("End this road  (Enter)")) EndDrawChain();
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            if (ImGui::Button("Close the tool  (Esc)")) CloseDrawTool();
+        }
+        ImGui::End();
+        ImGui::PopStyleVar(2);
+    }
+
+    // ---- the face junction wizard
+    //
+    // A junction made of the game's own faces, in three steps: the game's
+    // road mesh to edit, the faces of it in the new road's way, and the end
+    // node of the procedural road that joins there. From then on the result
+    // is worked out on the spot and drawn as a wireframe over the untouched
+    // game mesh -- faces can still be added or taken away, or another node
+    // chosen -- until Enter makes it part of the roads.
+
+    enum WizardStep { kWizardOff = 0, kWizardModel, kWizardFaces, kWizardNode, kWizardPreview };
+    static constexpr float kUnderRoad = 8.0f;   // how far back under the new road the game's ground goes
+
+    void StartFaceWizard() {
+        if (!app_.World() || groundModels_.empty()) {
+            app_.Message(L"Open a region first.");
+            return;
+        }
+        visible_ = true;
+        SetBrush(terrain::Brush::None);
+        drawing_ = false;
+        wizard_ = kWizardModel;
+        wizardModel_ = -1;
+        wizardFaces_.clear();
+        wizardNode_ = 0;
+        wizardHover_ = -1;
+        wizardPiece_ = {};
+        ::SetFocus(app_.View().Handle());
+        WizardStatus();
+    }
+
+    void WizardStatus() {
+        switch (wizard_) {
+            case kWizardModel:
+                app_.Status(L"Junction from game faces, 1 of 3: click the game's road mesh to edit (Esc cancels)");
+                break;
+            case kWizardFaces:
+                app_.Status(Fmt(L"Junction from game faces, 2 of 3: click or drag over the faces in the new road's way "
+                                L"(%zu chosen; a chosen one unchooses). Enter: next, Backspace: back, Esc: cancel",
+                                wizardFaces_.size()));
+                break;
+            case kWizardNode:
+                app_.Status(L"Junction from game faces, 3 of 3: click the end node of the procedural road that joins "
+                            L"here. Backspace: back, Esc: cancel");
+                break;
+            case kWizardPreview:
+                app_.Status(Fmt(L"Junction preview (%zu faces): green is what replaces them, the game mesh is untouched. "
+                                L"Click faces to change, Backspace for another node, Enter applies, Esc cancels",
+                                wizardFaces_.size()));
+                break;
+            default: break;
+        }
+    }
+
+    // The wizard's steps, drawn at the top of the view: where it is, what to
+    // do now, and buttons for the keys.
+    void DrawHud(float x, float y, float width, float height) override {
+        (void)height;
+        if (drawTool_ && wizard_ == kWizardOff) {
+            DrawToolHud(x, y, width);
+            return;
+        }
+        if (wizard_ == kWizardOff) return;
+        ImGui::SetNextWindowPos(ImVec2(x + width * 0.5f, y + 52.0f), ImGuiCond_Always, ImVec2(0.5f, 0.0f));
+        ImGui::SetNextWindowBgAlpha(0.9f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12.0f, 10.0f));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 8.0f);
+        const ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+                                       ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoDocking |
+                                       ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav |
+                                       ImGuiWindowFlags_NoMove;
+        if (ImGui::Begin("##facewizard", nullptr, flags)) {
+            ImGui::TextUnformatted("Junction into a game road");
+            ImGui::Separator();
+            const char* names[4] = { "1  Game mesh", "2  Faces in the way", "3  Road end", "4  Preview" };
+            const ImVec4 accent = ImGui::GetStyleColorVec4(ImGuiCol_CheckMark);
+            for (int k = 0; k < 4; ++k) {
+                const int step = k + 1;
+                if (k) ImGui::SameLine(0.0f, 14.0f);
+                if (step == wizard_) ImGui::TextColored(accent, "%s", names[k]);
+                else if (step < wizard_) ImGui::TextColored(ImVec4(0.55f, 0.85f, 0.55f, 1.0f), "%s", names[k]);
+                else ImGui::TextDisabled("%s", names[k]);
+            }
+            ImGui::Spacing();
+            switch (wizard_) {
+                case kWizardModel:
+                    ImGui::TextUnformatted("Click the game's road where the new road joins it.");
+                    break;
+                case kWizardFaces:
+                    ImGui::Text("Click or drag over the faces in the new road's way (red).  %zu chosen", wizardFaces_.size());
+                    ImGui::TextDisabled("A chosen face clicked again is let go. Kerbs beside them come along.");
+                    break;
+                case kWizardNode:
+                    ImGui::TextUnformatted("Click the end node of the procedural road that joins here.");
+                    break;
+                case kWizardPreview:
+                    ImGui::Text("Green: the new surface, orange: kerbs. %zu faces; click faces to change them.",
+                                wizardFaces_.size());
+                    ImGui::TextUnformatted("Drag the road end's gizmo to move it: the preview follows when let go.");
+                    ImGui::TextDisabled("The game's mesh is not changed until the roads are baked.");
+                    break;
+                default: break;
+            }
+            ImGui::Spacing();
+            if (wizard_ > kWizardModel && ImGui::Button("Back  (Backspace)")) WizardKey(VK_BACK);
+            if (wizard_ == kWizardFaces || wizard_ == kWizardPreview) {
+                if (wizard_ > kWizardModel) ImGui::SameLine();
+                ImGui::BeginDisabled(wizardFaces_.empty());
+                if (ImGui::Button(wizard_ == kWizardPreview ? "Apply  (Enter)" : "Next  (Enter)")) WizardKey(VK_RETURN);
+                ImGui::EndDisabled();
+            }
+            if (wizard_ > kWizardModel) ImGui::SameLine();
+            if (ImGui::Button("Cancel  (Esc)")) WizardKey(VK_ESCAPE);
+        }
+        ImGui::End();
+        ImGui::PopStyleVar(2);
+    }
+
+    void EndFaceWizard(const wchar_t* status) {
+        wizard_ = kWizardOff;
+        wizardPainting_ = false;
+        wizardFaces_.clear();
+        wizardPiece_ = {};
+        if (status) app_.Status(status);
+    }
+
+    // The nearest of the game's ground triangles along a ray, of one mesh
+    // (`only`) or any.
+    bool RayGround(const Ray& ray, int only, int& model, size_t& triangle) const {
+        float best = -1.0f;
+        for (size_t m = 0; m < groundModels_.size(); ++m) {
+            if (only >= 0 && (int)m != only) continue;
+            const GroundModel& g = groundModels_[m];
+            Aabb box = g.bounds;
+            box.Add(g.bounds.min - Vec3{ 0.5f, 0.5f, 0.5f });
+            box.Add(g.bounds.max + Vec3{ 0.5f, 0.5f, 0.5f });
+            if (IntersectRayAabb(ray, box) < 0.0f) continue;
+            const auto& indices = g.model->indices;
+            for (size_t k = 0; k + 2 < indices.size(); k += 3) {
+                const float hit = IntersectRayTriangle(ray, g.world[indices[k]], g.world[indices[k + 1]],
+                                                       g.world[indices[k + 2]]);
+                if (hit < 0.0f || (best >= 0.0f && hit >= best)) continue;
+                best = hit;
+                model = (int)m;
+                triangle = k / 3;
+            }
+        }
+        return best >= 0.0f;
+    }
+
+    std::string TriangleTexture(const GroundModel& g, size_t triangle) const {
+        const nfs::SolidObject& model = *g.model;
+        const size_t index = triangle * 3;
+        for (const nfs::SolidMaterial& material : model.materials) {
+            if (index < material.firstIndex || index >= (size_t)material.firstIndex + material.indexCount) continue;
+            const u32 hash = material.textureIndex < model.textureHashes.size() ? model.textureHashes[material.textureIndex] : 0;
+            const nfs::Texture* texture = hash && app_.World() ? app_.World()->FindTexture(hash) : nullptr;
+            return texture ? texture->name : std::string();
+        }
+        return {};
+    }
+
+    static roads::UvMap MapOf(const roads::GameFace& f) {
+        roads::UvMap map;
+        const Vec3 &a = f.p[0], &b = f.p[1], &c = f.p[2];
+        const float det = (b.x - a.x) * (c.y - a.y) - (c.x - a.x) * (b.y - a.y);
+        if (std::fabs(det) < 1e-6f) return map;
+        const auto gradient = [&](float fa, float fb, float fc) {
+            const float d1 = fb - fa, d2 = fc - fa;
+            return Vec2{ (d1 * (c.y - a.y) - d2 * (b.y - a.y)) / det, (d2 * (b.x - a.x) - d1 * (c.x - a.x)) / det };
+        };
+        map.gu = gradient(f.uv[0].x, f.uv[1].x, f.uv[2].x);
+        map.gv = gradient(f.uv[0].y, f.uv[1].y, f.uv[2].y);
+        map.origin = a;
+        map.uv = f.uv[0];
+        map.valid = true;
+        return map;
+    }
+
+    roads::GameFace FaceOf(const GroundModel& g, size_t triangle) const {
+        roads::GameFace f;
+        const auto& indices = g.model->indices;
+        for (int k = 0; k < 3; ++k) {
+            const u32 i = indices[triangle * 3 + k];
+            f.p[k] = g.world[i];
+            f.uv[k] = g.model->vertices[i].uv;
+        }
+        f.texture = TriangleTexture(g, triangle);
+        return f;
+    }
+
+    static float FacePlanArea(const roads::GameFace& f) {
+        return std::fabs((f.p[1].x - f.p[0].x) * (f.p[2].y - f.p[0].y) - (f.p[2].x - f.p[0].x) * (f.p[1].y - f.p[0].y)) * 0.5f;
+    }
+
+    // The junction as chosen so far.
+    roads::FaceJunction MakeFaceJunction() const {
+        roads::FaceJunction j;
+        j.node = wizardNode_;
+        if (wizardModel_ < 0 || wizardModel_ >= (int)groundModels_.size()) return j;
+        const GroundModel& g = groundModels_[(size_t)wizardModel_];
+        j.model = g.model->name;
+        const auto& indices = g.model->indices;
+        const size_t count = indices.size() / 3;
+        std::set<size_t> chosen = wizardFaces_;
+        // The game's ground under the new road's first metres goes too, so
+        // nothing runs on underneath where the road rises from the game's.
+        {
+            Vec3 into;
+            const roads::Segment* segment = nullptr;
+            const roads::Node* node = network_.FindNode(wizardNode_);
+            if (node && network_.EndDirection(wizardNode_, into, segment)) {
+                const Vec3 right{ into.y, -into.x, 0.0f };
+                const float half = segment->profile.HalfWidth();
+                for (size_t t = 0; t < count; ++t) {
+                    const Vec3 c = (g.world[indices[t * 3]] + g.world[indices[t * 3 + 1]] + g.world[indices[t * 3 + 2]]) *
+                                   (1.0f / 3.0f);
+                    const Vec3 d{ c.x - node->position.x, c.y - node->position.y, 0.0f };
+                    const float along = Dot(d, into), across = Dot(d, right);
+                    if (along < 0.0f && along > -kUnderRoad && std::fabs(across) <= half &&
+                        c.z < node->position.z + 0.5f && c.z > node->position.z - 3.0f)
+                        chosen.insert(t);
+                }
+            }
+        }
+        // The kerbs' standing faces along the chosen ones come with them:
+        // through the new road they go, elsewhere they come back as they were.
+        std::vector<Vec3> corners;
+        for (size_t t : chosen)
+            for (int k = 0; k < 3; ++k) corners.push_back(g.world[indices[t * 3 + k]]);
+        const auto shared = [&](const Vec3& p) {
+            for (const Vec3& q : corners)
+                if (std::fabs(p.x - q.x) < 0.01f && std::fabs(p.y - q.y) < 0.01f && std::fabs(p.z - q.z) < 0.01f) return true;
+            return false;
+        };
+        for (size_t t = 0; t < count; ++t) {
+            if (chosen.count(t)) continue;
+            const roads::GameFace f = FaceOf(g, t);
+            if (FacePlanArea(f) > 5e-4f) continue;
+            int touching = 0;
+            for (const Vec3& p : f.p) touching += shared(p);
+            if (touching >= 2) chosen.insert(t);
+        }
+        Vec3 middle{};
+        for (size_t t : chosen) {
+            j.faces.push_back(FaceOf(g, t));
+            middle = middle + (j.faces.back().p[0] + j.faces.back().p[1] + j.faces.back().p[2]) * (1.0f / 3.0f);
+        }
+        if (!j.faces.empty()) middle = middle * (1.0f / j.faces.size());
+
+        // The game's road direction: where its lane textures' V runs (as an
+        // axis, the doubled angle), from the chosen faces or around them.
+        const auto direction = [&](bool nearby) {
+            float sx = 0.0f, sy = 0.0f;
+            const auto add = [&](const roads::GameFace& f) {
+                if (!IsLaneTexture(f.texture)) return;
+                const roads::UvMap map = MapOf(f);
+                if (!map.valid) return;
+                const float l = std::sqrt(map.gv.x * map.gv.x + map.gv.y * map.gv.y);
+                if (l < 1e-5f) return;
+                const float angle = std::atan2(map.gv.y, map.gv.x);
+                const float w = FacePlanArea(f);
+                sx += std::cos(2.0f * angle) * w;
+                sy += std::sin(2.0f * angle) * w;
+            };
+            if (!nearby) for (const roads::GameFace& f : j.faces) add(f);
+            else
+                for (size_t t = 0; t < count; ++t) {
+                    const Vec3& p = g.world[indices[t * 3]];
+                    if (std::fabs(p.x - middle.x) > 30.0f || std::fabs(p.y - middle.y) > 30.0f) continue;
+                    add(FaceOf(g, t));
+                }
+            if (std::fabs(sx) + std::fabs(sy) < 1e-6f) return false;
+            const float angle = 0.5f * std::atan2(sy, sx);
+            j.gameForward = { std::cos(angle), std::sin(angle), 0.0f };
+            return true;
+        };
+        if (!direction(false)) direction(true);
+
+        // The surface laid where there was none: the game's own plain road
+        // texture there, carried on with its own mapping.
+        float bestArea = 0.0f;
+        const auto consider = [&](const roads::GameFace& f) {
+            if (!IsRoadTexture(f.texture) || IsLaneTexture(f.texture)) return;
+            const float area = FacePlanArea(f);
+            if (area <= bestArea) return;
+            bestArea = area;
+            j.asphalt = f.texture;
+            j.asphaltMap = MapOf(f);
+        };
+        for (const roads::GameFace& f : j.faces) consider(f);
+        if (j.asphalt.empty())
+            for (size_t t = 0; t < count; ++t) {
+                const Vec3& p = g.world[indices[t * 3]];
+                if (std::fabs(p.x - middle.x) > 30.0f || std::fabs(p.y - middle.y) > 30.0f) continue;
+                consider(FaceOf(g, t));
+            }
+        return j;
+    }
+
+    void WizardPreview() {
+        wizardPiece_ = {};
+        if (wizard_ != kWizardPreview) return;
+        network_.BuildFaceJunctionPiece(MakeFaceJunction(), wizardPiece_);
+    }
+
+    void WizardToggle(size_t triangle, bool add) {
+        const bool has = wizardFaces_.count(triangle) != 0;
+        if (has == add) return;
+        if (add) wizardFaces_.insert(triangle);
+        else wizardFaces_.erase(triangle);
+        WizardPreview();
+        WizardStatus();
+    }
+
+    bool WizardMouseDown(int x, int y) {
+        const Ray ray = app_.View().RayAt(x, y);
+        if (wizard_ == kWizardModel) {
+            int model = -1;
+            size_t triangle = 0;
+            if (!RayGround(ray, -1, model, triangle)) {
+                app_.Status(L"No game ground there: click a road of the game");
+                return true;
+            }
+            wizardModel_ = model;
+            wizard_ = kWizardFaces;
+            WizardStatus();
+            return true;
+        }
+        if (wizard_ == kWizardFaces || wizard_ == kWizardPreview) {
+            // In the preview the road's end node has the gizmo: a click on
+            // it moves the node, and the preview follows when let go.
+            if (wizard_ == kWizardPreview && app_.View().GizmoHot()) return false;
+            int model = -1;
+            size_t triangle = 0;
+            if (!RayGround(ray, wizardModel_, model, triangle)) return true;
+            wizardPainting_ = true;
+            wizardPaintAdd_ = wizardFaces_.count(triangle) == 0;
+            WizardToggle(triangle, wizardPaintAdd_);
+            return true;
+        }
+        if (wizard_ == kWizardNode) {
+            u32 best = 0;
+            float bestDistance = 1e30f;
+            for (const roads::Node& node : network_.Nodes()) {
+                if (network_.SegmentsAt(node.id).size() != 1) continue;   // a road's end only
+                const Vec3 d = node.position - ray.origin;
+                const float t = std::max(0.0f, Dot(d, ray.direction));
+                const float miss = Length(d - ray.direction * t);
+                if (miss < std::max(3.0f, t * 0.02f) && miss < bestDistance) { bestDistance = miss; best = node.id; }
+            }
+            if (!best) {
+                app_.Status(L"No road end there: click the end node of a procedural road (the end that joins here)");
+                return true;
+            }
+            wizardNode_ = best;
+            wizard_ = kWizardPreview;
+            Select((int)best);       // its gizmo moves it
+            WizardPreview();
+            WizardStatus();
+            return true;
+        }
+        return true;
+    }
+
+    void WizardMouseMove(int x, int y) {
+        if (wizard_ != kWizardFaces && wizard_ != kWizardPreview) return;
+        const Ray ray = app_.View().RayAt(x, y);
+        int model = -1;
+        size_t triangle = 0;
+        wizardHover_ = RayGround(ray, wizardModel_, model, triangle) ? (long long)triangle : -1;
+        if (wizardPainting_ && wizardHover_ >= 0) WizardToggle((size_t)wizardHover_, wizardPaintAdd_);
+    }
+
+    bool WizardKey(WPARAM key) {
+        if (key == VK_ESCAPE) {
+            EndFaceWizard(L"Junction from game faces cancelled");
+            return true;
+        }
+        if (key == VK_BACK) {
+            if (wizard_ == kWizardPreview) { wizard_ = kWizardNode; wizardNode_ = 0; wizardPiece_ = {}; }
+            else if (wizard_ == kWizardNode) wizard_ = kWizardFaces;
+            else if (wizard_ == kWizardFaces) { wizard_ = kWizardModel; wizardFaces_.clear(); wizardModel_ = -1; }
+            WizardStatus();
+            return true;
+        }
+        if (key == VK_RETURN) {
+            if (wizard_ == kWizardFaces) {
+                if (wizardFaces_.empty()) { app_.Status(L"Choose at least one face first"); return true; }
+                wizard_ = kWizardNode;
+                WizardStatus();
+            } else if (wizard_ == kWizardPreview) {
+                ApplyFaceWizard();
+            }
+            return true;
+        }
+        return false;
+    }
+
+    void ApplyFaceWizard() {
+        const roads::FaceJunction j = MakeFaceJunction();
+        if (j.faces.empty() || !network_.FindNode(j.node)) {
+            app_.Status(L"Nothing to apply: choose faces and a road end");
+            return;
+        }
+        network_.AddFaceJunction(j);
+        const size_t faces = j.faces.size();
+        EndFaceWizard(nullptr);
+        Changed(true);
+        Select((int)j.node);
+        LOG_INFO("roads: junction from %zu faces of %s at node %u (asphalt %s)", faces, j.model.c_str(), j.node,
+                 j.asphalt.c_str());
+        app_.Status(Fmt(L"Junction made from %zu faces of the game's road: they are replaced when the roads are baked "
+                        L"(Ctrl+Z takes it back; the Edits tab lists it)", faces));
+    }
+
+    void DrawWizard(IDirect3DDevice9* device, WorldRenderer& renderer) {
+        if (wizard_ == kWizardOff || wizardModel_ < 0 || wizardModel_ >= (int)groundModels_.size()) return;
+        if (wizardRefresh_) {
+            wizardRefresh_ = false;
+            WizardPreview();
+        }
+        struct Vertex { float x, y, z; D3DCOLOR colour; };
+        std::vector<Vertex> lines;
+        const auto line = [&](const Vec3& a, const Vec3& b, D3DCOLOR c) {
+            lines.push_back({ a.x, a.y, a.z, c });
+            lines.push_back({ b.x, b.y, b.z, c });
+        };
+        const GroundModel& g = groundModels_[(size_t)wizardModel_];
+        const auto& indices = g.model->indices;
+        const Vec3 lift{ 0.0f, 0.0f, 0.04f };
+        const auto triangle = [&](size_t t, D3DCOLOR c) {
+            if (t * 3 + 2 >= indices.size()) return;
+            const Vec3 a = g.world[indices[t * 3]] + lift, b = g.world[indices[t * 3 + 1]] + lift,
+                       d = g.world[indices[t * 3 + 2]] + lift;
+            line(a, b, c);
+            line(b, d, c);
+            line(d, a, c);
+        };
+        if (wizard_ == kWizardFaces || wizard_ == kWizardModel) {
+            // The mesh being edited, faintly.
+            for (size_t t = 0; t * 3 + 2 < indices.size(); ++t) triangle(t, 0x30FFFFFF);
+        }
+        for (size_t t : wizardFaces_) triangle(t, wizard_ == kWizardPreview ? 0x80FF4040 : 0xFFFF4040);
+        if (wizardHover_ >= 0) triangle((size_t)wizardHover_, 0xFFFFFF40);
+        if (wizardNode_)
+            if (const roads::Node* node = network_.FindNode(wizardNode_))
+                line(node->position, node->position + Vec3{ 0, 0, 6.0f }, 0xFFFFFFFF);
+        // The result, as a wireframe.
+        const Vec3 above{ 0.0f, 0.0f, 0.07f };
+        for (const roads::MeshGroup& group : wizardPiece_.groups)
+            for (size_t k = 0; k + 2 < group.indices.size(); k += 3) {
+                const Vec3 a = group.vertices[group.indices[k]].position + above;
+                const Vec3 b = group.vertices[group.indices[k + 1]].position + above;
+                const Vec3 c = group.vertices[group.indices[k + 2]].position + above;
+                const D3DCOLOR colour = roads::IsBakedRoadModel(group.texture) ? 0xFF40FF80
+                                        : group.texture.rfind("RDP_", 0) == 0 ? 0xFF40FF80 : 0xFF40C0FF;
+                line(a, b, colour);
+                line(b, c, colour);
+                line(c, a, colour);
+            }
+        for (const roads::CollisionWall& wall : wizardPiece_.walls)
+            for (size_t k = 0; k + 1 < wall.points.size(); ++k)
+                line(wall.points[k] + Vec3{ 0, 0, wall.height + 0.08f }, wall.points[k + 1] + Vec3{ 0, 0, wall.height + 0.08f },
+                     0xFFFF9020);
+        if (lines.empty()) return;
+        renderer.BeginOverlay(device);
+        device->SetRenderState(D3DRS_ZENABLE, FALSE);
+        device->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+        const size_t batch = 60000;
+        for (size_t at = 0; at < lines.size(); at += batch) {
+            const size_t n = std::min(batch, lines.size() - at);
+            device->DrawPrimitiveUP(D3DPT_LINELIST, (UINT)(n / 2), lines.data() + at, sizeof(Vertex));
+        }
+        renderer.EndOverlay(device);
+    }
+
+    // The game meshes face junctions are made of are drawn without the faces
+    // they replace, in the editor only: the game's own copy is left alone
+    // until the bake.
+    void BuildFaceRemainder() {
+        faceRemainder_.clear();
+        faceHidden_.clear();
+        std::map<std::string, std::vector<const roads::FaceJunction*>> byModel;
+        for (const roads::FaceJunction& j : network_.FaceJunctions())
+            if (network_.FindNode(j.node) && !j.faces.empty()) byModel[j.model].push_back(&j);
+        for (const auto& [name, junctions] : byModel) {
+            const GroundModel* found = nullptr;
+            for (const GroundModel& g : groundModels_)
+                if (g.model->name == name) { found = &g; break; }
+            if (!found) continue;
+            const GroundModel& g = *found;
+            std::vector<Vec3> centres;
+            Aabb box;
+            for (const roads::FaceJunction* j : junctions)
+                for (const roads::GameFace& f : j->faces) {
+                    centres.push_back((f.p[0] + f.p[1] + f.p[2]) * (1.0f / 3.0f));
+                    box.Add(centres.back());
+                }
+            const auto removed = [&](const Vec3& c) {
+                if (c.x < box.min.x - 0.1f || c.x > box.max.x + 0.1f || c.y < box.min.y - 0.1f || c.y > box.max.y + 0.1f)
+                    return false;
+                for (const Vec3& q : centres)
+                    if (std::fabs(c.x - q.x) < 0.01f && std::fabs(c.y - q.y) < 0.01f && std::fabs(c.z - q.z) < 0.01f)
+                        return true;
+                return false;
+            };
+            faceHidden_.insert(g.model->hash);
+            const nfs::SolidObject& model = *g.model;
+            for (const nfs::SolidMaterial& material : model.materials) {
+                DrawBatch batch;
+                batch.texture = material.textureIndex < model.textureHashes.size() ? model.textureHashes[material.textureIndex] : 0;
+                std::unordered_map<u32, u16> remap;
+                const size_t last = std::min<size_t>((size_t)material.firstIndex + material.indexCount, model.indices.size());
+                const auto flush = [&] {
+                    if (!batch.indices.empty()) faceRemainder_.push_back(batch);
+                    batch.vertices.clear();
+                    batch.indices.clear();
+                    remap.clear();
+                };
+                for (size_t k = material.firstIndex; k + 2 < last; k += 3) {
+                    const u32 t[3] = { model.indices[k], model.indices[k + 1], model.indices[k + 2] };
+                    if (removed((g.world[t[0]] + g.world[t[1]] + g.world[t[2]]) * (1.0f / 3.0f))) continue;
+                    if (batch.vertices.size() > 65000) flush();
+                    for (u32 i : t) {
+                        auto it = remap.find(i);
+                        if (it == remap.end()) {
+                            nfs::SolidVertex v = model.vertices[i];
+                            v.position = g.world[i];
+                            it = remap.emplace(i, (u16)batch.vertices.size()).first;
+                            batch.vertices.push_back(v);
+                        }
+                        batch.indices.push_back(it->second);
+                    }
+                }
+                flush();
+            }
+        }
+    }
 
     std::wstring GroundPath() const {
         const std::wstring region = app_.World() ? app_.World()->Region() : L"";
@@ -2560,15 +3421,40 @@ private:
         return app_.ModelsFolder() + L"\\roads-" + region + L"-collision.txt";
     }
 
+    // The road drawing tool beside the gizmo's buttons on the toolbar, pressed
+    // while it is on.
+    void AddToolbarButton() {
+        HWND toolbar = app_.Toolbar();
+        if (!toolbar) return;
+        TBBUTTON buttons[2] = {};
+        buttons[0].fsStyle = BTNS_SEP;
+        buttons[1].iBitmap = I_IMAGENONE;
+        buttons[1].idCommand = ID_ROAD_DRAW;
+        buttons[1].fsState = TBSTATE_ENABLED;
+        buttons[1].fsStyle = (BYTE)(BTNS_CHECK | BTNS_AUTOSIZE | BTNS_SHOWTEXT);
+        buttons[1].iString = (INT_PTR)L"Road tool";
+        ::SendMessageW(toolbar, TB_ADDBUTTONSW, 2, (LPARAM)buttons);
+        ::SendMessageW(toolbar, TB_AUTOSIZE, 0, 0);
+    }
+
+    void SyncToolbar() const {
+        if (HWND toolbar = app_.Toolbar()) ::SendMessageW(toolbar, TB_CHECKBUTTON, ID_ROAD_DRAW, MAKELPARAM(drawTool_ ? 1 : 0, 0));
+    }
+
     void AddMenu() {
+        AddToolbarButton();
         HMENU menu = app_.Menu();
         if (!menu) return;
         HMENU roadsMenu = ::CreatePopupMenu();
+        ::AppendMenuW(roadsMenu, MF_STRING, ID_ROAD_DRAW, L"&Draw Roads (nodes, click by click)\tCtrl+Shift+D");
         ::AppendMenuW(roadsMenu, MF_STRING, ID_ROAD_NEW, L"&New Road at View Centre\tCtrl+R");
         ::AppendMenuW(roadsMenu, MF_STRING, ID_ROAD_EXTEND, L"&Pull a Road out of the Selected Node\tCtrl+Shift+R");
         ::AppendMenuW(roadsMenu, MF_STRING, ID_ROAD_SPLIT, L"&Split the Selected Road Where Clicked");
-        ::AppendMenuW(roadsMenu, MF_STRING, ID_ROAD_JUNCTION_GAME, L"&Junction on a Game Road...\tCtrl+Shift+J");
+        ::AppendMenuW(roadsMenu, MF_STRING, ID_ROAD_FACE_JUNCTION, L"&Junction into a Game Road...\tCtrl+Shift+J");
         ::AppendMenuW(roadsMenu, MF_STRING, ID_ROAD_SPLIT_WAYS, L"Split the Two &Directions at This Road End");
+        ::AppendMenuW(roadsMenu, MF_STRING, ID_ROAD_LANE_ADD, L"Add a &Lane after the Selected Node");
+        ::AppendMenuW(roadsMenu, MF_STRING, ID_ROAD_LANE_DROP, L"Drop a La&ne after the Selected Node");
+        ::AppendMenuW(roadsMenu, MF_STRING, ID_ROAD_LANE_SPLIT, L"Split the &Outer Lane off Here (an exit)");
         ::AppendMenuW(roadsMenu, MF_STRING, ID_ROAD_AUTO_HEADING, L"Node Direction &Automatic");
         ::AppendMenuW(roadsMenu, MF_STRING, ID_ROAD_DELETE, L"&Delete Selected Node or Road");
         ::AppendMenuW(roadsMenu, MF_SEPARATOR, 0, nullptr);
@@ -2611,7 +3497,8 @@ private:
             { FVIRTKEY | FCONTROL | FSHIFT, 'R', (WORD)ID_ROAD_EXTEND },
             { FVIRTKEY | FCONTROL | FSHIFT, 'B', (WORD)ID_ROAD_BAKE },
             { FVIRTKEY | FCONTROL | FSHIFT, 'T', (WORD)ID_TERRAIN_OUTLINE },
-            { FVIRTKEY | FCONTROL | FSHIFT, 'J', (WORD)ID_ROAD_JUNCTION_GAME },
+            { FVIRTKEY | FCONTROL | FSHIFT, 'J', (WORD)ID_ROAD_FACE_JUNCTION },
+            { FVIRTKEY | FCONTROL | FSHIFT, 'D', (WORD)ID_ROAD_DRAW },
         };
         for (const ACCEL& key : added) {
             const bool taken = std::any_of(keys.begin(), keys.end(), [&](const ACCEL& k) {
@@ -2657,7 +3544,22 @@ private:
     int   cursorX_ = 0, cursorY_ = 0;
     std::vector<std::wstring> groundTextures_;
     bool  drawing_ = false;
-    bool  pickingJunction_ = false;
+    bool  drawTool_ = false;           // the road drawing tool is on
+    u32   drawFrom_ = 0;               // the node the road being drawn goes on from
+    bool  drawPending_ = false;        // a first click on open ground, no node yet
+    Vec3  drawStart_;
+    roads::RoadProfile drawProfile_;
+    DrawHit drawHover_;
+    int   wizard_ = 0;                 // WizardStep
+    int   wizardModel_ = -1;           // in groundModels_
+    std::set<size_t> wizardFaces_;     // its triangles
+    u32   wizardNode_ = 0;
+    long long wizardHover_ = -1;
+    bool  wizardPainting_ = false, wizardPaintAdd_ = true;
+    bool  wizardRefresh_ = false;      // the node was moved: work the preview out again
+    roads::MeshPiece wizardPiece_;
+    std::vector<DrawBatch> faceRemainder_;
+    std::set<u32> faceHidden_;
     std::vector<Vec3> outline_;
     Vec3  hover_{};
     bool  hoverValid_ = false;
@@ -2683,6 +3585,7 @@ private:
     std::unordered_map<std::wstring, HBITMAP> pictures_;
     std::vector<std::wstring> poleModels_;
     std::vector<std::wstring> wallModels_;
+    std::vector<std::wstring> pillarModels_;
     u64 meshRevision_ = 0;
     std::unordered_map<std::string, u32> hashes_;
     std::vector<std::wstring> lanes_, walks_, walls_;
@@ -2820,6 +3723,22 @@ bool RoadsExtension::FillProperties(PropertiesPanel::View& view) {
         view.title = Fmt(L"Road node %u", node->id);
         view.moveLabel = L"Pull a road out";
         view.removeLabel = L"Delete node";
+        view.actions.push_back({ L"Draw from here", ID_ROAD_DRAW_FROM, L"Roads",
+                                 L"The road drawing tool, going on from this node with its road's profile." });
+        view.actions.push_back({ L"Draw roads", ID_ROAD_DRAW, L"Roads", L"The road drawing tool (Ctrl+Shift+D)." });
+        if (count == 1 || count == 2) {
+            view.actions.push_back({ L"+ Lane", ID_ROAD_LANE_ADD, L"Lanes after this node",
+                                     L"One more lane on the road going on from this node, on its right; it widens in "
+                                     L"over the taper length." });
+            view.actions.push_back({ L"- Lane", ID_ROAD_LANE_DROP, L"Lanes after this node",
+                                     L"One lane fewer on the road going on from this node; the outer one narrows "
+                                     L"away before it." });
+            view.actions.push_back({ L"Exit", ID_ROAD_LANE_SPLIT, L"Split here",
+                                     L"The outer lane leaves as a road of its own (an exit); the other lanes go on." });
+        }
+        if (count == 1)
+            view.actions.push_back({ L"Two directions", ID_ROAD_SPLIT_WAYS, L"Split here",
+                                     L"The two directions go on as two one-way roads (a divided highway)." });
         AddRow(view, L"Node", L"Kind",
                count >= 3 ? Fmt(L"junction of %zu roads", count) : count == 2 ? L"through" : L"road end",
                L"Three or more roads on one node make a junction.", 0);
@@ -2846,6 +3765,9 @@ bool RoadsExtension::FillProperties(PropertiesPanel::View& view) {
     view.title = Fmt(L"Road %u", s->id);
     view.moveLabel = L"Pull a road out";
     view.removeLabel = L"Delete road";
+    view.actions.push_back({ L"Node in the middle", ID_ROAD_INSERT_MIDDLE, L"Roads",
+                             L"Splits this road in two at its middle, with a node there." });
+    view.actions.push_back({ L"Draw roads", ID_ROAD_DRAW, L"Roads", L"The road drawing tool (Ctrl+Shift+D)." });
     const std::vector<std::wstring> yesNo = { L"yes", L"no" };
     AddRow(view, L"Road", L"Length", Number(SegmentLength(*s)), L"Along the curve.", 0);
     AddRow(view, L"Lanes", L"Lanes forward", std::to_wstring(p.lanesForward),
@@ -2853,6 +3775,9 @@ bool RoadsExtension::FillProperties(PropertiesPanel::View& view) {
     AddRow(view, L"Lanes", L"Lanes backward", std::to_wstring(p.lanesBackward),
            L"Lanes on the left of the centre line. 0 makes a one-way road.", kLanesBackward);
     AddRow(view, L"Lanes", L"Lane width", Number(p.laneWidth), L"In world units (metres).", kLaneWidth);
+    AddRow(view, L"Lanes", L"Taper length", Number(p.taperLength),
+           L"Where this road meets one with fewer lanes at a node, its extra lanes narrow away over this length.",
+           kTaperLength);
     AddRow(view, L"Lanes", L"Centre lane texture", Widen(p.laneCentre),
            L"The lane beside the centre line. The game's lane textures carry their marking on the left edge.",
            kLaneCentre, lanes_, true);
@@ -2927,6 +3852,15 @@ bool RoadsExtension::FillProperties(PropertiesPanel::View& view) {
         AddRow(view, L"Bridge", L"Deck thickness", Number(p.deckThickness), L"From the road surface down.", kDeckThickness);
         AddRow(view, L"Bridge", L"Pillar spacing", Number(p.pillarSpacing), L"Between pillars; 0 for none.",
                kPillarSpacing);
+        AddRow(view, L"Bridge", L"Pillars across", Number((float)p.pillarCount),
+               L"Side by side at each spacing, spread over the deck's width; 0 picks by the width.", kPillarCount);
+        AddRow(view, L"Bridge", L"Pillar model", p.pillarModel.empty() ? L"-" : Widen(p.pillarModel),
+               L"A pillar of the game (supports, columns, piers) instead of the square column: its top under the "
+               L"deck; if it is shorter than the drop, the column carries on below it. '-' for the column.",
+               kPillarModel, pillarModels_, true);
+        if (!p.pillarModel.empty())
+            AddRow(view, L"Bridge", L"Model turn", Number(p.pillarModelTurn),
+                   L"Degrees added to each pillar, for a model not built along the road.", kPillarModelTurn);
         AddRow(view, L"Bridge", L"Pillar width", Number(p.pillarWidth), L"Square columns, this wide.", kPillarWidth);
         AddRow(view, L"Bridge", L"Deck texture", Widen(p.deckTexture), L"The deck's underside and edges.",
                kDeckTexture, walls_, true);
@@ -3071,6 +4005,13 @@ bool RoadsExtension::ApplyProperties() {
     if (properties.ReadNumber(kDeckThickness, value)) p.deckThickness = std::clamp(value, 0.0f, 20.0f);
     if (properties.ReadNumber(kPillarSpacing, value)) p.pillarSpacing = std::clamp(value, 0.0f, 500.0f);
     if (properties.ReadNumber(kPillarWidth, value)) p.pillarWidth = std::clamp(value, 0.3f, 20.0f);
+    if (properties.ReadNumber(kTaperLength, value)) p.taperLength = std::clamp(value, 5.0f, 500.0f);
+    if (properties.ReadText(kPillarModel, text)) {
+        const std::string name = Narrow(text);
+        p.pillarModel = name == "-" ? std::string() : name;
+    }
+    if (properties.ReadNumber(kPillarModelTurn, value)) p.pillarModelTurn = value;
+    if (properties.ReadNumber(kPillarCount, value)) p.pillarCount = std::clamp((int)std::lround(value), 0, 16);
     if (properties.ReadNumber(kPoleSpacing, value)) p.poleSpacing = std::clamp(value, 2.0f, 1000.0f);
     if (properties.ReadNumber(kPoleInset, value)) p.poleInset = std::clamp(value, -20.0f, 20.0f);
     if (properties.ReadNumber(kPoleTurn, value)) p.poleTurn = value;
@@ -3257,7 +4198,8 @@ void RoadsExtension::DrawRouteGraph(IDirect3DDevice9* device, const Camera& came
 
 void RoadsExtension::DrawOverlay(IDirect3DDevice9* device, const Camera& camera, WorldRenderer& renderer) {
     if (graphView_) DrawRouteGraph(device, camera, renderer);
-    if (!visible_ || (network_.Nodes().empty() && brush_ == terrain::Brush::None && !drawing_)) return;
+    if (wizard_ != kWizardOff) DrawWizard(device, renderer);
+    if (!visible_ || (network_.Nodes().empty() && brush_ == terrain::Brush::None && !drawing_ && !drawTool_)) return;
     struct Vertex { float x, y, z; D3DCOLOR colour; };
     std::vector<Vertex> solid, lines;
     const int selected = Selected();
@@ -3294,6 +4236,47 @@ void RoadsExtension::DrawOverlay(IDirect3DDevice9* device, const Camera& camera,
             }
         }
     }
+
+    // The drawing tool: what a click would do, and the road it would draw.
+    if (drawTool_ && drawHover_.kind != DrawHit::None) {
+        const D3DCOLOR c = drawHover_.kind == DrawHit::Node ? 0xFF40FF60 : drawHover_.kind == DrawHit::Road ? 0xFF40E0FF
+                                                                                                          : 0xFFFFFFFF;
+        const Vec3 at = drawHover_.point + Vec3{ 0, 0, 0.4f };
+        const float r = 1.6f;
+        for (int k = 0; k < 20; ++k) {
+            const float a0 = k * 6.2831853f / 20, a1 = (k + 1) * 6.2831853f / 20;
+            line(at + Vec3{ r * std::cos(a0), r * std::sin(a0), 0 }, at + Vec3{ r * std::cos(a1), r * std::sin(a1), 0 }, c);
+        }
+        line(at, at + Vec3{ 0, 0, 3.0f }, c);
+        Vec3 from{};
+        bool band = false;
+        if (drawPending_) { from = drawStart_; band = true; }
+        else if (const roads::Node* n = network_.FindNode(drawFrom_)) { from = n->position; band = true; }
+        if (band) {
+            const Vec3 a = from + Vec3{ 0, 0, 0.4f };
+            const Vec3 d = HorizontalDirection(at - a);
+            const Vec3 side{ d.y, -d.x, 0.0f };
+            const float half = drawProfile_.HalfWidth();
+            line(a, at, 0xFFFFD040);
+            line(a + side * half, at + side * half, 0xA0FFD040);
+            line(a - side * half, at - side * half, 0xA0FFD040);
+        }
+    }
+
+    // While a node is dragged: the node it joins if let go, ringed.
+    if (dragging_)
+        if (const roads::Node* moving = SelectedNode())
+            if (const u32 target = SnapTarget(moving->id))
+                if (const roads::Node* t = network_.FindNode(target)) {
+                    const float r = std::max(2.0f, NodeSize(*t) * 1.6f);
+                    const Vec3 c = t->position + Vec3{ 0, 0, 0.5f };
+                    for (int k = 0; k < 24; ++k) {
+                        const float a0 = k * 6.2831853f / 24, a1 = (k + 1) * 6.2831853f / 24;
+                        line(c + Vec3{ r * std::cos(a0), r * std::sin(a0), 0 }, c + Vec3{ r * std::cos(a1), r * std::sin(a1), 0 },
+                             0xFF40FF60);
+                    }
+                    line(moving->position + Vec3{ 0, 0, 0.5f }, c, 0xFF40FF60);
+                }
 
     // The curve handles on show: a line from the node and a small diamond.
     for (const auto& [segmentId, atStart] : VisibleHandles()) {
@@ -3489,7 +4472,9 @@ bool RoadsExtension::BakePoles(const std::vector<roads::Pole>& poles, size_t& ad
             LOG_WARN("roads: street light model %s is not in the region", pole.model.c_str());
             continue;
         }
-        const size_t target = world->SectionForPlacement(pole.position);
+        // A section the game has loaded where it stands.
+        size_t target = world->SectionForPlacementAlong({ pole.position });
+        if (target == SIZE_MAX) target = world->SectionForPlacement(pole.position);
         nfs::LoadedSection* section = target < loaded.size() ? world->MutableLoaded(target) : nullptr;
         if (!section || !section->info) continue;
 
@@ -3583,6 +4568,62 @@ bool RoadsExtension::BakeGroundCollision(size_t& moved) {
     std::vector<std::pair<std::vector<Vec3>, u8>> pieces;   // cut ground, as outlines
     std::set<std::string> seen;
     size_t removedInCuts = 0;
+
+    // Where a new road comes into one of the game's roads through a junction
+    // made of its faces, the game's edge barriers across the way are opened
+    // exactly as wide as the road, and where the road has barriers of its
+    // own each one is carried on to the game's, so the edge stays one closed
+    // line with the road inside it. A car crossing a barrier is put back on
+    // the road, so one left across the mouth would throw it back.
+    struct Mouth {
+        Vec3 node, u, r;
+        float lo = 0, hi = 0, back = 0, front = 0;   // across (r) and along (u, into the junction)
+        bool wall[2] = { false, false };              // the road's own barriers, left and right
+    };
+    std::vector<Mouth> mouths;
+    for (const roads::FaceJunction& j : network_.FaceJunctions()) {
+        const roads::Node* node = network_.FindNode(j.node);
+        Vec3 into;
+        const roads::Segment* segment = nullptr;
+        if (!node || !network_.EndDirection(j.node, into, segment) || j.faces.empty()) continue;
+        Mouth m;
+        m.node = node->position;
+        m.u = into;
+        m.r = { into.y, -into.x, 0.0f };
+        const roads::RoadProfile& p = segment->profile;
+        m.lo = -p.Edge(-1);
+        m.hi = p.Edge(1);
+        m.back = -kUnderRoad;
+        for (const roads::GameFace& f : j.faces)
+            for (const Vec3& q : f.p) m.front = std::max(m.front, Dot(q - m.node, m.u));
+        m.front += 2.0f;
+        m.wall[0] = p.Wall(-1) && p.wallHeight >= 0.05f;
+        m.wall[1] = p.Wall(1) && p.wallHeight >= 0.05f;
+        mouths.push_back(m);
+    }
+    std::vector<nfs::CollisionPolygon> connectors;
+    size_t barriersOpened = 0;
+    // The part of a barrier's line inside a mouth: t0..t1 of a->b, or false.
+    const auto across = [](const Mouth& m, const Vec3& a, const Vec3& b, float& t0, float& t1) {
+        t0 = 0.0f;
+        t1 = 1.0f;
+        const Vec3 d{ b.x - a.x, b.y - a.y, 0.0f };
+        const Vec3 o{ a.x - m.node.x, a.y - m.node.y, 0.0f };
+        const float bounds[2][3] = { { Dot(o, m.r), Dot(d, m.r), 0 }, { Dot(o, m.u), Dot(d, m.u), 0 } };
+        const float low[2] = { m.lo, m.back }, high[2] = { m.hi, m.front };
+        for (int axis = 0; axis < 2; ++axis) {
+            const float start = bounds[axis][0], step = bounds[axis][1];
+            if (std::fabs(step) < 1e-6f) {
+                if (start < low[axis] || start > high[axis]) return false;
+                continue;
+            }
+            float ta = (low[axis] - start) / step, tb = (high[axis] - start) / step;
+            if (ta > tb) std::swap(ta, tb);
+            t0 = std::max(t0, ta);
+            t1 = std::min(t1, tb);
+        }
+        return t1 - t0 > 1e-4f;
+    };
     const auto& loaded = world->Loaded();
     for (size_t s = 0; s < loaded.size(); ++s) {
         const auto& packs = loaded[s]->collision;
@@ -3594,6 +4635,46 @@ bool RoadsExtension::BakeGroundCollision(size_t& moved) {
                 std::snprintf(key, sizeof(key), "%.2f %.2f %.2f %.2f %.2f %.2f %d %d", p.corners[0].x, p.corners[0].y,
                               p.corners[1].x, p.corners[1].y, p.corners[2].x, p.corners[2].y, (int)p.surface,
                               (int)p.flags);
+                if (p.barrier && !mouths.empty()) {
+                    const Vec3 a = p.corners[0], b = p.corners[2];
+                    bool opened = false;
+                    for (const Mouth& m : mouths) {
+                        float t0 = 0.0f, t1 = 0.0f;
+                        // A link made by an earlier bake, on the opening's edge: kept.
+                        const float la = Dot(a - m.node, m.r), lb = Dot(b - m.node, m.r);
+                        if ((std::fabs(la - m.lo) < 0.06f && std::fabs(lb - m.lo) < 0.06f) ||
+                            (std::fabs(la - m.hi) < 0.06f && std::fabs(lb - m.hi) < 0.06f))
+                            continue;
+                        if (!across(m, a, b, t0, t1)) continue;
+                        refs.push_back({ (u32)s, (u32)k, (u32)i });
+                        opened = true;
+                        if (!seen.insert(key).second) break;
+                        ++barriersOpened;
+                        const Vec3 cut0 = a + (b - a) * t0, cut1 = a + (b - a) * t1;
+                        // What is left either side, as it was otherwise.
+                        const auto keep = [&](const Vec3& from, const Vec3& to) {
+                            if (Length(Vec3{ to.x - from.x, to.y - from.y, 0.0f }) < 0.05f) return;
+                            nfs::CollisionPolygon q = p;
+                            const nfs::CollisionPolygon shape = collision::MakeBarrier(from, to, p.surface);
+                            for (int c = 0; c < 4; ++c) q.corners[c] = shape.corners[c];
+                            replacements.push_back(q);
+                        };
+                        keep(a, cut0);
+                        keep(cut1, b);
+                        // The road's own barrier on from its end to the opening.
+                        for (const Vec3& at : { cut0, cut1 }) {
+                            const float lat = Dot(at - m.node, m.r), along = Dot(at - m.node, m.u);
+                            const int side = lat >= 0.0f ? 1 : 0;
+                            if (!m.wall[side] || along <= 0.05f || std::fabs(lat - (side ? m.hi : m.lo)) > 0.05f) continue;
+                            const Vec3 start = m.node + m.r * (side ? m.hi : m.lo);
+                            const Vec3 end{ at.x, at.y, start.z };
+                            connectors.push_back(collision::MakeBarrier(start, end, p.surface));
+                            connectors.push_back(collision::MakeBarrier(end, start, p.surface));
+                        }
+                        break;
+                    }
+                    if (opened) continue;
+                }
                 if (p.barrier || p.Vertical()) {
                     // A wall goes when its middle stands inside a cut.
                     const Vec3 middle = (p.corners[0] + p.corners[2]) * 0.5f;
@@ -3651,6 +4732,10 @@ bool RoadsExtension::BakeGroundCollision(size_t& moved) {
     }
     if (refs.empty()) return true;
     editor.Remove(refs);
+    replacements.insert(replacements.end(), connectors.begin(), connectors.end());
+    if (barriersOpened)
+        LOG_INFO("ground: %zu game barriers opened at junction mouths, %zu links to the roads' own", barriersOpened,
+                 connectors.size() / 2);
     if (!replacements.empty()) editor.Add(replacements, L"Sculpt the ground");
     tools->RefreshAfterEdit();
     moved = replacements.size() + removedInCuts;
@@ -4008,17 +5093,21 @@ void RoadsExtension::Unbake() {
         app_.Message(L"The baked roads could not be taken out. The log has why.", MB_ICONWARNING);
         return;
     }
+    WriteBakeStamp();   // unbaked on purpose: the game start leaves it so until the source changes
     app_.Status(Fmt(L"%zu baked road pieces and %zu collision polygons removed from the game; the road network "
                     L"is kept in the editor (Ctrl+Z puts them back)", removed, collisionRemoved));
 }
 
 void RoadsExtension::Bake() {
-    nfs::World* world = app_.World();
-    if (!world) {
+    if (!app_.World()) {
         app_.Message(L"Open a region first.");
         return;
     }
+    // A "yes" here saves the edits, which reopens the region: nothing of the
+    // world from before it may be used after.
     if (!app_.ConfirmUnsaved()) return;
+    nfs::World* world = app_.World();
+    if (!world) return;
     SaveNetwork();
     const std::wstring region = world->Region();
     // Ctrl+Z takes the whole bake back: the world's files as they are now.
@@ -4093,6 +5182,7 @@ void RoadsExtension::Bake() {
         return;
     }
     if (pieces.empty()) {
+        WriteBakeStamp();
         app_.Status(Fmt(L"No roads to bake; %zu old pieces and %zu collision polygons removed", removed,
                         collisionRemoved));
         return;
@@ -4110,6 +5200,62 @@ void RoadsExtension::Bake() {
         app_.Message(L"Could not make " + folder, MB_ICONWARNING);
         return;
     }
+    // A piece must sit in a section the game keeps loaded all along it:
+    // one that crosses visibility zones sharing none is cut in two, and
+    // again, until each part fits in one.
+    {
+        const auto samples = [](const roads::MeshPiece& piece) {
+            std::vector<Vec3> points;
+            size_t total = 0;
+            for (const roads::MeshGroup& g : piece.groups) total += g.vertices.size();
+            const size_t step = std::max<size_t>(1, total / 40);
+            size_t k = 0;
+            for (const roads::MeshGroup& g : piece.groups)
+                for (const roads::MeshVertex& v : g.vertices)
+                    if (k++ % step == 0) points.push_back(v.position);
+            return points;
+        };
+        std::vector<roads::MeshPiece> fitted;
+        std::vector<std::pair<roads::MeshPiece, int>> todo;
+        for (roads::MeshPiece& piece : pieces) todo.push_back({ std::move(piece), 0 });
+        size_t cuts = 0;
+        while (!todo.empty()) {
+            auto [piece, depth] = std::move(todo.back());
+            todo.pop_back();
+            if (piece.VertexCount() == 0 || depth >= 6 ||
+                app_.World()->SectionForPlacementAlong(samples(piece)) != SIZE_MAX) {
+                fitted.push_back(std::move(piece));
+                continue;
+            }
+            // In two across its longest side, at the middle of its triangles.
+            const Aabb box = piece.Bounds();
+            const int axis = box.max.x - box.min.x >= box.max.y - box.min.y ? 0 : 1;
+            const float cut = axis ? (box.min.y + box.max.y) * 0.5f : (box.min.x + box.max.x) * 0.5f;
+            roads::MeshPiece halves[2];
+            halves[0].name = piece.name + "A";
+            halves[1].name = piece.name + "B";
+            for (roads::MeshPiece& h : halves) { h.segment = piece.segment; h.node = piece.node; }
+            // The collision goes with the first half: it is placed by zone on its own.
+            halves[0].strips = std::move(piece.strips);
+            halves[0].areas = std::move(piece.areas);
+            halves[0].walls = std::move(piece.walls);
+            for (const roads::MeshGroup& g : piece.groups)
+                for (size_t k = 0; k + 2 < g.indices.size(); k += 3) {
+                    const Vec3 c = (g.vertices[g.indices[k]].position + g.vertices[g.indices[k + 1]].position +
+                                    g.vertices[g.indices[k + 2]].position) * (1.0f / 3.0f);
+                    roads::MeshGroup& to = halves[(axis ? c.y : c.x) < cut ? 0 : 1].Group(g.texture);
+                    for (int i = 0; i < 3; ++i) {
+                        to.indices.push_back((u32)to.vertices.size());
+                        to.vertices.push_back(g.vertices[g.indices[k + i]]);
+                    }
+                }
+            ++cuts;
+            for (roads::MeshPiece& h : halves) todo.push_back({ std::move(h), depth + 1 });
+        }
+        pieces = std::move(fitted);
+        if (cuts) LOG_INFO("roads: %zu pieces cut where they cross visibility zones with no section in common", cuts);
+    }
+
     const std::wstring obj = folder + L"\\roads.obj";
     Vec3 origin{};
     std::wstring error;
@@ -4126,16 +5272,21 @@ void RoadsExtension::Bake() {
     if (nfs::World* reloaded = app_.World())
         for (const nfs::SolidObject* model : reloaded->AllModels())
             baked += model && roads::IsBakedRoadModel(model->name);
+    // Pieces with nothing to draw (collision only: posts, pillars) are not
+    // written as models, so they are not counted.
+    size_t meshes = 0;
+    for (const roads::MeshPiece& piece : pieces) meshes += piece.VertexCount() > 0;
     app_.Status(Fmt(L"Roads baked: %zu of %zu pieces are in the game now (%zu old ones replaced), "
                     L"%zu collision polygons (%zu old removed), %zu street lights, ground: %zu meshes and %zu "
                     L"polygons moved; %s",
-                    baked, pieces.size(), removed, collisionAdded, collisionRemoved, polesAdded, groundMeshes,
+                    baked, meshes, removed, collisionAdded, collisionRemoved, polesAdded, groundMeshes,
                     groundPolygons, routes.c_str()));
-    LOG_INFO("roads: baked %zu of %zu pieces from %S", baked, pieces.size(), obj.c_str());
-    if (baked < pieces.size())
+    LOG_INFO("roads: baked %zu of %zu pieces from %S", baked, meshes, obj.c_str());
+    WriteBakeStamp();
+    if (baked < meshes)
         app_.Message(Fmt(L"%zu of %zu road pieces could not be made into models (the log has why: usually a "
                          L"section with no object of its own to build from).",
-                         pieces.size() - baked, pieces.size()),
+                         meshes - baked, meshes),
                      MB_ICONWARNING);
 }
 

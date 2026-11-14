@@ -72,11 +72,18 @@ struct CollisionPack {
     // means file order.
     std::vector<u32> gridRank;
 
+    // Changed in the editor since it was read: its cells are ordered by the
+    // rules below rather than kept as the file had them.
+    bool edited = false;
+
     size_t BarrierCount() const;
 
     // Height of the ground corner nearest to `point` in plan, or `fallback`
     // when the pack has no ground.
     float GroundHeightNear(const Vec3& point, float fallback) const;
+    // The height of every layer of ground under `point` (within `reach` of a
+    // polygon's edge in plan): a road and the bridge over it are two.
+    void GroundHeightsAt(const Vec3& point, float reach, std::vector<float>& out) const;
 
     // A barrier drawn as a wall standing on the ground at both ends, from
     // `below` under it to `above` over it. The file gives it no height, so
@@ -85,6 +92,21 @@ struct CollisionPack {
     void BarrierQuad(const CollisionPolygon& barrier, Vec3 out[4]) const;
     static constexpr float kBarrierBelow = 0.5f;
     static constexpr float kBarrierAbove = 3.0f;
+
+    // Settles the height of every barrier at once: barriers run in chains,
+    // end to end, so one standing where roads cross takes its level from the
+    // neighbours that stand where there is only one ground. BarrierQuad uses
+    // the result until the polygons are replaced; the collision view calls
+    // this whenever it rebuilds.
+    void ResolveBarriers() const;
+    // The heights a barrier gets on its own, without its neighbours.
+    void BarrierEndsAlone(const CollisionPolygon& barrier, float& za, float& zb) const { BarrierEnds(barrier, za, zb); }
+
+private:
+    void BarrierEnds(const CollisionPolygon& barrier, float& za, float& zb) const;
+    mutable std::vector<std::pair<float, float>> barrierZ_;   // per polygon, for barriers
+    mutable const CollisionPolygon* barrierFor_ = nullptr;
+    mutable size_t barrierSize_ = 0;
 };
 
 // A fingerprint of the polygons, so an import can tell which state of a pack

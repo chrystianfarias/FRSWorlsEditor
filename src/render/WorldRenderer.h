@@ -14,6 +14,8 @@ class RenderExtension;
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <set>
+#include <string>
 #include <vector>
 
 // How the world is shaded in the viewport.
@@ -330,6 +332,12 @@ public:
     // Models the editor shows some other way -- the baked roads, drawn from
     // their procedural description instead -- left out of drawing and picking.
     void SetHiddenModels(std::function<bool(const nfs::SolidObject&)> hidden) { hiddenModels_ = std::move(hidden); }
+
+    // Placed objects hidden in the editor only (ui/HiddenItems.h): neither
+    // drawn nor picked. A key names one placement -- the section that places
+    // it and its index there -- and is empty for what is not a placement.
+    void SetHiddenInstances(std::set<std::string> keys) { hiddenKeys_ = std::move(keys); ++hiddenVersion_; }
+    std::string HiddenKey(const PickResult& picked) const;
     // Textures the region does not hold, for an extension's models.
     void SetExtraTextureLookup(TextureCache::ExtraLookup lookup) { textures_.SetExtraLookup(std::move(lookup)); }
 
@@ -392,6 +400,8 @@ private:
         Vec3                        tablePosition;    // where the table says it lies
         bool                        positioned = false;
         bool                        alternate = false;
+        mutable std::vector<char>   hidden;           // per instance, from hiddenKeys_
+        mutable u64                 hiddenVersion = ~0ull;
 
         Aabb CullBounds(bool withLibrary) const {
             if (!withLibrary) return instanceBounds;
@@ -400,6 +410,11 @@ private:
             return both;
         }
     };
+
+    std::set<std::string> hiddenKeys_;
+    u64 hiddenVersion_ = 0;
+    static std::string InstanceKey(const std::string& section, int native, int placement);
+    const std::vector<char>& HiddenFlags(size_t section) const;
 
     void ApplyRenderStates();
     void BuildInstances(const nfs::World& world);

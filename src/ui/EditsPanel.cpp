@@ -378,6 +378,38 @@ bool EditsPanel::RevertModels(HWND owner, const std::vector<u32>& hashes, std::w
     return true;
 }
 
+std::vector<std::wstring> EditsPanel::TickedKeys() const {
+    std::vector<std::wstring> keys;
+    const State& state = impl_->state;
+    for (int i = 0; i < ListView_GetItemCount(list_); ++i) {
+        if (!ListView_GetCheckState(list_, i)) continue;
+        LVITEMW item{};
+        item.mask = LVIF_PARAM;
+        item.iItem = i;
+        ListView_GetItem(list_, &item);
+        const size_t index = (size_t)item.lParam;
+        if (index >= state.rows.size()) continue;
+        const Row& row = state.rows[index];
+        keys.push_back(row.sectionName + L"|" + row.kind + L"|" + row.what + L"|" + row.detail);
+    }
+    return keys;
+}
+
+void EditsPanel::TickKeys(const std::vector<std::wstring>& keys) {
+    const State& state = impl_->state;
+    for (int i = 0; i < ListView_GetItemCount(list_); ++i) {
+        LVITEMW item{};
+        item.mask = LVIF_PARAM;
+        item.iItem = i;
+        ListView_GetItem(list_, &item);
+        const size_t index = (size_t)item.lParam;
+        if (index >= state.rows.size()) continue;
+        const Row& row = state.rows[index];
+        const std::wstring key = row.sectionName + L"|" + row.kind + L"|" + row.what + L"|" + row.detail;
+        ListView_SetCheckState(list_, i, std::find(keys.begin(), keys.end(), key) != keys.end());
+    }
+}
+
 bool EditsPanel::RevertTicked(HWND owner, std::wstring& summary) {
     if (!impl_->state.world) return false;
     const int answer = ::MessageBoxW(owner,

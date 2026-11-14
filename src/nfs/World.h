@@ -122,6 +122,15 @@ public:
     // a new edit on these keeps the edits already in force.
     ByteSpan SectionBytes(const Section& section) const;
     const Preculler&    Visibility() const { return preculler_; }
+    // The zones as the game shipped them, before any edited list: a section
+    // a zone loads only because its list was edited is drawn there, but its
+    // collision is not taken (seen in game: the car loses the ground crossing
+    // into such a zone), so collision goes into sections the shipped lists name.
+    const Preculler&    ShippedVisibility() const { return shippedVisibility_; }
+    // The layout file (L4Rx.BUN) as shipped, and the spans the models folder
+    // lays over it and the stream.
+    ByteSpan LayoutBytes() const { return layout_.Span(); }
+    const std::vector<SpanOverlay>& Spans() const { return spans_; }
 
     // Parses a section if it has not been parsed yet. Returns nullptr when the
     // section holds no geometry.
@@ -207,9 +216,23 @@ public:
         return section.IsAlternate() && (preculler_.IsEmpty() || !preculler_.Listed(section.number));
     }
 
+    // Loaded sections (indices into Loaded()) that every point's visibility
+    // zone lists: what the game has loaded wherever along these points the
+    // car is. A model or collision placed in one of them never vanishes on
+    // the way. Empty when the points cross zones that share no section, or
+    // when the region has no visibility lists.
+    std::vector<size_t> SectionsLoadedThroughout(const std::vector<Vec3>& points) const;
+
     // The positioned section a placement at `point` belongs in: the one whose
     // ground covers it, else the nearest. SIZE_MAX when none can take scenery.
     size_t SectionForPlacement(const Vec3& point) const;
+
+    // The section for a model or placement spanning `points`: one that can
+    // take scenery and that every point's visibility zone loads, so it never
+    // vanishes along them -- SectionForPlacement's choice for their middle
+    // when it is one of those, else the nearest of them. Without visibility
+    // lists, SectionForPlacement. SIZE_MAX when no section qualifies.
+    size_t SectionForPlacementAlong(const std::vector<Vec3>& points) const;
 
     // Every model in the region, one per hash.
     std::vector<const SolidObject*> AllModels() const;
@@ -238,6 +261,7 @@ private:
     // shows the edited one.
     std::vector<SpanOverlay> spans_;
     Preculler    preculler_;
+    Preculler    shippedVisibility_;
 
     std::vector<std::unique_ptr<LoadedSection>> loaded_;
     std::unordered_map<u32, const SolidObject*>  modelsByHash_;

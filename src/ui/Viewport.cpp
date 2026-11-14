@@ -110,7 +110,11 @@ LRESULT Viewport::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
                 // The keys follow the click into a panel's fields.
                 ::SetFocus(window_);
                 return 0;
-            case WM_LBUTTONUP: case WM_MOUSEWHEEL:
+            case WM_LBUTTONUP:
+                // A drag that began in the view ends there, wherever it is let go.
+                if (::GetCapture() == window_) break;
+                return 0;
+            case WM_MOUSEWHEEL:
                 return 0;
             case WM_MOUSEMOVE:
                 gizmoHot_ = kGizmoNone;
@@ -230,6 +234,8 @@ LRESULT Viewport::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
 
         case WM_LBUTTONUP:
             if (GizmoDragging()) { EndGizmoDrag(true); return 0; }
+            for (ViewportTool* tool : tools_)
+                if (tool->MouseUp(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam), wParam)) return 0;
             break;
 
         case WM_CAPTURECHANGED:

@@ -47,6 +47,12 @@ public:
     // per change: its whole-pack "Collision edited" rows are left out.
     std::function<bool(const std::string& section)> collisionLogged;
 
+    // The ticked rows as text (section, kind, what, detail), and ticking the
+    // rows that read the same again -- across a refresh, when a save in
+    // between reopened the region and the rows were made anew.
+    std::vector<std::wstring> TickedKeys() const;
+    void TickKeys(const std::vector<std::wstring>& keys);
+
     // Asks, then reverts the ticked rows. True when something was reverted,
     // so the caller reloads the region; `summary` says what happened.
     bool RevertTicked(HWND owner, std::wstring& summary);

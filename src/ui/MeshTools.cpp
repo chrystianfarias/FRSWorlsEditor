@@ -12,6 +12,7 @@
 #include "ui/CollisionTools.h"
 #include "ui/CrashReport.h"
 #include "io/WorldFile.h"
+#include "io/SectionEdits.h"
 #include "ui/Resource.h"
 
 #include <algorithm>
@@ -35,6 +36,7 @@ enum : int {
     kIdFinish    = 44506,
     kIdDiscard   = 44507,
     kIdExtrude   = 44509,
+    kIdFill      = 44510,
 };
 
 std::wstring Format(const wchar_t* format, ...) {
@@ -95,6 +97,7 @@ void MeshTools::OnCreate() {
         ::AppendMenuW(popup_, MF_STRING, kIdFaces, L"Pick &Faces\t3");
         ::AppendMenuW(popup_, MF_STRING, kIdSelectAll, L"Select &All\tCtrl+A");
         ::AppendMenuW(popup_, MF_STRING, kIdExtrude, L"E&xtrude Picked Collision Edges\tE");
+        ::AppendMenuW(popup_, MF_STRING, kIdFill, L"&Fill Between Picked Collision Edges or Corners\tF");
         ::AppendMenuW(popup_, MF_SEPARATOR, 0, nullptr);
         ::AppendMenuW(popup_, MF_STRING, ID_GIZMO_MOVE, L"Gizmo: &Move");
         ::AppendMenuW(popup_, MF_STRING, ID_GIZMO_ROTATE, L"Gizmo: &Rotate");
@@ -139,7 +142,11 @@ bool MeshTools::OnCommand(int id) {
         case kIdFaces:     SetPickMode(Pick::Face); return true;
         case kIdSelectAll: if (!active_) return false; SelectAll(); return true;
         case kIdExtrude:   ExtrudeCollision(); return true;
-        case kIdFinish:    if (active_) Finish(); return true;
+        case kIdFill:      FillCollision(); return true;
+        case kIdFinish:
+            if (active_) Finish();
+            else if (host_.otherActive && host_.otherActive()) host_.otherEnd();
+            return true;
         case kIdDiscard:
             if (active_) { Stop(true); Status(L"Mesh edit discarded."); }
             return true;
@@ -157,6 +164,7 @@ void MeshTools::UpdateMenuChecks(HMENU menu) {
     check(kIdEdges, active_ && pick_ == Pick::Edge);
     check(kIdFaces, active_ && pick_ == Pick::Face);
     ::EnableMenuItem(menu, (UINT)kIdExtrude, MF_BYCOMMAND | (active_ && collision_ ? MF_ENABLED : MF_GRAYED));
+    ::EnableMenuItem(menu, (UINT)kIdFill, MF_BYCOMMAND | (active_ && collision_ ? MF_ENABLED : MF_GRAYED));
     for (int id : { kIdVertices, kIdEdges, kIdFaces, kIdSelectAll, kIdFinish, kIdDiscard })
         ::EnableMenuItem(menu, (UINT)id, MF_BYCOMMAND | (active_ ? MF_ENABLED : MF_GRAYED));
     const GizmoMode mode = host_.viewport->GetGizmoMode();
@@ -170,10 +178,24 @@ void MeshTools::UpdateMenuChecks(HMENU menu) {
 // ---------------------------------------------------------------------------
 
 bool MeshTools::Begin() {
+    // A visibility zone picked while they are shown: its corners are what is edited.
+    if (host_.otherBegin && host_.otherBegin()) {
+        if (host_.menuChecks) host_.menuChecks();
+        return true;
+    }
     nfs::World* world = World();
     const auto& selection = Renderer().Selection();
-    // Collision polygons picked (and no object): their shape is what is edited.
-    if (selection.empty() && !Renderer().CollisionSelection().empty()) return BeginCollision();
+    // The collision shown: it is what the edit mode edits -- all of it
+    // around the camera, nothing needs picking first. Picking first is only
+    // for an object's mesh.
+    if (Renderer().CollisionVisible() || (!Renderer().CollisionSelection().empty() && selection.empty())) {
+        LOG_INFO("edit mode: collision around the camera (%zu polygons were picked)",
+                 Renderer().CollisionSelection().size());
+        return BeginCollisionArea();
+    }
+    if (selection.size() != 1 || !selection.front().object)
+        LOG_INFO("edit mode refused: %zu objects selected, %zu collision polygons, collision %s", selection.size(),
+                 Renderer().CollisionSelection().size(), Renderer().CollisionVisible() ? "shown" : "hidden");
     if (!world || selection.size() != 1 || !selection.front().object) {
         Status(L"Select one object first (hide the collision with Ctrl+K to pick meshes), then Tab.");
         return false;
@@ -254,6 +276,7 @@ bool MeshTools::Begin() {
 
 void MeshTools::Stop(bool restore) {
     if (!active_) return;
+    boxPending_ = boxActive_ = false;
     if (collision_) { StopCollision(restore); return; }
     if (restore && !SameShape(world_, original_)) {
         world_ = original_;
@@ -394,10 +417,7 @@ void MeshTools::Undo() {
 
 bool MeshTools::GizmoPivot(Vec3& pivot) {
     if (!active_ || selected_.empty()) return false;
-    if (collision_ && !dragging_ && Collision() && Collision()->Editor().StepsUndone() != collisionUndone_) {
-        ReadCollision();
-        UpdateOverlay();
-    }
+    if (collision_ && !dragging_ && Collision() && Collision()->Editor().StepsUndone() != collisionUndone_) CatchUp();
     if (dragging_) { pivot = pivotStart_; return true; }
     const std::vector<u32> welds = SelectedWelds();
     if (welds.empty()) return false;
@@ -453,7 +473,7 @@ void MeshTools::GizmoChanged(const Mat4& transform, bool done, bool keep) {
 
 bool MeshTools::MouseDown(int x, int y, WPARAM keys) {
     if (!active_) return false;
-    if (collision_ && Collision() && Collision()->Editor().StepsUndone() != collisionUndone_) ReadCollision();
+    if (collision_ && Collision() && Collision()->Editor().StepsUndone() != collisionUndone_) CatchUp();
     const bool add = (keys & MK_CONTROL) != 0;
     const GizmoView view = host_.viewport->ToolView();
     const Vec3 eye = host_.viewport->GetCamera().Position();
@@ -494,7 +514,16 @@ bool MeshTools::MouseDown(int x, int y, WPARAM keys) {
     }
 
     if (best < 0) {
-        if (!add) selected_.clear();
+        // Nothing under the press: the start of a box, or a plain click that
+        // drops the selection when it is let go without moving.
+        boxPending_ = true;
+        boxActive_ = false;
+        boxAdd_ = add;
+        boxSubtract_ = (keys & MK_SHIFT) != 0 && !add;
+        boxX0_ = boxX1_ = x;
+        boxY0_ = boxY1_ = y;
+        ::SetCapture(host_.viewport->Handle());
+        return true;
     } else if (add) {
         if (!selected_.erase((u32)best)) selected_.insert((u32)best);
     } else {
@@ -513,9 +542,86 @@ bool MeshTools::MouseDown(int x, int y, WPARAM keys) {
     return true;
 }
 
+void MeshTools::MouseMove(int x, int y) {
+    if (!active_ || !boxPending_) return;
+    boxX1_ = x;
+    boxY1_ = y;
+    if (!boxActive_ && (std::abs(x - boxX0_) > 4 || std::abs(y - boxY0_) > 4)) boxActive_ = true;
+}
+
+bool MeshTools::MouseUp(int x, int y, WPARAM keys) {
+    (void)keys;
+    if (!active_ || !boxPending_) return false;
+    boxPending_ = false;
+    if (::GetCapture() == host_.viewport->Handle()) ::ReleaseCapture();
+    if (boxActive_) {
+        boxActive_ = false;
+        SelectBox(boxX0_, boxY0_, x, y, boxAdd_, boxSubtract_);
+    } else if (!boxAdd_) {
+        selected_.clear();
+    }
+    UpdateOverlay();
+    if (host_.menuChecks) host_.menuChecks();
+    return true;
+}
+
+bool MeshTools::BoxRect(int& left, int& top, int& right, int& bottom) const {
+    if (!active_ || !boxActive_) return false;
+    left = std::min(boxX0_, boxX1_);
+    right = std::max(boxX0_, boxX1_);
+    top = std::min(boxY0_, boxY1_);
+    bottom = std::max(boxY0_, boxY1_);
+    return true;
+}
+
+void MeshTools::SelectBox(int x0, int y0, int x1, int y1, bool add, bool subtract) {
+    const float left = (float)std::min(x0, x1), right = (float)std::max(x0, x1);
+    const float top = (float)std::min(y0, y1), bottom = (float)std::max(y0, y1);
+    const GizmoView view = host_.viewport->ToolView();
+    // Inside the box and in front of the camera; hidden ones count too, as
+    // Blender's X-ray does -- what the box covers is what it takes.
+    std::vector<char> inside(weldVertices_.size(), 0);
+    for (size_t w = 0; w < weldVertices_.size(); ++w) {
+        Vec2 pixel;
+        if (!GizmoProject(view, WeldPosition((u32)w), pixel)) continue;
+        inside[w] = pixel.x >= left && pixel.x <= right && pixel.y >= top && pixel.y <= bottom;
+    }
+    std::vector<u32> hits;
+    if (pick_ == Pick::Vertex) {
+        for (size_t w = 0; w < inside.size(); ++w) if (inside[w]) hits.push_back((u32)w);
+    } else if (pick_ == Pick::Edge) {
+        for (size_t e = 0; e < edges_.size(); ++e)
+            if (inside[edges_[e].first] && inside[edges_[e].second]) hits.push_back((u32)e);
+    } else {
+        std::vector<char> faceIn(faces_.size(), 0);
+        for (size_t f = 0; f < faces_.size(); ++f)
+            faceIn[f] = inside[faces_[f][0]] && inside[faces_[f][1]] && inside[faces_[f][2]];
+        // A collision quad comes whole or not at all.
+        if (!facePolygon_.empty()) {
+            std::map<u32, bool> whole;
+            for (size_t f = 0; f < faces_.size(); ++f) {
+                auto found = whole.find(facePolygon_[f]);
+                whole[facePolygon_[f]] = (found == whole.end() ? true : found->second) && faceIn[f];
+            }
+            for (size_t f = 0; f < faces_.size(); ++f) faceIn[f] = whole[facePolygon_[f]];
+        }
+        for (size_t f = 0; f < faces_.size(); ++f) if (faceIn[f]) hits.push_back((u32)f);
+    }
+    if (!add && !subtract) selected_.clear();
+    for (u32 hit : hits) {
+        if (subtract) selected_.erase(hit);
+        else selected_.insert(hit);
+    }
+    Status(Format(L"%zu %s in the box, %zu picked. Ctrl+drag adds, Shift+drag takes away.", hits.size(),
+                  pick_ == Pick::Vertex ? L"vertices" : pick_ == Pick::Edge ? L"edges" : L"faces", selected_.size()));
+}
+
 bool MeshTools::KeyDown(WPARAM key, bool repeat) {
     if (!active_) {
-        if (key == VK_TAB && !repeat && ::GetKeyState(VK_CONTROL) >= 0) return Begin() || true;
+        if (key == VK_TAB && !repeat && ::GetKeyState(VK_CONTROL) >= 0) {
+            if (host_.otherActive && host_.otherActive()) { host_.otherEnd(); return true; }
+            return Begin() || true;
+        }
         return false;
     }
     switch (key) {
@@ -529,10 +635,13 @@ bool MeshTools::KeyDown(WPARAM key, bool repeat) {
         case 'E':
             if (collision_ && !repeat && ::GetKeyState(VK_CONTROL) >= 0) { ExtrudeCollision(); return true; }
             return false;
+        case 'F':
+            if (collision_ && !repeat && ::GetKeyState(VK_CONTROL) >= 0) { FillCollision(); return true; }
+            return false;
         case 'Z':
             if (::GetKeyState(VK_CONTROL) < 0) {
                 undo::UndoLatest();
-                if (collision_) { ReadCollision(); UpdateOverlay(); }
+                if (collision_) CatchUp();
                 return true;
             }
             return false;
@@ -632,10 +741,180 @@ bool MeshTools::FillProperties(PropertiesPanel::View& view) {
 }
 
 void MeshTools::Tick(float deltaSeconds) {
+    FollowCamera();
+    // An undo from the menu or another tool: the session catches up.
+    if (active_ && collision_ && !dragging_ && Collision() &&
+        Collision()->Editor().StepsUndone() != collisionUndone_)
+        CatchUp();
     static float clock = 0.0f;
     static bool reported = false;
     clock += deltaSeconds;
     nfs::World* world = World();
+
+    // FRS_VIS_REPORT="x y;x y;...": the sections the game loads standing at
+    // each point (its visibility lists), by name.
+    static bool visReported = false;
+    if (!visReported && clock > 5.0f && world) {
+        if (const char* list = std::getenv("FRS_VIS_REPORT")) {
+            visReported = true;
+            std::string text = list;
+            size_t at = 0;
+            while (at < text.size()) {
+                const size_t end = text.find(';', at);
+                const std::string item = text.substr(at, end == std::string::npos ? std::string::npos : end - at);
+                at = end == std::string::npos ? text.size() : end + 1;
+                float x = 0, y = 0;
+                if (std::sscanf(item.c_str(), "%f %f", &x, &y) != 2) continue;
+                std::vector<u32> numbers;
+                const bool claimed = world->Visibility().VisibleAt({ x, y, 0.0f }, numbers);
+                std::string names;
+                for (u32 n : numbers)
+                    for (const auto& s : world->Table().Sections())
+                        if (s.number == n) { names += s.name + " "; break; }
+                LOG_INFO("vis report: (%.0f %.0f) %s %zu sections: %s", x, y, claimed ? "in a zone," : "NO ZONE,",
+                         numbers.size(), names.c_str());
+            }
+        }
+    }
+
+    // FRS_PACK_REPORT="x0 y0 x1 y1": every collision pack that covers that
+    // area, as shipped and as now -- where new collision went, and whether it
+    // lies inside what the section covered in the game.
+    static bool packsReported = false;
+    if (!packsReported && clock > 25.0f && world) {
+        if (const char* area = std::getenv("FRS_PACK_REPORT")) {
+            packsReported = true;
+            float x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+            std::sscanf(area, "%f %f %f %f", &x0, &y0, &x1, &y1);
+            for (u32 s = 0; s < (u32)world->Loaded().size(); ++s) {
+                const auto& section = *world->Loaded()[s];
+                if (!section.info) continue;
+                std::vector<nfs::CollisionPack> shipped;
+                ShippedCollisionPacks(*world, *section.info, shipped);
+                for (u32 p = 0; p < (u32)section.collision.size(); ++p) {
+                    const nfs::CollisionPack& pack = section.collision[p];
+                    Aabb now, before;
+                    size_t inArea = 0;
+                    for (const auto& polygon : pack.polygons) {
+                        bool in = false;
+                        for (const Vec3& c : polygon.corners) {
+                            if (!polygon.barrier) now.Add(c);
+                            in |= c.x >= x0 && c.x <= x1 && c.y >= y0 && c.y <= y1;
+                        }
+                        inArea += in;
+                    }
+                    if (!inArea) continue;
+                    // Every barrier in the area: where it runs and which side it holds.
+                    for (size_t b = 0; b < pack.polygons.size(); ++b) {
+                        const auto& polygon = pack.polygons[b];
+                        if (!polygon.barrier) continue;
+                        const Vec3 &a = polygon.corners[0], &e = polygon.corners[2];
+                        const bool in = (a.x >= x0 && a.x <= x1 && a.y >= y0 && a.y <= y1) ||
+                                        (e.x >= x0 && e.x <= x1 && e.y >= y0 && e.y <= y1);
+                        if (!in) continue;
+                        // Left of the direction from a to e is the side it blocks.
+                        const float nx = -(e.y - a.y), ny = e.x - a.x;
+                        LOG_INFO("pack report:   %s #%zu barrier (%.2f %.2f)->(%.2f %.2f) blocks toward (%.2f %.2f) "
+                                 "group %u surface %u", section.info->name.c_str(), b, a.x, a.y, e.x, e.y, nx, ny,
+                                 polygon.raceGroup, polygon.surface);
+                    }
+                    if (p < shipped.size())
+                        for (const auto& polygon : shipped[p].polygons)
+                            if (!polygon.barrier) for (const Vec3& c : polygon.corners) before.Add(c);
+                    LOG_INFO("pack report: %s pack %u: %zu polygons (%zu shipped), %zu in the area; ground now "
+                             "(%.0f %.0f %.0f)-(%.0f %.0f %.0f), shipped (%.0f %.0f %.0f)-(%.0f %.0f %.0f); grid %ux%u "
+                             "at (%.0f %.0f); section centre (%.0f %.0f %.0f)",
+                             section.info->name.c_str(), p, pack.polygons.size(),
+                             p < shipped.size() ? shipped[p].polygons.size() : 0, inArea, now.min.x, now.min.y,
+                             now.min.z, now.max.x, now.max.y, now.max.z, before.min.x, before.min.y, before.min.z,
+                             before.max.x, before.max.y, before.max.z, pack.gridWidth, pack.gridHeight,
+                             pack.gridOrigin.x, pack.gridOrigin.y, section.info->position.x,
+                             section.info->position.y, section.info->position.z);
+                }
+            }
+            // Every section: its shipped ground's extent, to see the map's squares.
+            for (const auto& entry : world->Table().Sections()) {
+                std::vector<nfs::CollisionPack> shipped;
+                ShippedCollisionPacks(*world, entry, shipped);
+                Aabb ground;
+                size_t polygons = 0;
+                for (const auto& pack : shipped)
+                    for (const auto& polygon : pack.polygons) {
+                        ++polygons;
+                        if (!polygon.barrier) for (const Vec3& c : polygon.corners) ground.Add(c);
+                    }
+                LOG_INFO("section grid: %s order %u centre (%.0f %.0f) packs %zu polygons %zu ground (%.0f %.0f)-(%.0f %.0f)",
+                         entry.name.c_str(), entry.order, entry.position.x, entry.position.y, shipped.size(), polygons,
+                         ground.Valid() ? ground.min.x : 0.0f, ground.Valid() ? ground.min.y : 0.0f,
+                         ground.Valid() ? ground.max.x : 0.0f, ground.Valid() ? ground.max.y : 0.0f);
+            }
+            LOG_INFO("pack report: done");
+        }
+    }
+
+    // FRS_BARRIER_REPORT=1: how level the barriers stand, by the nearest
+    // ground corner (the old way) and by the ground under each end.
+    static bool barriersReported = false;
+    if (!barriersReported && clock > 25.0f && world && std::getenv("FRS_BARRIER_REPORT")) {
+        barriersReported = true;
+        size_t barriers = 0, oldSteep = 0, newSteep = 0, ambiguous = 0, noGround = 0, byChain = 0;
+        Vec3 example{};
+        for (const auto& section : world->Loaded())
+            for (const nfs::CollisionPack& pack : section->collision) {
+                pack.ResolveBarriers();
+                for (const nfs::CollisionPolygon& polygon : pack.polygons) {
+                    if (!polygon.barrier) continue;
+                    ++barriers;
+                    const float za = pack.GroundHeightNear(polygon.corners[0], 0.0f);
+                    const float zb = pack.GroundHeightNear(polygon.corners[2], za);
+                    oldSteep += std::fabs(za - zb) > 2.0f;
+                    Vec3 quad[4];
+                    pack.BarrierQuad(polygon, quad);
+                    newSteep += std::fabs(quad[0].z - quad[3].z) > 2.0f;
+                    std::vector<float> ha, hb;
+                    pack.GroundHeightsAt(polygon.corners[0], 0.75f, ha);
+                    pack.GroundHeightsAt(polygon.corners[2], 0.75f, hb);
+                    ambiguous += ha.size() > 1 && hb.size() > 1;
+                    noGround += ha.empty() || hb.empty();
+                    float aloneA = 0.0f, aloneB = 0.0f;
+                    pack.BarrierEndsAlone(polygon, aloneA, aloneB);
+                    if (std::fabs(aloneA + nfs::CollisionPack::kBarrierBelow - quad[0].z) > 2.0f) {
+                        if (!byChain) example = { polygon.corners[0].x, polygon.corners[0].y, quad[0].z };
+                        ++byChain;
+                    }
+                }
+            }
+        LOG_INFO("barrier report: %zu barriers took another level from their neighbours; one at (%.1f %.1f %.1f)",
+                 byChain, example.x, example.y, example.z);
+        // Which way round the game stores its ground, seen from above.
+        size_t ccw = 0, cw = 0, flat = 0, quadsCcw = 0, quadsCw = 0;
+        for (const auto& section : world->Loaded())
+            for (const nfs::CollisionPack& pack : section->collision)
+                for (const nfs::CollisionPolygon& polygon : pack.polygons) {
+                    if (polygon.barrier) continue;
+                    const int n = polygon.quad ? 4 : 3;
+                    double area = 0.0;
+                    for (int i = 0; i < n; ++i) {
+                        const Vec3& a = polygon.corners[i];
+                        const Vec3& b = polygon.corners[(i + 1) % n];
+                        area += (double)a.x * b.y - (double)b.x * a.y;
+                    }
+                    if (std::fabs(area) < 1e-3) ++flat;
+                    else if (area > 0) { ++ccw; quadsCcw += polygon.quad; }
+                    else { ++cw; quadsCw += polygon.quad; }
+                }
+        LOG_INFO("winding report: ground seen from above: %zu counter-clockwise (%zu quads), %zu clockwise "
+                 "(%zu quads), %zu walls/flat", ccw, quadsCcw, cw, quadsCw, flat);
+        if (std::getenv("FRS_BARRIER_LOOK") && byChain) {
+            if (!host_.viewport->GetRenderer().CollisionVisible() && host_.window)
+                ::PostMessageW(host_.window, WM_COMMAND, MAKEWPARAM(ID_VIEW_COLLISION, 0), 0);
+            host_.viewport->GetCamera().SetPosition(example + Vec3{ -30.0f, -30.0f, 25.0f });
+            host_.viewport->GetCamera().SetYawPitch(Radians(45.0f), Radians(-30.0f));
+        }
+        LOG_INFO("barrier report: %zu barriers; ends more than 2 m apart: %zu the old way, %zu now; "
+                 "%zu over two grounds at both ends, %zu with an end over no ground",
+                 barriers, oldSteep, newSteep, ambiguous, noGround);
+    }
     if (reported || clock < 25.0f || !world || !std::getenv("FRS_ANIM_REPORT")) return;
     reported = true;
     // FRS_ANIM_REPORT=1: each texture animation, its frames, and the models
@@ -784,6 +1063,28 @@ void MeshTools::OnRegionLoaded() {
             Renderer().ClearSelection();
             Renderer().SetCollisionSelectionList({ { target.section, target.pack, target.polygon, 0.0f } });
             check(Begin() && collision_, "Tab starts the collision edit");
+            {
+                // An area pick over the whole view, the camera on the target.
+                const nfs::CollisionPolygon& p = *editor.Polygon(target);
+                const Vec3 centre = (p.corners[0] + p.corners[2]) * 0.5f;
+                host_.viewport->GetCamera().SetPosition(centre + Vec3{ -20.0f, -20.0f, 25.0f });
+                host_.viewport->GetCamera().SetYawPitch(Radians(45.0f), Radians(-40.0f));
+                pick_ = Pick::Vertex;
+                SelectBox(-100000, -100000, 100000, 100000, false, false);
+                const size_t all = selected_.size();
+                check(all > 0, "a box over the view takes vertices");
+                SelectBox(-100000, -100000, 100000, 100000, false, true);
+                check(selected_.empty(), "Shift+box takes them away");
+                pick_ = Pick::Face;
+                SelectBox(-100000, -100000, 100000, 100000, false, false);
+                bool whole = true;
+                for (u32 f : selected_)
+                    for (size_t g = 0; g < faces_.size(); ++g)
+                        if (facePolygon_[g] == facePolygon_[f] && !selected_.count((u32)g)) whole = false;
+                check(!selected_.empty() && whole, "faces come by whole polygons");
+                LOG_INFO("collision edit selftest: box took %zu vertices, %zu faces", all, selected_.size());
+                selected_.clear();
+            }
             const nfs::CollisionPolygon before = *editor.Polygon(target);
             // The weld at corner 0 of the target.
             long weld = -1;
@@ -882,6 +1183,114 @@ void MeshTools::OnRegionLoaded() {
             }
             StopCollision(false);
             check(!active_, "Tab ends it");
+        }
+
+        // Ground made by the editor faces up, whichever way round it was given.
+        {
+            const Vec3 cw[4] = { { 0, 0, 0 }, { 0, 4, 0 }, { 4, 4, 0 }, { 4, 0, 0 } };
+            const nfs::CollisionPolygon made = collision::MakeGround(cw, 4, nfs::kSurfaceRoad);
+            double area = 0.0;
+            for (int i = 0; i < 4; ++i)
+                area += (double)made.corners[i].x * made.corners[(i + 1) % 4].y -
+                        (double)made.corners[(i + 1) % 4].x * made.corners[i].y;
+            check(area > 0.0, "ground given clockwise is stored counter-clockwise");
+            std::vector<nfs::CollisionPolygon> strip;
+            collision::AppendStrip({ { 0, 0, 0 }, { 0, 10, 1 } }, { { 6, 0, 0 }, { 6, 10, 1 } }, nfs::kSurfaceRoad,
+                                   strip);
+            bool up = !strip.empty();
+            for (const auto& p : strip) {
+                const int n = p.quad ? 4 : 3;
+                double a = 0.0;
+                for (int i = 0; i < n; ++i)
+                    a += (double)p.corners[i].x * p.corners[(i + 1) % n].y - (double)p.corners[(i + 1) % n].x * p.corners[i].y;
+                up &= a > 0.0;
+            }
+            check(up, "a road strip faces up");
+        }
+
+        // A barrier: its side edge moves that end, the other stays.
+        collision::PolygonRef barrier{};
+        bool haveBarrier = false;
+        for (u32 s = 0; s < (u32)world->Loaded().size() && !haveBarrier; ++s) {
+            const auto& packs = world->Loaded()[s]->collision;
+            for (u32 p = 0; p < (u32)packs.size() && !haveBarrier; ++p)
+                for (u32 i = 0; i < (u32)packs[p].polygons.size(); ++i)
+                    if (packs[p].polygons[i].barrier) { barrier = { s, p, i }; haveBarrier = true; break; }
+        }
+        if (haveBarrier) {
+            Renderer().ClearSelection();
+            Renderer().SetCollisionSelectionList({ { barrier.section, barrier.pack, barrier.polygon, 0.0f } });
+            check(Begin() && collision_, "Tab on a barrier");
+            const nfs::CollisionPolygon before = *editor.Polygon(barrier);
+            Vec3 quad[4];
+            editor.BarrierQuad(barrier, quad);
+            long foot = -1, top = -1;
+            for (size_t w = 0; w < weldVertices_.size(); ++w) {
+                if (Length(WeldPosition((u32)w) - quad[0]) < 1e-3f) foot = (long)w;
+                if (Length(WeldPosition((u32)w) - quad[1]) < 1e-3f) top = (long)w;
+            }
+            const std::pair<u32, u32> side{ (u32)std::min(foot, top), (u32)std::max(foot, top) };
+            const auto e = std::find(edges_.begin(), edges_.end(), side);
+            check(foot >= 0 && top >= 0 && e != edges_.end(), "the barrier has a side edge");
+            check(faces_.size() >= 2, "and a face");
+            if (e != edges_.end()) {
+                pick_ = Pick::Edge;
+                selected_ = { (u32)(e - edges_.begin()) };
+                Vec3 pivot3;
+                GizmoPivot(pivot3);
+                GizmoChanged(Mat4::Translation(pivot3 + Vec3{ 2.0f, 0.0f, 0.0f }), true, true);
+                const nfs::CollisionPolygon after = *editor.Polygon(barrier);
+                check(std::fabs(after.corners[0].x - before.corners[0].x - 2.0f) < 1e-3f &&
+                          std::fabs(after.corners[1].x - before.corners[1].x - 2.0f) < 1e-3f,
+                      "the side edge moved that end 2 m");
+                check(std::fabs(after.corners[2].x - before.corners[2].x) < 1e-4f, "the other end stayed");
+                check(after.corners[0].z == 0.0f, "a barrier keeps no height");
+                editor.Undo();
+                Collision()->RefreshAfterEdit();
+            }
+            StopCollision(false);
+        }
+
+        // F between two edges of a ground quad that face each other: a new face.
+        if (found) {
+            Renderer().ClearSelection();
+            Renderer().SetCollisionSelectionList({ { target.section, target.pack, target.polygon, 0.0f } });
+            Begin();
+            const nfs::CollisionPolygon q = *editor.Polygon(target);
+            const auto weldAt = [&](const Vec3& p) -> long {
+                for (size_t w = 0; w < weldVertices_.size(); ++w)
+                    if (Length(WeldPosition((u32)w) - p) < 1e-3f) return (long)w;
+                return -1;
+            };
+            const auto edgeOf = [&](long a, long b) -> long {
+                const std::pair<u32, u32> e{ (u32)std::min(a, b), (u32)std::max(a, b) };
+                const auto it = std::find(edges_.begin(), edges_.end(), e);
+                return it == edges_.end() ? -1 : (long)(it - edges_.begin());
+            };
+            const long e1 = edgeOf(weldAt(q.corners[0]), weldAt(q.corners[1]));
+            const long e2 = edgeOf(weldAt(q.corners[2]), weldAt(q.corners[3]));
+            check(e1 >= 0 && e2 >= 0, "two opposite edges of the quad");
+            if (e1 >= 0 && e2 >= 0) {
+                pick_ = Pick::Edge;
+                selected_ = { (u32)e1, (u32)e2 };
+                const size_t before = collisionRefs_.size();
+                const u64 steps = editor.StepsRecorded();
+                FillCollision();
+                check(collisionRefs_.size() > before && editor.StepsRecorded() == steps + 1, "F fills a face between them");
+                check(pick_ == Pick::Face && !selected_.empty(), "and picks it");
+                // Del takes the new face out again.
+                const size_t withFace = collisionRefs_.size();
+                DeleteSelection();
+                check(collisionRefs_.size() < withFace && selected_.empty(), "Del deletes the picked face");
+                editor.Undo();   // the delete
+                Collision()->RefreshAfterEdit();
+                CatchUp();
+                check(collisionRefs_.size() == withFace, "Ctrl+Z brings it back");
+                editor.Undo();   // the fill
+                Collision()->RefreshAfterEdit();
+                CatchUp();
+            }
+            StopCollision(false);
         }
         LOG_INFO("collision edit selftest: %s", ok ? "PASSED" : "FAILED");
     }
@@ -1194,7 +1603,10 @@ bool MeshTools::BeginCollision() {
     CollisionTools* tools = Collision();
     if (!world || !tools) return false;
     collision::Editor& editor = tools->Editor();
-    if (editor.Moving()) return false;
+    if (editor.Moving()) {
+        LOG_INFO("edit mode refused: a collision move is still in progress");
+        return false;
+    }
 
     collisionSelected_.clear();
     for (const CollisionPick& pick : Renderer().CollisionSelection())
@@ -1240,6 +1652,132 @@ bool MeshTools::BeginCollision() {
     return BuildCollision(std::move(all));
 }
 
+bool MeshTools::BeginCollisionArea() {
+    nfs::World* world = World();
+    CollisionTools* tools = Collision();
+    if (!world || !tools) return false;
+    collision::Editor& editor = tools->Editor();
+    if (editor.Moving()) return false;
+    collisionSelected_.clear();
+    for (const CollisionPick& pick : Renderer().CollisionSelection())
+        collisionSelected_.push_back({ pick.section, pick.pack, pick.polygon });
+
+    areaCentre_ = host_.viewport->GetCamera().Position();
+    std::vector<collision::PolygonRef> all = collisionSelected_;
+    const float r2 = kAreaRadius * kAreaRadius;
+    for (u32 s = 0; s < (u32)world->Loaded().size(); ++s) {
+        const auto& packs = world->Loaded()[s]->collision;
+        for (u32 p = 0; p < (u32)packs.size(); ++p)
+            for (u32 i = 0; i < (u32)packs[p].polygons.size(); ++i) {
+                const nfs::CollisionPolygon& polygon = packs[p].polygons[i];
+                if (!showRaceGroupsInEdit_ && polygon.raceGroup != 0) continue;
+                for (const Vec3& c : polygon.corners) {
+                    const float dx = c.x - areaCentre_.x, dy = c.y - areaCentre_.y;
+                    if (dx * dx + dy * dy <= r2) { all.push_back({ s, p, i }); break; }
+                }
+            }
+    }
+    if (all.empty()) {
+        Status(L"No collision around the camera to edit.");
+        return false;
+    }
+    collisionRefs_.clear();
+    collisionStart_.clear();
+    areaMode_ = true;
+    if (!BuildCollision(std::move(all))) { areaMode_ = false; return false; }
+    // What was picked before starts picked, as faces.
+    pick_ = Pick::Face;
+    selected_.clear();
+    for (const collision::PolygonRef& ref : collisionSelected_)
+        for (size_t f = 0; f < facePolygon_.size(); ++f)
+            if (collisionRefs_[facePolygon_[f]] == ref) selected_.insert((u32)f);
+    if (selected_.empty()) pick_ = Pick::Vertex;
+    UpdateOverlay();
+    Status(Format(L"Editing the collision around the camera: %zu polygons. 1/2/3 vertices/edges/faces, drag a box, "
+                  L"E extrudes, F fills, Tab finishes.", collisionRefs_.size()));
+    return true;
+}
+
+// The camera went on: the collision around it is gathered again, and what
+// was picked stays picked where it still is.
+void MeshTools::CatchUp() {
+    if (!active_ || !collision_ || dragging_) return;
+    if (areaMode_) FollowCamera(true);
+    else ReadCollision();
+    if (Collision()) collisionUndone_ = Collision()->Editor().StepsUndone();
+    UpdateOverlay();
+}
+
+void MeshTools::FollowCamera(bool force) {
+    if (!active_ || !collision_ || !areaMode_ || dragging_ || boxPending_) return;
+    const Vec3 eye = host_.viewport->GetCamera().Position();
+    const float dx = eye.x - areaCentre_.x, dy = eye.y - areaCentre_.y;
+    if (!force && dx * dx + dy * dy < (kAreaRadius * 0.5f) * (kAreaRadius * 0.5f)) return;
+    nfs::World* world = World();
+    CollisionTools* tools = Collision();
+    if (!world || !tools) return;
+    // The picked items, by where their corners are.
+    std::vector<std::vector<Vec3>> picked;
+    for (u32 item : selected_) {
+        std::vector<Vec3> corners;
+        if (pick_ == Pick::Vertex && item < weldVertices_.size()) corners = { WeldPosition(item) };
+        else if (pick_ == Pick::Edge && item < edges_.size())
+            corners = { WeldPosition(edges_[item].first), WeldPosition(edges_[item].second) };
+        else if (pick_ == Pick::Face && item < faces_.size())
+            corners = { WeldPosition(faces_[item][0]), WeldPosition(faces_[item][1]), WeldPosition(faces_[item][2]) };
+        if (!corners.empty()) picked.push_back(std::move(corners));
+    }
+    const Pick mode = pick_;
+    std::vector<collision::PolygonRef> keep;   // polygons with a picked corner stay in
+    for (size_t p = 0; p < collisionPoints_.size(); ++p)
+        for (const auto& corners : picked)
+            for (const Vec3& c : corners)
+                if (Length(world_[p] - c) < 1e-3f) keep.push_back(collisionRefs_[collisionPoints_[p].polygon]);
+
+    if (!force) areaCentre_ = eye;
+    std::vector<collision::PolygonRef> all = keep;
+    const float r2 = kAreaRadius * kAreaRadius;
+    for (u32 s = 0; s < (u32)world->Loaded().size(); ++s) {
+        const auto& packs = world->Loaded()[s]->collision;
+        for (u32 p = 0; p < (u32)packs.size(); ++p)
+            for (u32 i = 0; i < (u32)packs[p].polygons.size(); ++i) {
+                const nfs::CollisionPolygon& polygon = packs[p].polygons[i];
+                if (!showRaceGroupsInEdit_ && polygon.raceGroup != 0) continue;
+                for (const Vec3& c : polygon.corners) {
+                    const float ex = c.x - areaCentre_.x, ey = c.y - areaCentre_.y;
+                    if (ex * ex + ey * ey <= r2) { all.push_back({ s, p, i }); break; }
+                }
+            }
+    }
+    if (!BuildCollision(std::move(all))) return;
+    pick_ = mode;
+    selected_.clear();
+    const auto at = [&](const Vec3& c) -> long {
+        for (size_t w = 0; w < weldVertices_.size(); ++w)
+            if (Length(WeldPosition((u32)w) - c) < 1e-3f) return (long)w;
+        return -1;
+    };
+    for (const auto& corners : picked) {
+        std::vector<long> w;
+        for (const Vec3& c : corners) w.push_back(at(c));
+        if (std::find(w.begin(), w.end(), -1L) != w.end()) continue;
+        if (mode == Pick::Vertex) selected_.insert((u32)w[0]);
+        else if (mode == Pick::Edge) {
+            const std::pair<u32, u32> e{ (u32)std::min(w[0], w[1]), (u32)std::max(w[0], w[1]) };
+            const auto found = std::lower_bound(edges_.begin(), edges_.end(), e);
+            if (found != edges_.end() && *found == e) selected_.insert((u32)(found - edges_.begin()));
+        } else {
+            for (size_t f = 0; f < faces_.size(); ++f) {
+                std::array<u32, 3> a = faces_[f], b{ (u32)w[0], (u32)w[1], (u32)w[2] };
+                std::sort(a.begin(), a.end());
+                std::sort(b.begin(), b.end());
+                if (a == b) selected_.insert((u32)f);
+            }
+        }
+    }
+    UpdateOverlay();
+}
+
 bool MeshTools::BuildCollision(std::vector<collision::PolygonRef> seed) {
     CollisionTools* tools = Collision();
     if (!tools) return false;
@@ -1266,8 +1804,12 @@ bool MeshTools::BuildCollision(std::vector<collision::PolygonRef> seed) {
         const auto known = before.find({ all[i].section, all[i].pack, all[i].polygon });
         collisionStart_.push_back(known != before.end() ? known->second : polygon);
         if (polygon.barrier) {
-            collisionPoints_.push_back({ i, 0x3, true });
-            collisionPoints_.push_back({ i, 0xC, true });
+            // Drawn as a wall: foot and top at each end. Both of an end move
+            // where it stands; the height is the view's, not the game's.
+            collisionPoints_.push_back({ i, 0x3, true, 0 });
+            collisionPoints_.push_back({ i, 0x3, true, 1 });
+            collisionPoints_.push_back({ i, 0xC, true, 2 });
+            collisionPoints_.push_back({ i, 0xC, true, 3 });
         } else if (polygon.quad) {
             for (int k = 0; k < 4; ++k) collisionPoints_.push_back({ i, (u8)(1 << k), false });
         } else {
@@ -1313,10 +1855,8 @@ bool MeshTools::BuildCollision(std::vector<collision::PolygonRef> seed) {
         std::vector<u32> w;
         for (size_t k = p; k < end; ++k) w.push_back(weldOf_[k]);
         for (size_t k = 0; k < w.size(); ++k) edge(w[k], w[(k + 1) % w.size()]);
-        if (!collisionPoints_[p].barrier) {
-            if (w.size() >= 3) face(w[0], w[1], w[2], polygon);
-            if (w.size() == 4) face(w[0], w[2], w[3], polygon);
-        }
+        if (w.size() >= 3) face(w[0], w[1], w[2], polygon);
+        if (w.size() == 4) face(w[0], w[2], w[3], polygon);
         p = end;
     }
     edges_.assign(edgeSet.begin(), edgeSet.end());
@@ -1357,11 +1897,10 @@ void MeshTools::ReadCollision() {
         int slot = 0;
         while (slot < 3 && !(point.slots & (1 << slot))) ++slot;
         if (point.barrier) {
-            // Only where it stands is stored; the dot sits half way up the wall.
+            // Only where it stands is stored; the points are the wall drawn.
             Vec3 quad[4];
             editor.BarrierQuad(ref, quad);
-            const int lo = slot < 2 ? 0 : 3, hi = slot < 2 ? 1 : 2;
-            world_[i] = { polygon->corners[slot].x, polygon->corners[slot].y, (quad[lo].z + quad[hi].z) * 0.5f };
+            world_[i] = quad[point.quadCorner & 3];
         } else {
             world_[i] = polygon->corners[slot];
         }
@@ -1384,15 +1923,28 @@ void MeshTools::PushCollision() {
             have[point.polygon] = 1;
         }
         nfs::CollisionPolygon& shape = shapes[point.polygon];
-        for (int slot = 0; slot < 4; ++slot) {
-            if (!(point.slots & (1 << slot))) continue;
-            if (point.barrier) {
-                shape.corners[slot].x = world_[i].x;
-                shape.corners[slot].y = world_[i].y;
-            } else {
-                shape.corners[slot] = world_[i];
-            }
+        if (point.barrier) {
+            // An end has a foot and a top: the one that moved further from
+            // where the drag began says where the end now stands.
+            const std::vector<Vec3>& from = !dragStart_.empty() ? dragStart_ : original_;
+            const auto moved = [&](size_t k) {
+                if (k >= from.size()) return 0.0f;
+                const float dx = world_[k].x - from[k].x, dy = world_[k].y - from[k].y;
+                return dx * dx + dy * dy;
+            };
+            const size_t other = point.quadCorner == 0 || point.quadCorner == 2 ? i + 1 : i - 1;
+            if (other < collisionPoints_.size() && collisionPoints_[other].polygon == point.polygon &&
+                moved(other) > moved(i))
+                continue;   // its partner speaks for this end
+            for (int slot = 0; slot < 4; ++slot)
+                if (point.slots & (1 << slot)) {
+                    shape.corners[slot].x = world_[i].x;
+                    shape.corners[slot].y = world_[i].y;
+                }
+            continue;
         }
+        for (int slot = 0; slot < 4; ++slot)
+            if (point.slots & (1 << slot)) shape.corners[slot] = world_[i];
     }
     for (size_t p = 0; p < shapes.size(); ++p)
         if (have[p]) editor.SetShape(collisionRefs_[p], shapes[p]);
@@ -1413,6 +1965,7 @@ void MeshTools::StopCollision(bool restore) {
     }
     active_ = false;
     collision_ = false;
+    areaMode_ = false;
     dragging_ = false;
     selected_.clear();
     collisionPoints_.clear();
@@ -1534,9 +2087,210 @@ void MeshTools::ExtrudeCollision() {
     LOG_INFO("collision edit: extruded %zu edges into %zu polygons (copies included)", pieces.size(), added.size());
 }
 
+bool MeshTools::AddToSession(const std::vector<nfs::CollisionPolygon>& polygons, const std::wstring& label) {
+    CollisionTools* tools = Collision();
+    if (!tools || polygons.empty()) return false;
+    collision::Editor& editor = tools->Editor();
+    const std::vector<collision::PolygonRef> added = editor.Add(polygons, label);
+    tools->RefreshAfterEdit();
+    if (added.empty()) {
+        Status(L"The new collision could not be stored: no section's collision lies there.");
+        return false;
+    }
+    collisionSteps_ = true;
+    std::vector<collision::PolygonRef> seed = collisionRefs_;
+    seed.insert(seed.end(), added.begin(), added.end());
+    const Pick keep = pick_;
+    if (!BuildCollision(seed)) return false;
+    pick_ = keep;
+    return true;
+}
+
+void MeshTools::FillCollision() {
+    CollisionTools* tools = Collision();
+    if (!active_ || !collision_ || !tools || dragging_) return;
+    collision::Editor& editor = tools->Editor();
+    if (editor.StepsUndone() != collisionUndone_) ReadCollision();
+
+    // What a weld stands for: a barrier's corner, or a corner of ground/wall,
+    // and the polygon it comes from (for the surface).
+    const auto barrierWeld = [&](u32 w) {
+        for (u32 v : weldVertices_[w]) if (collisionPoints_[v].barrier) return true;
+        return false;
+    };
+    const auto sourceOf = [&](u32 w) -> const nfs::CollisionPolygon* {
+        for (u32 v : weldVertices_[w])
+            if (const nfs::CollisionPolygon* p = editor.Polygon(collisionRefs_[collisionPoints_[v].polygon])) return p;
+        return nullptr;
+    };
+    const auto plan = [](const Vec3& a, const Vec3& b) {
+        const float dx = a.x - b.x, dy = a.y - b.y;
+        return std::sqrt(dx * dx + dy * dy);
+    };
+    const auto joinBarrier = [&](const Vec3& a, const Vec3& b, std::vector<nfs::CollisionPolygon>& out) {
+        if (plan(a, b) < 0.05f) return false;
+        collision::WallOptions options;
+        options.kind = collision::WallKind::Barrier;
+        options.bothSides = true;
+        collision::AppendWall({ a, b }, options, out);
+        return true;
+    };
+
+    std::vector<u32> welds;
+    std::vector<std::pair<u32, u32>> pickedEdges;
+    if (pick_ == Pick::Vertex) welds.assign(selected_.begin(), selected_.end());
+    else if (pick_ == Pick::Edge)
+        for (u32 e : selected_) if (e < edges_.size()) pickedEdges.push_back(edges_[e]);
+
+    std::vector<nfs::CollisionPolygon> polygons;
+    std::wstring what;
+    if (pickedEdges.size() == 2) {
+        auto [a0, a1] = pickedEdges[0];
+        auto [b0, b1] = pickedEdges[1];
+        const bool barrierA = barrierWeld(a0) && barrierWeld(a1), barrierB = barrierWeld(b0) && barrierWeld(b1);
+        if (barrierA && barrierB) {
+            // The two ends that face each other, in plan.
+            float best = 1e30f;
+            Vec3 from{}, to{};
+            for (u32 p : { a0, a1 })
+                for (u32 q : { b0, b1 }) {
+                    const float d = plan(WeldPosition(p), WeldPosition(q));
+                    if (d < best) { best = d; from = WeldPosition(p); to = WeldPosition(q); }
+                }
+            if (!joinBarrier(from, to, polygons)) { Status(L"Those barriers already meet."); return; }
+            what = L"barrier joining the two";
+        } else if (!barrierA && !barrierB) {
+            Vec3 A0 = WeldPosition(a0), A1 = WeldPosition(a1), B0 = WeldPosition(b0), B1 = WeldPosition(b1);
+            // Pair the ends so the face does not twist.
+            if (Length(A0 - B0) + Length(A1 - B1) > Length(A0 - B1) + Length(A1 - B0)) std::swap(B0, B1);
+            const Vec3 quad[4] = { A0, A1, B1, B0 };
+            const nfs::CollisionPolygon* source = sourceOf(a0);
+            polygons.push_back(collision::MakeGround(quad, 4, source ? source->surface : nfs::kSurfaceRoad));
+            what = polygons.back().Vertical() ? L"wall between the two edges" : L"face between the two edges";
+        } else {
+            Status(L"Fill: pick two edges of the same kind -- two of ground or walls, or two of barriers.");
+            return;
+        }
+    } else if (welds.size() == 2 && barrierWeld(welds[0]) && barrierWeld(welds[1])) {
+        if (!joinBarrier(WeldPosition(welds[0]), WeldPosition(welds[1]), polygons)) {
+            Status(L"Those barrier corners already meet.");
+            return;
+        }
+        what = L"barrier between the two corners";
+    } else if (welds.size() == 3 || welds.size() == 4) {
+        std::vector<Vec3> points;
+        for (u32 w : welds) points.push_back(WeldPosition(w));
+        // In order round their middle, seen from above -- or, standing up,
+        // along the wall and then down.
+        Vec3 centre{};
+        for (const Vec3& p : points) centre = centre + p;
+        centre = centre * (1.0f / (float)points.size());
+        float spanX = 0, spanY = 0;
+        for (const Vec3& p : points) { spanX = std::max(spanX, std::fabs(p.x - centre.x)); spanY = std::max(spanY, std::fabs(p.y - centre.y)); }
+        // Angle in plan; points that share a spot in plan (a wall) are told
+        // apart by height.
+        const float along = spanX >= spanY ? 1.0f : 0.0f;
+        std::sort(points.begin(), points.end(), [&](const Vec3& a, const Vec3& b) {
+            const float aa = std::atan2(a.y - centre.y, a.x - centre.x), ab = std::atan2(b.y - centre.y, b.x - centre.x);
+            if (std::fabs(aa - ab) > 1e-3f) return aa < ab;
+            return a.z < b.z;
+        });
+        // A wall seen from above is a line: order it along the line, up one
+        // end and down the other.
+        double area = 0;
+        for (size_t i = 0; i < points.size(); ++i) {
+            const Vec3& a = points[i];
+            const Vec3& b = points[(i + 1) % points.size()];
+            area += (double)a.x * b.y - (double)b.x * a.y;
+        }
+        if (std::fabs(area) < 1e-2 && points.size() == 4) {
+            std::sort(points.begin(), points.end(), [&](const Vec3& a, const Vec3& b) {
+                const float ka = along * a.x + (1 - along) * a.y, kb = along * b.x + (1 - along) * b.y;
+                return std::fabs(ka - kb) > 0.05f ? ka < kb : a.z < b.z;
+            });
+            // low-high at one end, high-low at the other
+            if (points[0].z > points[1].z) std::swap(points[0], points[1]);
+            if (points[2].z < points[3].z) std::swap(points[2], points[3]);
+        }
+        const nfs::CollisionPolygon* source = sourceOf(welds[0]);
+        polygons.push_back(collision::MakeGround(points.data(), (int)points.size(),
+                                                 source && !source->barrier ? source->surface : nfs::kSurfaceRoad));
+        what = polygons.back().Vertical() ? L"wall on the picked corners" : L"face on the picked corners";
+    } else {
+        Status(L"Fill (F): pick two edges, two barrier corners, or three or four vertices.");
+        return;
+    }
+
+    if (!AddToSession(polygons, L"Fill collision")) return;
+    // The new polygon picked, as a face (or, for a barrier, its edges).
+    selected_.clear();
+    if (polygons.front().barrier) {
+        pick_ = Pick::Edge;
+        const Vec3 a = polygons.front().corners[0], b = polygons.front().corners[2];
+        for (size_t e = 0; e < edges_.size(); ++e) {
+            const Vec3 p = WeldPosition(edges_[e].first), q = WeldPosition(edges_[e].second);
+            const bool onA = plan(p, a) < 0.05f || plan(q, a) < 0.05f, onB = plan(p, b) < 0.05f || plan(q, b) < 0.05f;
+            if (onA && onB) selected_.insert((u32)e);
+        }
+    } else {
+        pick_ = Pick::Face;
+        for (size_t f = 0; f < faces_.size(); ++f) {
+            bool all = true;
+            for (u32 w : faces_[f]) {
+                bool corner = false;
+                for (int c = 0; c < (polygons.front().quad ? 4 : 3); ++c)
+                    corner |= Length(WeldPosition(w) - polygons.front().corners[c]) < 0.05f;
+                all &= corner;
+            }
+            if (all) selected_.insert((u32)f);
+        }
+    }
+    UpdateOverlay();
+    if (host_.menuChecks) host_.menuChecks();
+    Status(L"Filled: " + what + L". Ctrl+Z takes it back.");
+    LOG_INFO("collision edit: filled, %zu polygons added", polygons.size());
+}
+
 bool MeshTools::DeleteSelection() {
     if (!active_) return false;
-    Status(L"The mesh editor moves vertices only; it does not delete them.");
+    if (!collision_) {
+        Status(L"The mesh editor moves vertices only; it does not delete them.");
+        return true;
+    }
+    CollisionTools* tools = Collision();
+    if (!tools || dragging_) return true;
+    if (tools->Editor().StepsUndone() != collisionUndone_) CatchUp();
+    // The polygons the picked faces are, or that use the picked edges or vertices.
+    std::vector<std::set<u32>> polygonsOf(weldVertices_.size());
+    for (size_t w = 0; w < weldVertices_.size(); ++w)
+        for (u32 v : weldVertices_[w]) polygonsOf[w].insert(collisionPoints_[v].polygon);
+    std::set<u32> going;
+    for (u32 item : selected_) {
+        if (pick_ == Pick::Vertex && item < weldVertices_.size()) {
+            going.insert(polygonsOf[item].begin(), polygonsOf[item].end());
+        } else if (pick_ == Pick::Edge && item < edges_.size()) {
+            for (u32 p : polygonsOf[edges_[item].first])
+                if (polygonsOf[edges_[item].second].count(p)) going.insert(p);
+        } else if (pick_ == Pick::Face && item < facePolygon_.size()) {
+            going.insert(facePolygon_[item]);
+        }
+    }
+    if (going.empty()) {
+        Status(L"Pick the faces (3), edges (2) or vertices (1) of the collision to delete, then Del.");
+        return true;
+    }
+    std::vector<collision::PolygonRef> refs;
+    for (u32 p : going) refs.push_back(collisionRefs_[p]);
+    const size_t removed = tools->Editor().Remove(refs);   // copies in other sections too
+    tools->RefreshAfterEdit();
+    collisionSteps_ = true;
+    selected_.clear();
+    areaMode_ = true;
+    FollowCamera(true);
+    collisionUndone_ = tools->Editor().StepsUndone();
+    UpdateOverlay();
+    Status(Format(L"%zu collision polygons deleted (copies included). Ctrl+Z puts them back.", removed));
+    LOG_INFO("collision edit: %zu polygons deleted", removed);
     return true;
 }
 

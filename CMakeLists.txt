@@ -64,6 +64,8 @@ add_executable(FRSWorldEditor WIN32
     src/ui/EditsPanel.cpp
     src/ui/EmbeddedGame.cpp
     src/ui/CrashReport.cpp
+    src/ui/HiddenItems.cpp
+    src/ui/ZoneTools.cpp
     src/ui/MainWindow.cpp
     src/ui/MainWindowShell.cpp
     src/ui/OnlineLibrary.cpp
@@ -140,6 +142,9 @@ target_link_libraries(FRSWorldEditor PRIVATE
 if(MSVC)
     target_compile_options(FRSWorldEditor PRIVATE /W4 /permissive- /Zc:preprocessor /utf-8)
     target_link_options(FRSWorldEditor PRIVATE /SUBSYSTEM:WINDOWS)
+    # Symbols beside the Release build too, so a crash dump says where it died.
+    target_compile_options(FRSWorldEditor PRIVATE $<$<CONFIG:Release>:/Zi>)
+    target_link_options(FRSWorldEditor PRIVATE $<$<CONFIG:Release>:/DEBUG /OPT:REF /OPT:ICF>)
     set_property(TARGET FRSWorldEditor PROPERTY MSVC_DEBUG_INFORMATION_FORMAT
                  "$<IF:$<CONFIG:Debug,RelWithDebInfo>,ProgramDatabase,>")
     # Enable the common-controls v6 manifest so the UI uses the modern theme.

@@ -88,6 +88,7 @@ bool CollisionMesh::Upload(IDirect3DDevice9* device, const nfs::LoadedSection& s
 
     for (const nfs::CollisionPack& pack : section.collision) {
         sectionNumber_ = pack.sectionNumber;
+        pack.ResolveBarriers();   // barrier heights, chain by chain
 
         for (const nfs::CollisionPolygon& polygon : pack.polygons) {
             ++polygonCount_;

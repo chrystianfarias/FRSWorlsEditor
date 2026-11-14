@@ -72,6 +72,16 @@ struct RoadProfile {
     float deckThickness = 1.2f;
     float pillarSpacing = 24.0f;
     float pillarWidth   = 1.8f;
+    int   pillarCount   = 0;      // side by side at each spacing; 0 picks by the deck's width
+    // A game model for the pillars instead of the square column: stood with
+    // its top under the deck, turned along the road, and when it is shorter
+    // than the drop the column carries on below it to the ground.
+    std::string pillarModel;
+    float pillarModelTurn = 0.0f;
+
+    // Where this road meets one with fewer lanes at a node, its extra lanes
+    // narrow away to nothing over this length before the node (a taper).
+    float taperLength = 60.0f;
     std::string deckTexture   = "ARC_CONCRETE_LIGHT2";
     std::string pillarTexture = "ARC_PILLARCONCRETE";
 
@@ -178,6 +188,15 @@ struct Segment {
     // How far the curve's handles reach from each end; 0 is automatic (a
     // third of the way). Their direction is the node's heading.
     float handleA = 0.0f, handleB = 0.0f;
+    // How high each handle stands over its node, when set by hand (the
+    // gizmo's Z): the road leaves the node climbing or falling that way, for
+    // ramps. Unset, the road rises evenly from one end to the other.
+    bool  liftSetA = false, liftSetB = false;
+    float liftA = 0.0f, liftB = 0.0f;
+    // The whole cross-section moved off the curve, to the right of the way
+    // the road was drawn: a lane gained or dropped on one side keeps the
+    // other side's edge in line with the road before it.
+    float shift = 0.0f;
 };
 
 // The cubic Bezier a segment follows.
@@ -239,7 +258,10 @@ struct MeshPiece {
 
 class Network {
 public:
-    void Clear() { nodes_.clear(); segments_.clear(); cuts_.clear(); gameJunctions_.clear(); nextId_ = 1; SetDirty(); }
+    void Clear() {
+        nodes_.clear(); segments_.clear(); cuts_.clear(); gameJunctions_.clear(); faceJunctions_.clear();
+        nextId_ = 1; SetDirty();
+    }
 
     const std::vector<Node>& Nodes() const { return nodes_; }
     const std::vector<Segment>& Segments() const { return segments_; }
@@ -292,6 +314,26 @@ public:
         return nullptr;
     }
     void AddGameJunction(const GameJunction& junction) { gameJunctions_.push_back(junction); SetDirty(); }
+
+    // Junctions made of the game's faces, chosen by hand (GameCut.h).
+    const std::vector<FaceJunction>& FaceJunctions() const { return faceJunctions_; }
+    void AddFaceJunction(const FaceJunction& junction) {
+        faceJunctions_.erase(std::remove_if(faceJunctions_.begin(), faceJunctions_.end(),
+                                            [&](const FaceJunction& j) { return j.node == junction.node; }),
+                             faceJunctions_.end());
+        faceJunctions_.push_back(junction);
+        SetDirty();
+    }
+    void RemoveFaceJunction(size_t index) {
+        if (index < faceJunctions_.size()) faceJunctions_.erase(faceJunctions_.begin() + (ptrdiff_t)index);
+        SetDirty();
+    }
+    // The surface a face junction lays, for `j` as it would be now (the
+    // preview); false when its node is not a road's end.
+    bool BuildFaceJunctionPiece(const FaceJunction& j, MeshPiece& piece) const;
+    // Which way a road's end at `node` points: from the road into what it
+    // meets. False when no road ends there.
+    bool EndDirection(u32 node, Vec3& into, const Segment*& segment) const;
     // The new road's width at a junction: (half kerb to kerb, sidewalk).
     void MouthOf(const GameJunction& junction, float& half, float& walk) const;
 
@@ -336,6 +378,10 @@ public:
     using GroundQuery = std::function<bool(float x, float y, float top, float& height)>;
     void SetGroundQuery(GroundQuery query) { ground_ = std::move(query); }
 
+    // A game model's bounds in its own space, for the pillars built of one.
+    using ModelBounds = std::function<bool(const std::string& model, Vec3& min, Vec3& max)>;
+    void SetModelBounds(ModelBounds query) { modelBounds_ = std::move(query); }
+
     // Save and load, as text.
     bool Save(const std::wstring& path) const;
     bool Load(const std::wstring& path);
@@ -351,7 +397,9 @@ private:
     std::vector<Segment> segments_;
     std::vector<GameCut> cuts_;
     std::vector<GameJunction> gameJunctions_;
+    std::vector<FaceJunction> faceJunctions_;
     GroundQuery ground_;
+    ModelBounds modelBounds_;
     std::shared_ptr<const LightSources> light_;
     u32 nextId_ = 1;
     bool dirty_ = true;

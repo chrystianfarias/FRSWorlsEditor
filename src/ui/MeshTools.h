@@ -29,6 +29,11 @@ struct MeshToolsHost {
     int undoCommand = 0;                  // the editor's Ctrl+Z command
     // The collision tools: their editor, undo history and redraw.
     std::function<class CollisionTools*()> collision;
+    // Another edit mode that takes Tab first when it has something picked
+    // (a visibility zone's corners): start it, whether it is on, end it.
+    std::function<bool()> otherBegin;
+    std::function<bool()> otherActive;
+    std::function<void()> otherEnd;
 };
 
 // A small mesh editor for the object selected in the viewport: vertices,
@@ -80,6 +85,10 @@ public:
 
     // ---- ViewportTool
     bool MouseDown(int x, int y, WPARAM keys) override;
+    void MouseMove(int x, int y) override;
+    bool MouseUp(int x, int y, WPARAM keys) override;
+    // The box being dragged over the view, in its pixels, for the frame to draw.
+    bool BoxRect(int& left, int& top, int& right, int& bottom) const;
     bool KeyDown(WPARAM key, bool repeat) override;
     bool GizmoPivot(Vec3& pivot) override;
     void GizmoChanged(const Mat4& transform, bool done, bool keep) override;
@@ -97,6 +106,17 @@ private:
 
     bool Begin();
     bool BeginCollision();
+    // With the collision shown and nothing picked: all of it around the
+    // camera, gathered again as the camera moves on (the picked parts kept).
+    bool BeginCollisionArea();
+    void FollowCamera(bool force = false);
+    // After an undo or a delete the packs' polygons are not where the session
+    // had them: gathered again (the picked parts kept where they still are).
+    void CatchUp();
+    bool areaMode_ = false;
+    Vec3 areaCentre_{};
+    static constexpr float kAreaRadius = 90.0f;
+    bool showRaceGroupsInEdit_ = false;   // race-only barriers stay out, as the view hides them
     // The edit session over these polygons (copies added): points, welds,
     // edges and faces. A polygon already in the session keeps its starting
     // shape, for Discard.
@@ -104,6 +124,13 @@ private:
     // E: each picked edge grows a new face, its far edge 2 m outward (up, for
     // the top of a wall) and picked, ready for the gizmo.
     void ExtrudeCollision();
+    // F: fills between what is picked -- two edges become a face (ground,
+    // or a wall when it stands up), two barrier edges or two barrier corners
+    // a barrier joining them, three or four vertices a face.
+    void FillCollision();
+    // Puts new polygons in, makes them part of the session and picks the
+    // edges or faces at these spots. False when nothing could be stored.
+    bool AddToSession(const std::vector<nfs::CollisionPolygon>& polygons, const std::wstring& label);
     void Finish();                 // writes the edit
     void Stop(bool restore);       // leaves edit mode; `restore` puts the shape back
     void SetPickMode(Pick mode);
@@ -138,6 +165,12 @@ private:
     std::vector<std::vector<Vec3>> undo_;
     std::vector<u64> undoStamps_;      // one per undo_ step, from undo::NextStamp()
 
+    // Picking by area: a press over nothing starts it, a move of a few
+    // pixels makes it a box, the release takes what lies inside.
+    void SelectBox(int x0, int y0, int x1, int y1, bool add, bool subtract);
+    bool boxPending_ = false, boxActive_ = false, boxAdd_ = false, boxSubtract_ = false;
+    int  boxX0_ = 0, boxY0_ = 0, boxX1_ = 0, boxY1_ = 0;
+
     bool dragging_ = false;
     std::vector<Vec3> dragStart_;
     Vec3 pivotStart_{};
@@ -151,6 +184,7 @@ private:
         u32 polygon = 0;   // index into collisionRefs_
         u8  slots = 0;     // corners it sets, bit per slot
         bool barrier = false;
+        u8  quadCorner = 0;   // a barrier's: which corner of the wall it is drawn as (foot, top, top, foot)
     };
     class CollisionTools* Collision() const { return host_.collision ? host_.collision() : nullptr; }
     void ReadCollision();          // positions from the packs (after an undo)
