@@ -438,6 +438,7 @@ std::vector<u8> ZoneTools::CurrentBytes(u64 offset, u32 length) const {
 
 bool ZoneTools::WriteOutline(size_t index, const std::vector<Vec3>& ring, std::wstring& error) {
     nfs::World* world = World();
+    if (world && world->IsUnderground1()) { error = L"Need for Speed Underground regions are read-only for now: the editor can show and export them, but nothing it writes would reach the game."; return false; }
     const std::wstring folder = host_.modelsFolder ? host_.modelsFolder() : L"";
     if (!world || folder.empty() || index >= world->Visibility().Zones().size()) { error = L"no zone"; return false; }
     const auto& zone = world->Visibility().Zones()[index];
@@ -567,6 +568,7 @@ bool ZoneTools::ApplyProperties() {
 
 bool ZoneTools::WriteList(u32 zoneId, const std::vector<u32>& sections, std::wstring& error) {
     nfs::World* world = World();
+    if (world && world->IsUnderground1()) { error = L"Need for Speed Underground regions are read-only for now: the editor can show and export them, but nothing it writes would reach the game."; return false; }
     const std::wstring folder = host_.modelsFolder ? host_.modelsFolder() : L"";
     u64 offset = 0;
     u32 length = 0;

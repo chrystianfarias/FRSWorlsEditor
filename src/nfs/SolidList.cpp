@@ -16,6 +16,11 @@ constexpr size_t kHdrBoundsMin = 0x20;
 constexpr size_t kHdrBoundsMax = 0x30;
 constexpr size_t kHdrTransform = 0x40;  // 4x4 floats, row major, translation in row 3
 constexpr size_t kHdrName      = 0xA4;  // zero-terminated ASCII
+// Underground 1 (header version 0x13 in the low word -- the crowd's skinned
+// people carry 0x40 in the high one -- Underground 2's is 0x16) has the same
+// header sixteen bytes shorter before the name.
+constexpr u32    kHdrVersionU1 = 0x13;
+constexpr size_t kHdrNameU1    = 0x94;
 
 // --- Mesh descriptor, chunk 0x00134900 -------------------------------------
 constexpr size_t kDescNumMaterials = 0x10;
@@ -33,9 +38,11 @@ constexpr size_t kMatFirstIndex     = 0x34;
 constexpr size_t kMatStripFlags     = 0x38;
 
 // --- Vertex layouts --------------------------------------------------------
-// Only two strides occur across every shipped track stream.
+// Two strides occur across every shipped Underground 2 track stream.
 constexpr u32 kStridePositionColorUv       = 24;  // pos, color, uv
 constexpr u32 kStridePositionNormalColorUv = 36;  // pos, normal, color, uv
+// Underground 1's crowd: the 36-byte layout, then bone weights and indices.
+constexpr u32 kStrideSkinned               = 60;
 
 Vec3 ReadVec3(ByteSpan span, size_t offset) {
     return { span.read<float>(offset),
@@ -65,7 +72,7 @@ void ParseHeader(ByteSpan data, SolidObject& out) {
     out.bounds.min = ReadVec3(data, kHdrBoundsMin);
     out.bounds.max = ReadVec3(data, kHdrBoundsMax);
     out.transform  = ReadMat4(data, kHdrTransform);
-    out.name       = ReadName(data, kHdrName);
+    out.name       = ReadName(data, (out.version & 0xFFFFu) <= kHdrVersionU1 ? kHdrNameU1 : kHdrName);
     out.kind       = ClassifyObject(out.name);
 }
 
@@ -115,6 +122,7 @@ bool ParseVertices(ByteSpan data, u32 vertexCount, SolidObject& out) {
             hasNormal = false; colorOffset = 12; uvOffset = 16;
             break;
         case kStridePositionNormalColorUv:
+        case kStrideSkinned:
             hasNormal = true;  colorOffset = 24; uvOffset = 28;
             break;
         default:

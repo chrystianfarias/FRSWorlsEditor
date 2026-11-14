@@ -1,6 +1,7 @@
 #include "nfs/TextureDecode.h"
 
 #include <algorithm>
+#include <cstring>
 
 namespace nfs {
 
@@ -132,6 +133,8 @@ u32 TextureLevelSize(const Texture& texture, u32 level) {
     switch (texture.format) {
         case TextureFormat::Palettised8:
             return width * height;
+        case TextureFormat::Argb8888:
+            return width * height * 4;
         case TextureFormat::Dxt1:
             return std::max(1u, (width + 3) / 4) * std::max(1u, (height + 3) / 4) * 8;
         case TextureFormat::Dxt3:
@@ -162,6 +165,11 @@ bool DecodeTexture(const Texture& texture, u32 level,
     const u8* source = texture.pixels.data + offset;
     const size_t available = texture.pixels.size - offset;
 
+    if (texture.format == TextureFormat::Argb8888) {
+        // Already B, G, R, A in memory: the same order as the output.
+        std::memcpy(outPixels.data(), source, (size_t)outWidth * outHeight * 4);
+        return true;
+    }
     if (texture.format == TextureFormat::Palettised8)
         return DecodePalettised(source, available, texture.palette,
                                 outWidth, outHeight, outPixels);

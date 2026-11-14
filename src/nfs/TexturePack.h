@@ -20,6 +20,8 @@ enum class TextureFormat {
     // bays and pavements -- 3986 of the 27 987 material slots, which is every
     // street surface in the city.
     Palettised8,
+    // D3DFMT_A8R8G8B8, uncompressed: Underground 1's sky (TEX<n>TRACK.BIN).
+    Argb8888,
 };
 
 const char* ToString(TextureFormat format);

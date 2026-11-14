@@ -841,3 +841,25 @@ what the shipped table holds. The pack's own tables count as geometry.
 Everything else is copied from a texture of the same format that the game
 already loads. Those are values the game accepts for a texture of this kind,
 which is more than can be said for anything invented.
+
+## Need for Speed Underground (the first game)
+
+The editor reads Underground 1 regions too (read-only). Its chunks are
+Underground 2's with these differences:
+
+| | Underground 1 | Underground 2 |
+|---|---|---|
+| Layout file | none per region: one bundle per track, `TRACKS\TRACKB<n>.LZC` (JDLZ), over the region's shared `STREAM<region>.BUN` | `<region>.BUN` |
+| Which bundle | the one whose `0x00034108` {"--" size, region stream size, track part size} names this stream's size | -- |
+| Section table | `0x00034107` in the bundle, 56 bytes: tag[8], number (bit 16 = left out by this track), 0, type (0 "--", 1 region stream, 2 the track's own `STREAM<region>_<n>.BUN`), offset, size, size without texture data, byte sum, 5 x 0. No position | `0x00034110`, 80 bytes |
+| Visibility | same container `0x80034150`, children one id lower: `0x00034151` outlines (marker, u16 id, u16 count, up to 16 points, no box), `0x00034152` lists (as Underground 2's `0x00034153`). Zone id = section number | `0x00034152` / `0x00034153` |
+| Collision | one pack for the whole track in the bundle: `0x00034132` polygons (same 32-byte records; byte 0 is a query flag, 0), `0x00034130` quadtree, `0x00034131` cells, `0x00034133` indices, `0x00034134` bounds | a `0x80034130` pack per section |
+| SceneryInfo `0x00034102` | 72 bytes: u32 hash[6] (detail levels), i16 thresholds at `+0x18`, radius at `+0x44`; no name | 68 bytes with name |
+| Scenery instance `0x00034103` | 48 bytes: i16 bounds min/max (whole units), u16 info `+0x0C`, flags `+0x0E`, float position `+0x10`, i16 rotation[9] `+0x1C` | 64 bytes |
+| Solid header `0x00134011` | version `0x13` in the low word (crowd: `0x400013`), name at `+0x94` | `0x16`, name at `+0xA4` |
+| Vertices | 24 (pos, colour, uv); the crowd's skinned people 60 (36-byte layout + bone weights) | 24 / 36 |
+| Textures | also D3DFMT_A8R8G8B8 (format code 21) for the sky in `TEX<n>TRACK.BIN` | DXT, P8 |
+
+The editor gives each drivable section the centre of its zone as a position
+(a detail section `<letter>11..19` takes `<letter>1..9`'s), and splits the
+track's collision by the zone that holds each polygon.

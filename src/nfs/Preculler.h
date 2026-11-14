@@ -22,7 +22,13 @@ namespace nfs {
 class Preculler {
 public:
     // Parses the visibility container out of an already-mapped L4Rx.BUN.
-    bool Parse(ByteSpan bunFile);
+    //
+    // Underground 1 has the same container in its track bundle with the
+    // children one id lower: 0x00034151 the outlines (fixed 0x84-byte bodies:
+    // u16 id, u16 point count, then up to 16 points with no bounding box
+    // before them) and 0x00034152 the lists, laid out as Underground 2's. Its
+    // zone ids are the section numbers of the drivable sections.
+    bool Parse(ByteSpan bunFile, bool underground1 = false);
 
     bool IsEmpty() const { return zones_.empty(); }
 

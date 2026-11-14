@@ -47,7 +47,11 @@ struct Scenery {
     }
 };
 
-// Parses one 0x80034100 scenery chunk.
-bool ParseScenery(const Chunk& sceneryChunk, Scenery& out);
+// Parses one 0x80034100 scenery chunk. Underground 1 stores the same chunk
+// with smaller records: a 72-byte SceneryInfo without a name (the model's
+// hash for each of six detail levels), and 48-byte instances whose bounds are
+// whole units in i16. Its infos come out unnamed; World names them after the
+// model they place.
+bool ParseScenery(const Chunk& sceneryChunk, Scenery& out, bool underground1 = false);
 
 } // namespace nfs

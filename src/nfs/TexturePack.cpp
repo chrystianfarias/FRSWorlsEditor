@@ -44,6 +44,7 @@ TextureFormat FormatFromFourCc(u32 fourCc) {
         case 0x33545844: return TextureFormat::Dxt3;  // "DXT3"
         case 0x35545844: return TextureFormat::Dxt5;  // "DXT5"
         case 41:         return TextureFormat::Palettised8;  // D3DFMT_P8
+        case 21:         return TextureFormat::Argb8888;     // D3DFMT_A8R8G8B8
         default:         return TextureFormat::Unknown;
     }
 }
@@ -63,6 +64,7 @@ const char* ToString(TextureFormat format) {
         case TextureFormat::Dxt3: return "DXT3";
         case TextureFormat::Dxt5: return "DXT5";
         case TextureFormat::Palettised8: return "P8";
+        case TextureFormat::Argb8888: return "A8R8G8B8";
         default:                  return "unknown";
     }
 }

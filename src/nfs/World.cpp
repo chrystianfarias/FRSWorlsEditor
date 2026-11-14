@@ -1,6 +1,7 @@
 #include "nfs/World.h"
 
 #include "io/MeshOverlay.h"
+#include "nfs/Jdlz.h"
 
 #include "core/Log.h"
 
@@ -74,6 +75,8 @@ std::vector<std::wstring> World::AvailableRegions(const std::wstring& tracksDire
     do {
         std::wstring name = find.cFileName;               // STREAML4RA.BUN
         if (name.size() <= 10) continue;
+        // Underground 1's per-track parts, STREAML1RA_1001.BUN, are not regions.
+        if (name.find(L'_') != std::wstring::npos) continue;
         name = name.substr(6, name.size() - 6 - 4);       // L4RA
         regions.push_back(name);
     } while (::FindNextFileW(handle, &find));
@@ -85,6 +88,10 @@ std::vector<std::wstring> World::AvailableRegions(const std::wstring& tracksDire
 
 bool World::Open(const std::wstring& tracksDirectory, const std::wstring& region) {
     Close();
+
+    // No layout file named after the region: Underground 1.
+    if (::GetFileAttributesW((tracksDirectory + L"\\" + region + L".BUN").c_str()) == INVALID_FILE_ATTRIBUTES)
+        return OpenUnderground1(tracksDirectory, region);
 
     if (!layout_.Open(tracksDirectory + L"\\" + region + L".BUN"))
         return false;
@@ -177,7 +184,7 @@ std::vector<size_t> World::SectionsLoadedThroughout(const std::vector<Vec3>& poi
 // first one "NONE". Read from the top level of the layout file.
 void World::ReadRaceBarrierGroups() {
     raceGroups_.clear();
-    ChunkReader reader(layout_.Span(), 0);
+    ChunkReader reader(LayoutSpan(), 0);
     Chunk chunk;
     while (reader.Next(chunk)) {
         if (chunk.id != kChunkRaceBarrierGroups) continue;
@@ -231,6 +238,11 @@ void World::Close() {
     textureAnimations_.clear();
     objectAnimations_.Clear();
     layout_.Close();
+    layoutUnpacked_.clear();
+    layoutUnpacked_.shrink_to_fit();
+    trackCollision_.clear();
+    game_ = Game::Underground2;
+    trackNumber_ = 0;
     stream_.Close();
     globalPacks_.clear();
     globalFiles_.clear();
@@ -371,7 +383,7 @@ const LoadedSection* World::LoadSection(const Section& section) {
 
             Scenery& scenery = loadedSection->scenery;
             const size_t before = scenery.instances.size();
-            ParseScenery(chunk, scenery);
+            ParseScenery(chunk, scenery, IsUnderground1());
             for (size_t i = before; i < scenery.instances.size(); ++i)
                 scenery.instances[i].sceneryNumber = info.number;
 
@@ -416,6 +428,11 @@ const LoadedSection* World::LoadSection(const Section& section) {
         } else if (chunk.id == 0xB0300100u) {
             ReadTextureAnimations(chunk);
         }
+    }
+
+    if (IsUnderground1()) {
+        const auto found = trackCollision_.find(section.number);
+        if (found != trackCollision_.end()) loadedSection->collision.push_back(found->second);
     }
 
     if (loadedSection->solidLists.empty() && loadedSection->texturePacks.empty() &&
@@ -488,6 +505,11 @@ void World::LoadAllSections(void (*progress)(size_t, size_t, void*), void* userD
         LoadSection(sections[i]);
         if (progress) progress(i + 1, sections.size(), userData);
     }
+
+    // Underground 1's scenery names no models: name each after the model it
+    // places, now that every section's models are known.
+    if (IsUnderground1())
+        for (auto& section : loaded_) NameUnderground1Scenery(*section);
 
     size_t objects = 0, triangles = 0;
     for (const auto& section : loaded_) {
@@ -645,6 +667,11 @@ void World::OpenGlobalPacks(const std::wstring& tracksDirectory) {
     // the sky dome draws from those, which the game swaps with the weather.
     std::vector<std::wstring> paths;
     for (const wchar_t* name : { L"InGameCommon.bun", L"GLOBALB.BUN" }) paths.push_back(game + L"\\GLOBAL\\" + name);
+    // Underground 1: its in-game packs and the track's own (TEX<n>TRACK.BIN).
+    if (IsUnderground1()) {
+        for (const wchar_t* name : { L"INGAMEB.BUN", L"DYNTEX.BIN" }) paths.push_back(game + L"\\GLOBAL\\" + name);
+        paths.push_back(tracksDirectory + L"\\TEX" + std::to_wstring(trackNumber_) + L"TRACK.BIN");
+    }
     WIN32_FIND_DATAW found{};
     HANDLE search = ::FindFirstFileW((tracksDirectory + L"\\LOC*DYNTEX.BIN").c_str(), &found);
     if (search != INVALID_HANDLE_VALUE) {
@@ -669,6 +696,215 @@ void World::OpenGlobalPacks(const std::wstring& tracksDirectory) {
         LOG_INFO("global textures: %zu packs from %S", packs, path.c_str());
         globalFiles_.push_back(std::move(file));
     }
+}
+
+// ---------------------------------------------------------------------------
+// Underground 1
+// ---------------------------------------------------------------------------
+
+namespace {
+
+bool ReadWholeFile(const std::wstring& path, std::vector<u8>& out) {
+    HANDLE file = ::CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                                FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER size{};
+    bool ok = ::GetFileSizeEx(file, &size) && size.QuadPart > 0 && size.QuadPart < (1ll << 31);
+    if (ok) {
+        out.resize((size_t)size.QuadPart);
+        DWORD read = 0;
+        ok = ::ReadFile(file, out.data(), (DWORD)out.size(), &read, nullptr) && read == out.size();
+    }
+    ::CloseHandle(file);
+    return ok;
+}
+
+// TRACKB<n>.LZC unpacked; a bundle left unpacked is taken as it is.
+std::vector<u8> UnpackTrackBundle(const std::wstring& path) {
+    std::vector<u8> file;
+    if (!ReadWholeFile(path, file)) return {};
+    if (file.size() >= 4 && std::memcmp(file.data(), "JDLZ", 4) == 0)
+        return JdlzDecompress(ByteSpan{ file.data(), file.size() });
+    return file;
+}
+
+ByteSpan TopLevelChunk(ByteSpan file, u32 id) {
+    ChunkReader reader(file, 0);
+    Chunk chunk;
+    while (reader.Next(chunk))
+        if (chunk.id == id) return chunk.data;
+    return {};
+}
+
+constexpr u32 kChunkStreamSizesU1    = 0x00034108;   // {"--" size, region stream size, track part size}
+constexpr u32 kChunkTrackCollisionU1 = 0x00034132;   // the whole track's collision polygons
+
+std::vector<u32> TrackNumbersIn(const std::wstring& pattern, size_t digitsFrom) {
+    std::vector<u32> numbers;
+    WIN32_FIND_DATAW find{};
+    HANDLE handle = ::FindFirstFileW(pattern.c_str(), &find);
+    if (handle == INVALID_HANDLE_VALUE) return numbers;
+    do {
+        const std::wstring name = find.cFileName;
+        if (name.size() <= digitsFrom || !iswdigit(name[digitsFrom])) continue;
+        numbers.push_back((u32)std::wcstoul(name.c_str() + digitsFrom, nullptr, 10));
+    } while (::FindNextFileW(handle, &find));
+    ::FindClose(handle);
+    std::sort(numbers.begin(), numbers.end());
+    numbers.erase(std::unique(numbers.begin(), numbers.end()), numbers.end());
+    return numbers;
+}
+
+} // namespace
+
+// Every track of a region has its own bundle over the region's one stream.
+// The bundle to open is one whose stream sizes (0x00034108) name this stream:
+// tried first are the tracks the region lists a part file for
+// (STREAM<region>_<n>.BUN), an empty part -- a track with nothing of its own
+// -- before the rest; then any other bundle, those whose number starts with
+// the region's digit (L4RA -> 4xxx) first.
+bool World::OpenUnderground1(const std::wstring& tracksDirectory, const std::wstring& region) {
+    if (!stream_.Open(tracksDirectory + L"\\STREAM" + region + L".BUN")) return false;
+
+    const std::vector<u32> parts =
+        TrackNumbersIn(tracksDirectory + L"\\STREAM" + region + L"_*.BUN", 6 + region.size() + 1);
+    const std::vector<u32> bundles = TrackNumbersIn(tracksDirectory + L"\\TRACKB*.LZC", 6);
+
+    std::vector<u32> empty, full;
+    for (u32 number : parts) {
+        WIN32_FILE_ATTRIBUTE_DATA data{};
+        const std::wstring part =
+            tracksDirectory + L"\\STREAM" + region + L"_" + std::to_wstring(number) + L".BUN";
+        if (!::GetFileAttributesExW(part.c_str(), GetFileExInfoStandard, &data)) continue;
+        (data.nFileSizeLow == 0 && data.nFileSizeHigh == 0 ? empty : full).push_back(number);
+    }
+    const wchar_t digit = region.size() > 1 ? region[1] : L'?';
+    std::vector<u32> sameDigit, otherDigit;
+    for (u32 number : bundles) {
+        if (std::find(parts.begin(), parts.end(), number) != parts.end()) continue;
+        (std::to_wstring(number)[0] == digit ? sameDigit : otherDigit).push_back(number);
+    }
+    std::vector<u32> order;
+    for (const auto* list : { &empty, &full, &sameDigit, &otherDigit })
+        order.insert(order.end(), list->begin(), list->end());
+
+    for (u32 number : order) {
+        const std::wstring path = tracksDirectory + L"\\TRACKB" + std::to_wstring(number) + L".LZC";
+        std::vector<u8> unpacked = UnpackTrackBundle(path);
+        if (unpacked.empty()) continue;
+        const ByteSpan sizes = TopLevelChunk(ByteSpan{ unpacked.data(), unpacked.size() }, kChunkStreamSizesU1);
+        if (sizes.size < 8 || sizes.read<u32>(4) != stream_.Size()) continue;
+        layoutUnpacked_ = std::move(unpacked);
+        trackNumber_ = number;
+        break;
+    }
+    if (layoutUnpacked_.empty()) {
+        LOG_ERROR("Underground 1 region %S: no TRACKB<n>.LZC describes STREAM%S.BUN", region.c_str(),
+                  region.c_str());
+        stream_.Close();
+        return false;
+    }
+    game_ = Game::Underground1;
+    LOG_INFO("Underground 1 region %S opened with track %u (%zu bytes unpacked)", region.c_str(), trackNumber_,
+             layoutUnpacked_.size());
+
+    const ByteSpan layout = LayoutSpan();
+    if (!table_.Parse(layout)) {
+        Close();
+        return false;
+    }
+    preculler_.Parse(layout, true);
+
+    // Positions: the outline of each drivable section's zone (zone id =
+    // section number); a detail section (<letter>11..19) sits on its
+    // drivable one's. Shared sections (W, X, Y, Z...) stay unpositioned, as
+    // the library they are.
+    std::unordered_map<u32, Vec3> centres;
+    for (const Preculler::Zone& zone : preculler_.Zones()) {
+        Vec3 sum{};
+        for (const Vec3& p : zone.ring) sum += p;
+        centres[zone.id] = sum * (1.0f / (float)zone.ring.size());
+    }
+    for (size_t i = 0; i < table_.Sections().size(); ++i) {
+        const u32 number = table_.Sections()[i].number;
+        auto found = centres.find(number);
+        if (found == centres.end() && number % 100 >= 11 && number % 100 <= 19) found = centres.find(number - 10);
+        if (found != centres.end()) table_.SetPosition(i, found->second);
+    }
+
+    SplitTrackCollision();
+    OpenGlobalPacks(tracksDirectory);
+    raceGroups_.clear();
+
+    region_ = region;
+    sectionToLoaded_.assign(table_.Sections().size(), -1);
+    return true;
+}
+
+// The track's collision is one list of polygons. The editor keeps collision
+// per section, so each polygon goes to the drivable section whose zone holds
+// its middle, or to the nearest zone's.
+void World::SplitTrackCollision() {
+    trackCollision_.clear();
+    const ByteSpan records = TopLevelChunk(LayoutSpan(), kChunkTrackCollisionU1);
+    std::vector<CollisionPolygon> polygons;
+    ParseCollisionPolygons(records, polygons);
+    if (polygons.empty()) return;
+
+    std::unordered_set<u32> numbers;
+    for (const Section& section : table_.Sections()) numbers.insert(section.number);
+    const auto& zones = preculler_.Zones();
+
+    size_t unplaced = 0;
+    for (const CollisionPolygon& polygon : polygons) {
+        float x = 0.0f, y = 0.0f;
+        for (const Vec3& c : polygon.corners) { x += c.x * 0.25f; y += c.y * 0.25f; }
+        int zone = preculler_.ZoneAt(x, y);
+        if (zone < 0 || !numbers.count(zones[(size_t)zone].id)) {
+            float best = 1e30f;
+            zone = -1;
+            for (size_t z = 0; z < zones.size(); ++z) {
+                if (!numbers.count(zones[z].id)) continue;
+                const float cx = (zones[z].boundsMin.x + zones[z].boundsMax.x) * 0.5f - x;
+                const float cy = (zones[z].boundsMin.y + zones[z].boundsMax.y) * 0.5f - y;
+                const float d = cx * cx + cy * cy;
+                if (d < best) { best = d; zone = (int)z; }
+            }
+        }
+        if (zone < 0) { ++unplaced; continue; }
+        const u32 number = zones[(size_t)zone].id;
+        CollisionPack& pack = trackCollision_[number];
+        pack.sectionNumber = number;
+        pack.polygons.push_back(polygon);
+    }
+
+    for (auto& [number, pack] : trackCollision_) {
+        Aabb ground;
+        for (const CollisionPolygon& polygon : pack.polygons)
+            if (!polygon.barrier)
+                for (const Vec3& c : polygon.corners) ground.Add(c);
+        pack.bounds = ground;
+        const float low  = ground.Valid() ? ground.min.z - CollisionPack::kBarrierBelow : -1.0f;
+        const float high = ground.Valid() ? ground.max.z + CollisionPack::kBarrierAbove : 3.0f;
+        for (const CollisionPolygon& polygon : pack.polygons)
+            if (polygon.barrier)
+                for (const Vec3& c : polygon.corners) {
+                    pack.bounds.Add({ c.x, c.y, low });
+                    pack.bounds.Add({ c.x, c.y, high });
+                }
+        pack.gridOrigin = { std::floor(pack.bounds.min.x / 32.0f) * 32.0f,
+                            std::floor(pack.bounds.min.y / 32.0f) * 32.0f, 0.0f };
+        pack.gridWidth  = (u16)std::ceil((pack.bounds.max.x - pack.gridOrigin.x) / 32.0f);
+        pack.gridHeight = (u16)std::ceil((pack.bounds.max.y - pack.gridOrigin.y) / 32.0f);
+    }
+    LOG_INFO("Underground 1 collision: %zu polygons over %zu sections (%zu with no zone)", polygons.size(),
+             trackCollision_.size(), unplaced);
+}
+
+void World::NameUnderground1Scenery(LoadedSection& section) const {
+    for (SceneryInfo& info : section.scenery.infos)
+        if (info.name.empty())
+            if (const SolidObject* model = FindModel(info.solidHash)) info.name = model->name;
 }
 
 } // namespace nfs
