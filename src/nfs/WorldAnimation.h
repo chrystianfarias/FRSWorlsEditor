@@ -44,13 +44,19 @@ struct WorldAnimationPlacement {
     Mat4   matrix;
     float  speed = 1.0f;
     float  loopDelay = 0.0f;   // seconds held at the end before it starts again
+    u32    key = 0;            // +0x20: what it answers to -- a garage door, its shop's zone hash
 };
 
 class WorldAnimations {
 public:
     // Reads every animated tree of a region's layout file.
     void Parse(ByteSpan layout);
-    void Clear() { trees_.clear(); placements_.clear(); }
+    void Clear() { trees_.clear(); placements_.clear(); shipped_ = 0; }
+
+    // Placements of the editor's own after the region's -- shown, never
+    // written: a preview of what an extension is about to put in the game.
+    // Each call replaces the last set.
+    void SetExtraPlacements(std::vector<WorldAnimationPlacement> extra);
 
     const std::vector<WorldAnimationTree>& Trees() const { return trees_; }
     const std::vector<WorldAnimationPlacement>& Placements() const { return placements_; }
@@ -61,6 +67,7 @@ public:
 private:
     std::vector<WorldAnimationTree>      trees_;
     std::vector<WorldAnimationPlacement> placements_;
+    size_t shipped_ = 0;   // the region's own, before any extra ones
 };
 
 } // namespace nfs

@@ -194,6 +194,10 @@ public:
 
     // The moving scenery of the layout file: doors, planes, cranes, trams.
     const WorldAnimations& ObjectAnimations() const { return objectAnimations_; }
+    // Moving scenery shown but not part of the region (WorldAnimations::SetExtraPlacements).
+    void SetPreviewAnimations(std::vector<WorldAnimationPlacement> extra) {
+        objectAnimations_.SetExtraPlacements(std::move(extra));
+    }
 
     // The race barrier groups the layout file names (chunk 0x3412F): byte 0
     // of a collision polygon indexes this list, entry 0 being "NONE". A group

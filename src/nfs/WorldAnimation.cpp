@@ -410,10 +410,18 @@ void WorldAnimations::Parse(ByteSpan layout) {
             if (!(placement.speed > 0.0f)) placement.speed = 1.0f;
             placement.loopDelay = std::max(0.0f, data.read<float>(at + 0x18));
             placement.matrix = ReadMatrix(data, at + 0x40);
+            placement.key = data.read<u32>(at + 0x20);
             placements_.push_back(placement);
         }
+    shipped_ = placements_.size();
     LOG_INFO("world animations: %zu trees, %zu placements, %zu tracks decoded, %zu not", trees_.size(),
              placements_.size(), decoded, failed);
+}
+
+void WorldAnimations::SetExtraPlacements(std::vector<WorldAnimationPlacement> extra) {
+    placements_.resize(shipped_);
+    for (WorldAnimationPlacement& placement : extra)
+        if (placement.tree < trees_.size()) placements_.push_back(placement);
 }
 
 void WorldAnimations::Pose(const WorldAnimationPlacement& placement, double seconds, std::vector<Mat4>& out) const {
