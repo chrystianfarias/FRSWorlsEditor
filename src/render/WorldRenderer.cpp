@@ -676,6 +676,11 @@ void WorldRenderer::Render(const Camera& camera) {
 
     if (showScenery_) DrawObjectAnimations(device, usingVisibility, eye, stats);
     DrawTranslucent(device, stats);
+    if (worldOnly_) {
+        // RenderWorldOnly: the world is done; nothing of the editor's goes into a reflection.
+        device->SetTexture(0, nullptr);
+        return;
+    }
     for (RenderExtension* extension : extensions_) extension->DrawWithWorld(device, *this);
     DrawSelection(device);
     if (showCollision_) DrawCollision(device, collisionVisible);
@@ -688,6 +693,19 @@ void WorldRenderer::Render(const Camera& camera) {
 
     stats.frameMilliseconds = (float)((SecondsNow() - start) * 1000.0);
     stats_ = stats;
+}
+
+void WorldRenderer::RenderWorldOnly(const Camera& camera) {
+    if (worldOnly_) return;   // never nested
+    // Render overwrites these for its own frame; the outer frame keeps going after this call.
+    const DWORD outerCull = cullMode_;
+    const bool outerStreaming = streaming_;
+    worldOnly_ = true;
+    streaming_ = false;       // the visible-set cache follows the main camera, not this one
+    Render(camera);
+    streaming_ = outerStreaming;
+    worldOnly_ = false;
+    cullMode_ = outerCull;
 }
 
 // ---------------------------------------------------------------------------

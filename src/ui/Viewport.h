@@ -144,6 +144,14 @@ public:
     // The panels drawn over the view (ui/ImGuiLayer.h): `draw` lays them out
     // once a frame, between the scene and the present.
     void SetUiCallback(std::function<void()> draw) { uiDraw_ = std::move(draw); }
+    // Runs at the start of every frame, before the camera moves and the view
+    // is drawn: what drives the camera itself (the test drive) does it here,
+    // so the picture shows this frame's pose rather than the last one's.
+    void SetFrameHook(std::function<void(float)> hook) { frameHook_ = std::move(hook); }
+    // Width and height of the view in pixels.
+    u32 ViewWidth() const { return context_.Width(); }
+    u32 ViewHeight() const { return context_.Height(); }
+    IDirect3DDevice9* Device() const { return context_.Device(); }
     // What takes the edges (menu, toolbar, status bar), before the panels.
     void SetUiBars(std::function<void()> bars) { uiBars_ = std::move(bars); }
     // A panel's text field has the keyboard: shortcuts leave it alone.
@@ -235,6 +243,7 @@ private:
     std::vector<ViewportTool*> tools_;
     ImGuiLayer ui_;
     std::function<void()> uiDraw_, uiBars_;
+    std::function<void(float)> frameHook_;
     bool inFrame_ = false;
     // FRS_CAPTURE=<file.bmp>: the frame, panels included, saved once the
     // region has been up a few seconds -- for checking the look without a

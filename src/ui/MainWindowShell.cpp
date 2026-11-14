@@ -79,7 +79,7 @@ const char* ToolbarIcon(const std::wstring& text) {
         { L"Show map", ICON_PH_MAP_TRIFOLD },       { L"Show game", ICON_PH_GAME_CONTROLLER },
         { L"Move", ICON_PH_ARROWS_OUT_CARDINAL },   { L"Rotate", ICON_PH_ARROW_CLOCKWISE },
         { L"Scale", ICON_PH_ARROWS_OUT },           { L"Road", ICON_PH_ROAD_HORIZON },
-        { L"Breaker", ICON_PH_STACK },
+        { L"Breaker", ICON_PH_STACK },          { L"Test drive", ICON_PH_STEERING_WHEEL },
     };
     for (const Pair& pair : kIcons)
         if (text.rfind(pair.text, 0) == 0) return pair.icon;

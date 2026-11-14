@@ -363,6 +363,7 @@ void Viewport::UpdateFlight(float deltaSeconds) {
 void Viewport::Tick(float deltaSeconds) {
     if (!context_.IsValid()) return;
 
+    if (frameHook_) frameHook_(deltaSeconds);
     UpdateFlight(deltaSeconds);
     UpdateCamera(deltaSeconds);
 

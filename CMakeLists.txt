@@ -106,6 +106,15 @@ add_executable(FRSWorldEditor WIN32
 
 target_include_directories(FRSWorldEditor PRIVATE src)
 
+# Test drive (src/drive): NFSU2's vehicle physics, collision, camera and car
+# models, ported from the bit-exact C# port (NFSU2Unity). Plain float
+# arithmetic must stay unfused there: /fp:precise, never /fp:fast.
+file(GLOB_RECURSE FRS_DRIVE_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/drive/*.cpp")
+target_sources(FRSWorldEditor PRIVATE ${FRS_DRIVE_SOURCES})
+if(MSVC)
+    set_source_files_properties(${FRS_DRIVE_SOURCES} PROPERTIES COMPILE_OPTIONS "/fp:precise")
+endif()
+
 # Extensions (src/ui/EditorExtension.h): a build with an extensions folder
 # beside this file -- FRS_EXTENSIONS_DIR, or ./private by default -- compiles
 # what its editor.cmake adds; this repository's own build has none.

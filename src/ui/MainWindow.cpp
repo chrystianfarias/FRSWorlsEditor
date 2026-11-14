@@ -6,6 +6,7 @@
 #include "ui/CollisionTools.h"
 #include "ui/CrashReport.h"
 #include "ui/MeshTools.h"
+#include "drive/DriveMode.h"
 #include "ui/HiddenItems.h"
 #include "ui/ZoneTools.h"
 #include "ui/OnlineLibrary.h"
@@ -749,6 +750,20 @@ void MainWindow::OnCreate() {
         auto tools = std::make_unique<CollisionTools>(std::move(host));
         collisionTools_ = tools.get();
         extensions_.push_back(std::move(tools));
+    }
+    // Test drive with the game's own physics (drive/DriveMode.h).
+    {
+        DriveModeHost host;
+        host.window = window_;
+        host.menu = menu_;
+        host.toolbar = toolbar_;
+        host.viewport = &viewport_;
+        host.world = [this] { return world_.get(); };
+        host.gameFolder = [this] { return gameFolder_; };
+        host.viewCentre = [this](Vec3& point) { return world_ && ViewCentrePoint(point); };
+        host.status = [this](const std::wstring& text) { SetStatusText(2, text); };
+        host.menuChecks = [this] { UpdateMenuChecks(); };
+        extensions_.push_back(std::make_unique<DriveMode>(std::move(host)));
     }
     for (auto& extension : extensions_) extension->OnCreate();
 

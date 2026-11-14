@@ -151,6 +151,18 @@ public:
 
     void Render(const Camera& camera);
 
+    // The world alone -- sky, sections, scenery, animated objects and blended
+    // surfaces; no extensions, selection, collision, tool overlays or gizmo --
+    // drawn from `camera` (usually an explicit view and projection) into the
+    // render target, depth buffer and viewport the caller has set. For
+    // reflections: the test drive's car environment map (drive/CarShader)
+    // calls it from inside its DrawWithWorld, so it is safe to call during
+    // Render, never recurses into the extensions, ignores streaming (the
+    // visible-set cache belongs to the main camera) and leaves the outer
+    // frame's cull mode and statistics as they were. The caller restores the
+    // device states it cares about (transforms, textures, render states).
+    void RenderWorldOnly(const Camera& camera);
+
     RenderMode Mode() const { return mode_; }
     void SetMode(RenderMode mode) { mode_ = mode; }
 
@@ -517,6 +529,7 @@ private:
     mutable bool             haveVisible_ = false;
     float      streamRadius_ = 400.0f;
     DWORD      cullMode_ = D3DCULL_CW;
+    bool       worldOnly_ = false;   // inside RenderWorldOnly: stop after the blended surfaces
 
     size_t      unresolvedInstances_ = 0;
     size_t      duplicateInstances_  = 0;
