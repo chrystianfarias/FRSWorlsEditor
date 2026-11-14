@@ -1,18 +1,26 @@
-<p align="center"><img src="docs/cover.png" alt="FRS World Editor: a map editor for Need for Speed Underground 2"></p>
+<p align="center"><img src="docs/cover.png" alt="FRS World Editor: a world editor for the Black Box Need for Speed games"></p>
 
 <p align="center">
   <a href="https://discord.gg/jTKwQXYQkb"><img src="https://img.shields.io/badge/Discord-join%20the%20community-5865F2?logo=discord&logoColor=white" alt="Discord"></a>
-  <a href="../../releases/latest"><img src="https://img.shields.io/github/v/release/chrystianfarias/FRSWorlsEditor?label=download" alt="Latest release"></a>
+  <a href="../../releases/latest"><img src="https://img.shields.io/github/v/release/chrystianfarias/FRSWorldEditor?label=download" alt="Latest release"></a>
 </p>
 
 # FRS World Editor
 
-A map editor for **Need for Speed Underground 2**, by Chrystian Farias.
+An open-source world editor for the **Black Box Need for Speed games** --
+Underground, Underground 2, Most Wanted, Carbon and ProStreet -- by
+Chrystian Farias.
 
-The editor reads the game's own `TRACKS` streams directly -- nothing is
-converted or imported first -- so what the viewport draws is what the game
-ships. What you change goes to `<game>\models`, never into the game's files,
-and a small ASI plugin puts it into the game as it loads.
+These games share one engine family and much of its file formats: track
+streams split into sections, chunked geometry and texture packs, collision
+packs, visibility zones, road and route graphs. The editor reads each game's
+own files directly -- nothing is converted or imported first -- so what the
+viewport draws is what the game ships. What you change goes to
+`<game>\models`, never into the game's files, and a small ASI plugin puts it
+into the game as it loads.
+
+**Need for Speed Underground 2 is supported today**; the other games are on
+the way, starting with Underground. The table below shows where each one is.
 
 **[Download the latest release](../../releases/latest)** -- unzip, run
 `FRSWorldEditor.exe`, and the setup does the rest.
@@ -21,11 +29,37 @@ Questions, bugs, ideas, or something you built: join the **[official Discord](ht
 
 If the editor helps you, you can [buy me a coffee](https://buymeacoffee.com/chrystianfarias).
 
-## What it does
+## Games
+
+✅ ready &nbsp; 🚧 in progress &nbsp; 🗓️ planned &nbsp; — not in that game
+
+| Feature | Underground | Underground 2 | Most Wanted | Carbon | ProStreet |
+| --- | :---: | :---: | :---: | :---: | :---: |
+| View the world as shipped (geometry, textures, scenery, lighting) | 🚧 | ✅ | 🗓️ | 🗓️ | 🗓️ |
+| Sky, animated textures, object animations | 🗓️ | ✅ | 🗓️ | 🗓️ | 🗓️ |
+| Place, move, copy and remove objects | 🗓️ | ✅ | 🗓️ | 🗓️ | 🗓️ |
+| Mesh editor and OBJ export / import | 🗓️ | ✅ | 🗓️ | 🗓️ | 🗓️ |
+| Edit in Blender, new objects | 🗓️ | ✅ | 🗓️ | 🗓️ | 🗓️ |
+| Collision: view, draw, edit, make from meshes | 🗓️ | ✅ | 🗓️ | 🗓️ | 🗓️ |
+| Roads: draw, junctions, bridges, bake into the game | 🗓️ | ✅ | 🗓️ | 🗓️ | 🗓️ |
+| Traffic and GPS routes for new roads | 🗓️ | ✅ | 🗓️ | 🗓️ | 🗓️ |
+| Terrain: new patches, sculpting, fitting to roads | 🗓️ | ✅ | 🗓️ | 🗓️ | 🗓️ |
+| Visibility zones: view and edit | 🗓️ | ✅ | 🗓️ | 🗓️ | 🗓️ |
+| Named zones and quick travel | — | ✅ | 🗓️ | 🗓️ | — |
+| Worlds: separate sets of edits, per-edit revert, undo | 🗓️ | ✅ | 🗓️ | 🗓️ | 🗓️ |
+| Game plugin: edits loaded into the running game | 🗓️ | ✅ | 🗓️ | 🗓️ | 🗓️ |
+| Launch the game into free roam at the camera | — | ✅ | 🗓️ | 🗓️ | — |
+
+Underground and ProStreet have no free roam: in those games the editor will
+launch into a race instead.
+
+## What it does (Underground 2)
 
 - **The whole city, as shipped.** Every region, its objects, scenery,
-  textures and baked night lighting, with a free-flight camera. Textured,
-  unlit, vertex-colour and wireframe views, collision overlay, texture browser.
+  textures and baked night lighting, with a free-flight camera, the skybox,
+  animated textures and the game's object animations (doors, planes, cranes,
+  trams). Textured, unlit, vertex-colour and wireframe views, collision
+  overlay, texture browser.
 - **Objects.** Place any model of the region from a catalogue with a picture of
   each, sorted into shelves (buildings, lights, signs, fences, trees, vehicles...),
   then move, rotate, snap to
@@ -62,6 +96,17 @@ If the editor helps you, you can [buy me a coffee](https://buymeacoffee.com/chry
 - **Launch game.** Starts the game straight into free roam, with your car on
   the street where the editor's camera is -- inside the editor's window when
   the game runs windowed.
+- **Roads.** Draw roads with Bézier nodes and junctions, with lanes,
+  sidewalks, walls, street lights and bridges, and join them to the game's
+  own roads. Ctrl+Shift+B bakes them into the game, with traffic and GPS
+  routes and collision; Ctrl+Z takes a bake back.
+- **Terrain.** New terrain patches, sculpting of the game's own ground, and
+  ground fitted under new roads.
+- **Visibility zones.** See the zones the game streams the city by, edit
+  their outlines and section lists in place, and load new pieces into the
+  zones around them.
+- **Hidden items.** H / Alt+H hides objects in the editor only, to work
+  behind them.
 
 ## Getting started
 
@@ -176,9 +221,9 @@ Created by **Chrystian Farias**.
   [nfsu2-re](https://github.com/yugecin/nfsu2-re) projects are useful
   references for the engine internals.
 
-Need for Speed and Need for Speed Underground 2 are trademarks of Electronic
-Arts. This is a fan project, not affiliated with or endorsed by EA; you need
-your own copy of the game.
+Need for Speed, Need for Speed Underground, Underground 2, Most Wanted,
+Carbon and ProStreet are trademarks of Electronic Arts. This is a fan project,
+not affiliated with or endorsed by EA; you need your own copy of each game.
 
 ## License
 
