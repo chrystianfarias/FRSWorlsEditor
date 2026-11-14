@@ -8,7 +8,10 @@
 #include <cstdlib>
 #include <fstream>
 #include <functional>
+#include <array>
 #include <map>
+#include <set>
+#include <tuple>
 #include <sstream>
 
 namespace roads {
@@ -160,8 +163,73 @@ struct StretchTaper {
     float wallSkip[2][2] = { { 0.0f, 0.0f }, { 0.0f, 0.0f } };
     float length = 60.0f;
     float total = 0.0f;
+    // How far from each end the median narrows away to nothing (0: it does
+    // not), where the road going on has none.
+    float medianClose[2] = { 0.0f, 0.0f };
+    // The same for the shoulders (both sides), where the road going on has none.
+    float shoulderClose[2][2] = { { 0.0f, 0.0f }, { 0.0f, 0.0f } };   // per end and side
     bool Any() const {
-        return lanes[0][0] || lanes[0][1] || lanes[1][0] || lanes[1][1] || slide[0] != 0.0f || slide[1] != 0.0f;
+        return lanes[0][0] || lanes[0][1] || lanes[1][0] || lanes[1][1] || slide[0] != 0.0f || slide[1] != 0.0f ||
+               medianClose[0] > 0.0f || medianClose[1] > 0.0f || shoulderClose[0][0] > 0.0f || shoulderClose[0][1] > 0.0f ||
+               shoulderClose[1][0] > 0.0f || shoulderClose[1][1] > 0.0f ||
+               walkClose[0][0] > 0.0f || walkClose[0][1] > 0.0f || walkClose[1][0] > 0.0f || walkClose[1][1] > 0.0f ||
+               laneStretch[0] != 0.0f || laneStretch[1] != 0.0f || outerStretch[0][0] != 0.0f ||
+               outerStretch[0][1] != 0.0f || outerStretch[1][0] != 0.0f || outerStretch[1][1] != 0.0f ||
+               walkSink[0][0] > 0.0f || walkSink[0][1] > 0.0f || walkSink[1][0] > 0.0f || walkSink[1][1] > 0.0f;
+    }
+    // And per end (A, B) and side (0 left, 1 right) the sidewalks and the
+    // walls, where the road going on has none on that side: the sidewalk
+    // narrows and sinks to the road, the wall lowers to nothing.
+    float walkClose[2][2] = { { 0.0f, 0.0f }, { 0.0f, 0.0f } };
+    float wallClose[2][2] = { { 0.0f, 0.0f }, { 0.0f, 0.0f } };
+    // What is left once everything above has closed: per end, how far the
+    // right kerb moves out (the outer lane or shoulder widening to meet the
+    // other road's), and per end and side how much wider the sidewalk gets.
+    float laneStretch[2] = { 0.0f, 0.0f };   // the outer right lane, per end
+    float outerStretch[2][2] = { { 0.0f, 0.0f }, { 0.0f, 0.0f } };   // shoulder, else sidewalk
+    // A sidewalk that stays as wide but sinks to the road, where the road
+    // going on has a shoulder there instead: it becomes the shoulder.
+    float walkSink[2][2] = { { 0.0f, 0.0f }, { 0.0f, 0.0f } };
+    static float Closing(float d, float reach) {
+        if (reach <= 0.0f) return 0.0f;
+        const float t = std::clamp(d / reach, 0.0f, 1.0f);
+        return 1.0f - t * t * (3.0f - 2.0f * t);
+    }
+    float ShoulderClosed(int side, float distance) const {
+        const int k = side > 0 ? 1 : 0;
+        return std::min(1.0f, Closing(distance, shoulderClose[0][k]) + Closing(total - distance, shoulderClose[1][k]));
+    }
+    float WalkClosed(int side, float distance) const {
+        const int k = side > 0 ? 1 : 0;
+        return std::min(1.0f, Closing(distance, walkClose[0][k]) + Closing(total - distance, walkClose[1][k]));
+    }
+    // How far down the sidewalk has come: narrowing away or sinking.
+    float WalkLow(int side, float distance) const {
+        const int k = side > 0 ? 1 : 0;
+        const float sunk = std::min(1.0f, Closing(distance, walkSink[0][k]) + Closing(total - distance, walkSink[1][k]));
+        return std::max(WalkClosed(side, distance), sunk);
+    }
+    float WallClosed(int side, float distance) const {
+        const int k = side > 0 ? 1 : 0;
+        return std::min(1.0f, Closing(distance, wallClose[0][k]) + Closing(total - distance, wallClose[1][k]));
+    }
+    // The shoulder's narrowing stretch nearest `distance`: v of the game's
+    // hatching that starts from nothing (RDP_ROADSTRIP_MA), 0 at the node.
+    bool InShoulderTaper(int side, float distance, float& v) const {
+        const int k = side > 0 ? 1 : 0;
+        const float a = shoulderClose[0][k], b = shoulderClose[1][k];
+        if (a > 0.0f && distance <= a + 1e-3f) { v = distance / a; return true; }
+        if (b > 0.0f && total - distance <= b + 1e-3f) { v = (total - distance) / b; return true; }
+        return false;
+    }
+    // How closed the median is at `distance`: 0 full width, 1 gone.
+    float MedianClosed(float distance) const {
+        const auto closed = [](float d, float reach) {
+            if (reach <= 0.0f) return 0.0f;
+            const float t = std::clamp(d / reach, 0.0f, 1.0f);
+            return 1.0f - t * t * (3.0f - 2.0f * t);
+        };
+        return std::min(1.0f, closed(distance, medianClose[0]) + closed(total - distance, medianClose[1]));
     }
     bool WallAt(int side, float from, float to) const {
         const int k = side > 0 ? 1 : 0;
@@ -187,14 +255,65 @@ void BuildStretch(const RoadProfile& p, const std::vector<Station>& stations, si
             region[side] = lane * (float)std::max(taper.lanes[0][side], taper.lanes[1][side]);
         }
         float out = x;
+        // A sidewalk narrowing away: what is beyond it closes in on the kerb.
+        if (p.sidewalkWidth > 0.01f) {
+            for (int side = -1; side <= 1; side += 2) {
+                if (!p.Walk(side)) continue;
+                const float c = taper.WalkClosed(side, distance);
+                const float beyond = x * side - half;
+                if (c > 0.0f && beyond > 0.0f) out -= std::min(beyond, p.sidewalkWidth) * c * side;
+            }
+        }
+        const float shoulderL = p.ShoulderAt(-1), shoulderR = p.ShoulderAt(1);
+        // The shoulders narrowing away: the edges close in on the lanes.
+        if (shoulderR > 0.01f) {
+            const float c = taper.ShoulderClosed(1, distance);
+            if (c > 0.0f && x > half - shoulderR) out -= std::min(x - (half - shoulderR), shoulderR) * c;
+        }
+        if (shoulderL > 0.01f) {
+            const float c = taper.ShoulderClosed(-1, distance);
+            if (c > 0.0f && x < -half + shoulderL) out += std::min(-half + shoulderL - x, shoulderL) * c;
+        }
+        // The leftover: the outer right lane widening (or narrowing), and on
+        // each side the shoulder -- or the sidewalk where there is none -- to
+        // meet the other road.
+        {
+            const float laneMore = taper.laneStretch[0] * (1.0f - wa) + taper.laneStretch[1] * (1.0f - wb);
+            if (laneMore != 0.0f) {
+                const float edge = half - shoulderR, from = edge - lane;
+                if (x >= edge) out += laneMore;
+                else if (x > from) out += laneMore * (x - from) / std::max(0.01f, lane);
+            }
+            for (int side = -1; side <= 1; side += 2) {
+                const int k = side > 0 ? 1 : 0;
+                const float more = taper.outerStretch[0][k] * (1.0f - wa) + taper.outerStretch[1][k] * (1.0f - wb);
+                if (more == 0.0f) continue;
+                const float shoulderHere = side > 0 ? shoulderR : shoulderL;
+                const float from = shoulderHere > 0.01f ? half - shoulderHere : half;
+                const float width = shoulderHere > 0.01f ? shoulderHere : (p.Walk(side) ? p.sidewalkWidth : 0.0f);
+                const float beyond = x * side - from;
+                if (width > 0.01f && beyond > 0.0f) out += more * std::min(1.0f, beyond / width) * side;
+            }
+        }
+        // The median narrowing away: the lanes either side close in on its
+        // middle, which stays where it is.
+        if (const float median = p.MedianWidth(); median > 0.01f) {
+            const float c = taper.MedianClosed(distance);
+            if (c > 0.0f) {
+                const float m0 = p.MedianLeft(), m1 = m0 + median, mid = (m0 + m1) * 0.5f;
+                if (x >= m1) out -= median * 0.5f * c;
+                else if (x <= m0) out += median * 0.5f * c;
+                else out = mid + (x - mid) * (1.0f - c);
+            }
+        }
         if (region[1] > 0.0f) {
-            const float from = half - region[1];
-            if (x >= half) out -= shrink[1];
+            const float from = half - shoulderR - region[1];
+            if (x >= half - shoulderR) out -= shrink[1];
             else if (x > from) out -= shrink[1] * (x - from) / region[1];
         }
         if (region[0] > 0.0f) {
-            const float from = -half + region[0];
-            if (x <= -half) out += shrink[0];
+            const float from = -half + shoulderL + region[0];
+            if (x <= -half + shoulderL) out += shrink[0];
             else if (x < from) out += shrink[0] * (from - x) / region[0];
         }
         return out + taper.slide[0] * (1.0f - wa) + taper.slide[1] * (1.0f - wb);
@@ -237,7 +356,7 @@ void BuildStretch(const RoadProfile& p, const std::vector<Station>& stations, si
     // Where a lane starts across the road: the backward lanes from the left
     // edge, then the median, then the forward lanes.
     const auto laneStart = [&](size_t k) {
-        return -half + lane * (float)k + ((int)k >= p.lanesBackward ? median : 0.0f);
+        return -half + p.ShoulderAt(-1) + lane * (float)k + ((int)k >= p.lanesBackward ? median : 0.0f);
     };
     // The median opens out before a junction: the road runs through.
     const auto medianOpen = [&](const Station& s0, const Station& s1) {
@@ -273,6 +392,40 @@ void BuildStretch(const RoadProfile& p, const std::vector<Station>& stations, si
                     Vertex(at(s1, x1, 0), up, u1, v1, color), Vertex(at(s1, x0, 0), up, u0, v1, color), up);
         }
 
+        // The shoulders: the lane texture across them from the lane's side,
+        // so a line there keeps its width.
+        if (p.AnyShoulder() && !crossing) {
+            // A road strip across its width; striped, the hatching starts
+            // from nothing where it narrows away (RDP_ROADSTRIP_MA).
+            for (int side = -1; side <= 1; side += 2) {
+                const float shoulder = p.ShoulderAt(side);
+                if (shoulder <= 0.01f) continue;
+                const float line = p.shoulderLine ? std::min(0.15f, shoulder * 0.3f) : 0.0f;
+                float t0 = 0.0f, t1 = 0.0f;
+                const bool tapering = p.shoulderType == 2 && p.shoulderTexture.empty() &&
+                                      taper.InShoulderTaper(side, s0.distance, t0) &&
+                                      taper.InShoulderTaper(side, s1.distance, t1);
+                MeshGroup& g = piece.Group(tapering ? std::string("RDP_ROADSTRIP_MA") : p.ShoulderTexture());
+                const float v0 = tapering ? t0 : s0.distance / p.textureLength;
+                const float v1 = tapering ? t1 : s1.distance / p.textureLength;
+                const float inner = (half - shoulder + line) * side, outer = half * side;
+                const float x0 = side < 0 ? outer : inner, x1 = side < 0 ? inner : outer;
+                const float u0 = side < 0 ? 1.0f : 0.0f, u1 = 1.0f - u0;
+                AddQuad(g, Vertex(at(s0, x0, 0), up, u0, v0, color), Vertex(at(s0, x1, 0), up, u1, v0, color),
+                        Vertex(at(s1, x1, 0), up, u1, v1, color), Vertex(at(s1, x0, 0), up, u0, v1, color), up);
+                if (line > 0.0f) {
+                    // The solid white line of the game's lane texture.
+                    MeshGroup& lg = piece.Group("RDP_LANEB_WS_AA_KT");
+                    const float a = (half - shoulder) * side, b = (half - shoulder + line) * side;
+                    const float la0 = side < 0 ? b : a, la1 = side < 0 ? a : b;
+                    const float lv0 = s0.distance / p.textureLength, lv1 = s1.distance / p.textureLength;
+                    AddQuad(lg, Vertex(at(s0, la0, 0), up, 0.03f, lv0, color), Vertex(at(s0, la1, 0), up, 0.10f, lv0, color),
+                            Vertex(at(s1, la1, 0), up, 0.10f, lv1, color), Vertex(at(s1, la0, 0), up, 0.03f, lv1, color),
+                            up);
+                }
+            }
+        }
+
         // The median.
         if (median > 0.01f && !crossing) {
             const float m0 = medianLeft, m1 = medianLeft + median;
@@ -284,20 +437,27 @@ void BuildStretch(const RoadProfile& p, const std::vector<Station>& stations, si
                 AddQuad(g, Vertex(at(s0, m0, 0), up, 0, v0, color), Vertex(at(s0, m1, 0), up, w, v0, color),
                         Vertex(at(s1, m1, 0), up, w, v1, color), Vertex(at(s1, m0, 0), up, 0, v1, color), up);
             } else {
-                // Raised: a top and a kerb or barrier face either side.
+                // Raised: a top and a kerb or barrier face either side --
+                // sinking into the road as it narrows away.
                 const float h = p.medianType == 4 ? std::max(0.3f, p.medianHeight) : p.medianHeight;
+                const float h0 = h * (1.0f - taper.MedianClosed(s0.distance));
+                const float h1 = h * (1.0f - taper.MedianClosed(s1.distance));
                 MeshGroup& g = piece.Group(p.MedianTexture());
                 const float topW = p.medianType == 4 ? std::min(0.3f, median * 0.5f) : median;
                 const float t0 = m0 + (median - topW) * 0.5f, t1 = t0 + topW;
-                AddQuad(g, Vertex(at(s0, t0, h), up, 0, v0, color), Vertex(at(s0, t1, h), up, 1, v0, color),
-                        Vertex(at(s1, t1, h), up, 1, v1, color), Vertex(at(s1, t0, h), up, 0, v1, color), up);
-                for (int side = -1; side <= 1; side += 2) {
-                    const float foot = side < 0 ? m0 : m1;
-                    const float top = side < 0 ? t0 : t1;
-                    const Vec3 n = s0.right * (float)side;
-                    const float uTop = p.medianType == 4 ? 1.0f : std::clamp(h / std::max(median, 0.01f), 0.0f, 1.0f);
-                    AddQuad(g, Vertex(at(s0, foot, 0), n, 0, v0, color), Vertex(at(s0, top, h), n, uTop, v0, color),
-                            Vertex(at(s1, top, h), n, uTop, v1, color), Vertex(at(s1, foot, 0), n, 0, v1, color), n);
+                if (h0 > 0.005f || h1 > 0.005f) {
+                    AddQuad(g, Vertex(at(s0, t0, h0), up, 0, v0, color), Vertex(at(s0, t1, h0), up, 1, v0, color),
+                            Vertex(at(s1, t1, h1), up, 1, v1, color), Vertex(at(s1, t0, h1), up, 0, v1, color), up);
+                    for (int side = -1; side <= 1; side += 2) {
+                        const float foot = side < 0 ? m0 : m1;
+                        const float top = side < 0 ? t0 : t1;
+                        const Vec3 n = s0.right * (float)side;
+                        const float uTop =
+                            p.medianType == 4 ? 1.0f : std::clamp(h / std::max(median, 0.01f), 0.0f, 1.0f);
+                        AddQuad(g, Vertex(at(s0, foot, 0), n, 0, v0, color), Vertex(at(s0, top, h0), n, uTop, v0, color),
+                                Vertex(at(s1, top, h1), n, uTop, v1, color), Vertex(at(s1, foot, 0), n, 0, v1, color),
+                                n);
+                    }
                 }
             }
         }
@@ -307,6 +467,10 @@ void BuildStretch(const RoadProfile& p, const std::vector<Station>& stations, si
             if (!p.Walk(side)) continue;
             MeshGroup& g = piece.Group(p.sidewalkTexture);
             const float h = p.sidewalkHeight;
+            // Sinking to the road where it narrows away.
+            const float h0 = h * (1.0f - taper.WalkLow(side, s0.distance));
+            const float h1 = h * (1.0f - taper.WalkLow(side, s1.distance));
+            if (taper.WalkClosed(side, s0.distance) > 0.999f && taper.WalkClosed(side, s1.distance) > 0.999f) continue;
             const float v0 = s0.distance / p.textureLength;
             const float v1 = s1.distance / p.textureLength;
             const float kerbU = std::clamp(h / std::max(p.sidewalkWidth, 0.01f), 0.0f, 1.0f);
@@ -314,12 +478,13 @@ void BuildStretch(const RoadProfile& p, const std::vector<Station>& stations, si
             const float outer = (half + p.sidewalkWidth) * side;
             const float uIn = side < 0 ? 1.0f : 0.0f;
             const float uOut = 1.0f - uIn;
-            AddQuad(g, Vertex(at(s0, inner, h), up, uIn, v0, color), Vertex(at(s0, outer, h), up, uOut, v0, color),
-                    Vertex(at(s1, outer, h), up, uOut, v1, color), Vertex(at(s1, inner, h), up, uIn, v1, color), up);
+            AddQuad(g, Vertex(at(s0, inner, h0), up, uIn, v0, color), Vertex(at(s0, outer, h0), up, uOut, v0, color),
+                    Vertex(at(s1, outer, h1), up, uOut, v1, color), Vertex(at(s1, inner, h1), up, uIn, v1, color), up);
             const Vec3 face0 = s0.right * (float)-side;
-            AddQuad(g, Vertex(at(s0, inner, 0), face0, 0, v0, color), Vertex(at(s0, inner, h), face0, kerbU, v0, color),
-                    Vertex(at(s1, inner, h), face0, kerbU, v1, color), Vertex(at(s1, inner, 0), face0, 0, v1, color),
-                    face0);
+            if (h0 > 0.005f || h1 > 0.005f)
+                AddQuad(g, Vertex(at(s0, inner, 0), face0, 0, v0, color), Vertex(at(s0, inner, h0), face0, kerbU, v0, color),
+                        Vertex(at(s1, inner, h1), face0, kerbU, v1, color), Vertex(at(s1, inner, 0), face0, 0, v1, color),
+                        face0);
         }
 
         // Walls on the outer edges: flat (faced both ways), a guardrail, or
@@ -330,17 +495,60 @@ void BuildStretch(const RoadProfile& p, const std::vector<Station>& stations, si
             MeshGroup& g = piece.Group(p.wallTexture);
             const float x = p.Edge(side) * side;
             const float base = p.Walk(side) ? p.sidewalkHeight : 0.0f;
+            // Where the sidewalk under it sinks and the wall itself lowers
+            // away towards a road without one.
+            const float base0 = p.Walk(side) ? p.sidewalkHeight * (1.0f - taper.WalkLow(side, s0.distance)) : 0.0f;
+            const float base1 = p.Walk(side) ? p.sidewalkHeight * (1.0f - taper.WalkLow(side, s1.distance)) : 0.0f;
+            const float rise0 = p.wallHeight * (1.0f - taper.WallClosed(side, s0.distance));
+            const float rise1 = p.wallHeight * (1.0f - taper.WallClosed(side, s1.distance));
             const float v0 = s0.distance / p.wallTextureLength;
             const float v1 = s1.distance / p.wallTextureLength;
             if (p.wallStyle == 0) {
-                const float top = base + p.wallHeight;
-                for (int face = -1; face <= 1; face += 2) {
-                    const Vec3 n = s0.right * (float)face;
-                    AddQuad(g, Vertex(at(s0, x, base), n, 0, v0, color), Vertex(at(s0, x, top), n, 1, v0, color),
-                            Vertex(at(s1, x, top), n, 1, v1, color), Vertex(at(s1, x, base), n, 0, v1, color), n);
+                if (rise0 < 0.01f && rise1 < 0.01f) continue;
+                const float top0 = base0 + rise0, top1 = base1 + rise1;
+                const float depth = std::clamp(p.wallThickness, 0.0f, 5.0f);
+                const float uh0 = rise0 / std::max(0.01f, p.wallHeight + depth);
+                const float uh1 = rise1 / std::max(0.01f, p.wallHeight + depth);
+                if (depth < 0.01f) {
+                    for (int face = -1; face <= 1; face += 2) {
+                        const Vec3 n = s0.right * (float)face;
+                        AddQuad(g, Vertex(at(s0, x, base0), n, 0, v0, color), Vertex(at(s0, x, top0), n, rise0 / std::max(0.01f, p.wallHeight), v0, color),
+                                Vertex(at(s1, x, top1), n, rise1 / std::max(0.01f, p.wallHeight), v1, color),
+                                Vertex(at(s1, x, base1), n, 0, v1, color), n);
+                    }
+                    continue;
                 }
+                // With depth: the face towards the road, the one away from
+                // it, the top, and an end where the wall starts or stops.
+                const float out = x + depth * (float)side;
+                const float ud = depth / std::max(0.01f, p.wallHeight + depth);
+                const Vec3 inward = s0.right * (float)-side, outward = s0.right * (float)side;
+                AddQuad(g, Vertex(at(s0, x, base0), inward, 0, v0, color), Vertex(at(s0, x, top0), inward, uh0, v0, color),
+                        Vertex(at(s1, x, top1), inward, uh1, v1, color), Vertex(at(s1, x, base1), inward, 0, v1, color),
+                        inward);
+                AddQuad(g, Vertex(at(s0, out, base0), outward, 0, v0, color),
+                        Vertex(at(s0, out, top0), outward, uh0, v0, color), Vertex(at(s1, out, top1), outward, uh1, v1, color),
+                        Vertex(at(s1, out, base1), outward, 0, v1, color), outward);
+                AddQuad(g, Vertex(at(s0, x, top0), up, uh0, v0, color), Vertex(at(s0, out, top0), up, uh0 + ud, v0, color),
+                        Vertex(at(s1, out, top1), up, uh1 + ud, v1, color), Vertex(at(s1, x, top1), up, uh1, v1, color), up);
+                const float last = stations.back().distance;
+                const auto cap = [&](const Station& s, float facing, float b, float t, float uh) {
+                    const Vec3 n = s.forward * facing;
+                    AddQuad(g, Vertex(at(s, x, b), n, 0, 0, color), Vertex(at(s, x, t), n, 0, uh, color),
+                            Vertex(at(s, out, t), n, ud, uh, color), Vertex(at(s, out, b), n, ud, 0, color), n);
+                };
+                const bool startsHere = s0.distance <= 1e-3f || (i > 0 && !taper.WallAt(side, stations[i - 1].distance,
+                                                                                          s0.distance));
+                const bool stopsHere = s1.distance >= last - 1e-3f ||
+                                       (i + 2 < stations.size() && !taper.WallAt(side, s1.distance,
+                                                                                  stations[i + 2].distance));
+                if (startsHere && rise0 > 0.01f) cap(s0, -1.0f, base0, top0, uh0);
+                if (stopsHere && rise1 > 0.01f) cap(s1, 1.0f, base1, top1, uh1);
                 continue;
             }
+            // A guardrail ends where the wall has mostly lowered away.
+            if (taper.WallClosed(side, s0.distance) > 0.5f || taper.WallClosed(side, s1.distance) > 0.5f) continue;
+            (void)base;
             // A guardrail: a W-shaped steel beam, its profile scaled to the
             // wall height, on posts every two units.
             const float scale = p.wallHeight / 0.8f;
@@ -395,17 +603,33 @@ void BuildStretch(const RoadProfile& p, const std::vector<Station>& stations, si
     piece.strips.push_back(road);
     for (int side = -1; side <= 1; side += 2) {
         if (!p.Walk(side)) continue;
+        // Its height where it sinks away towards a road without one.
+        const auto sunk = [&](float lateral) {
+            std::vector<Vec3> line;
+            for (size_t i : picks)
+                line.push_back(at(stations[i], lateral,
+                                  p.sidewalkHeight * (1.0f - taper.WalkLow(side, stations[i].distance))));
+            return line;
+        };
         CollisionStrip walk;
-        walk.left = edge(side < 0 ? -p.Edge(-1) : half, p.sidewalkHeight);
-        walk.right = edge(side < 0 ? -half : p.Edge(1), p.sidewalkHeight);
+        walk.left = sunk(side < 0 ? -p.Edge(-1) : half);
+        walk.right = sunk(side < 0 ? -half : p.Edge(1));
         walk.surface = kSurfaceSidewalk;
         piece.strips.push_back(walk);
+        // The kerb, in runs where it still stands.
         CollisionWall kerb;
-        kerb.points = edge(half * side, 0.0f);
         kerb.barrier = false;
         kerb.height = p.sidewalkHeight;
         kerb.surface = kSurfaceSidewalk;
-        if (p.sidewalkHeight > 0.02f) piece.walls.push_back(kerb);
+        for (size_t i : picks) {
+            if (taper.WalkLow(side, stations[i].distance) > 0.5f) {
+                if (kerb.points.size() >= 2 && p.sidewalkHeight > 0.02f) piece.walls.push_back(kerb);
+                kerb.points.clear();
+                continue;
+            }
+            kerb.points.push_back(at(stations[i], half * side, 0.0f));
+        }
+        if (kerb.points.size() >= 2 && p.sidewalkHeight > 0.02f) piece.walls.push_back(kerb);
     }
     for (int side = -1; side <= 1; side += 2) {
         if (!p.Wall(side) || p.wallHeight < 0.05f) continue;
@@ -414,12 +638,13 @@ void BuildStretch(const RoadProfile& p, const std::vector<Station>& stations, si
         wall.barrier = true;
         for (size_t i : picks) {
             const float d = stations[i].distance;
-            if (!taper.WallAt(side, d, d)) {
+            if (!taper.WallAt(side, d, d) || taper.WallClosed(side, d) > 0.6f) {
                 if (wall.points.size() >= 2) piece.walls.push_back(wall);
                 wall.points.clear();
                 continue;
             }
-            wall.points.push_back(at(stations[i], p.Edge(side) * side, p.Walk(side) ? p.sidewalkHeight : 0.0f));
+            wall.points.push_back(at(stations[i], p.Edge(side) * side,
+                                     p.Walk(side) ? p.sidewalkHeight * (1.0f - taper.WalkLow(side, d)) : 0.0f));
         }
         if (wall.points.size() >= 2) piece.walls.push_back(wall);
     }
@@ -429,7 +654,8 @@ void BuildStretch(const RoadProfile& p, const std::vector<Station>& stations, si
         std::vector<std::vector<size_t>> runs(1);
         for (size_t i : picks) {
             const Station& s = stations[i];
-            const bool open = s.distance < medianBefore - 0.01f || s.distance > medianAfter + 0.01f;
+            const bool open = s.distance < medianBefore - 0.01f || s.distance > medianAfter + 0.01f ||
+                              taper.MedianClosed(s.distance) > 0.5f;
             if (open) {
                 if (!runs.back().empty()) runs.emplace_back();
             } else {
@@ -859,8 +1085,10 @@ bool InTriangle2(const Vec3& p, const Vec3& a, const Vec3& b, const Vec3& c, flo
 
 } // namespace
 
+// `endSign` and `endShift`: how the road's own across (right of the way it
+// was drawn) runs in this junction's terms, and the road's sideways shift.
 void BuildFaceJunction(const FaceJunction& j, const Vec3& node, const Vec3& into, const RoadProfile& profile,
-                       MeshPiece& piece) {
+                       float endSign, float endShift, MeshPiece& piece) {
     if (j.faces.empty()) return;
     const Vec3 u = HorizontalDirection(into);
     const Vec3 r = RightOf(u);
@@ -884,12 +1112,15 @@ void BuildFaceJunction(const FaceJunction& j, const Vec3& node, const Vec3& into
         return best;
     };
 
+    // A face is road when marked so, or by its texture when not marked.
+    const auto isRoad = [](const GameFace& f) { return f.kind == 1 || (f.kind == 0 && IsRoadSurface(f.texture)); };
+
     // The game's road height: a plane through the corners of its road faces.
     double s[4][4] = {};
     size_t samples = 0;
     float meanZ = 0.0f;
     for (const GameFace& f : j.faces) {
-        if (!IsRoadSurface(f.texture) || std::fabs(PlanArea(f.p[0], f.p[1], f.p[2])) < 1e-3f) continue;
+        if (!isRoad(f) || std::fabs(PlanArea(f.p[0], f.p[1], f.p[2])) < 1e-3f) continue;
         for (const Vec3& q : f.p) {
             const double row[4] = { 1.0, q.x - node.x, q.y - node.y, q.z };
             for (int a = 0; a < 3; ++a)
@@ -920,8 +1151,49 @@ void BuildFaceJunction(const FaceJunction& j, const Vec3& node, const Vec3& into
         if (ok)
             for (int a = 0; a < 3; ++a) plane[a] = m[a][3] / m[a][a];
     }
-    const auto gameZ = [&](const Vec3& q) {
+    const auto fitZ = [&](const Vec3& q) {
         return (float)(plane[0] + plane[1] * (q.x - node.x) + plane[2] * (q.y - node.y));
+    };
+    // The game's road height at a point: on the road face under it, or
+    // carried on from the nearest one -- so the new surface follows the
+    // road's own crown and slopes and meets its faces without a step.
+    struct RoadPlane { Vec3 a, b, c; float z0, zx, zy; };
+    std::vector<RoadPlane> roadPlanes;
+    for (const GameFace& f : j.faces) {
+        if (!isRoad(f)) continue;
+        const float d = PlanArea(f.p[0], f.p[1], f.p[2]);
+        if (std::fabs(d) < 1e-3f) continue;
+        const Vec3 e1 = f.p[1] - f.p[0], e2 = f.p[2] - f.p[0];
+        const Vec3 n = Cross(e1, e2);
+        if (std::fabs(n.z) < 1e-6f) continue;
+        RoadPlane rp;
+        rp.a = f.p[0]; rp.b = f.p[1]; rp.c = f.p[2];
+        rp.zx = -n.x / n.z;
+        rp.zy = -n.y / n.z;
+        rp.z0 = f.p[0].z - rp.zx * f.p[0].x - rp.zy * f.p[0].y;
+        roadPlanes.push_back(rp);
+    }
+    const auto planDistance = [](const Vec3& q, const Vec3& a, const Vec3& b) {
+        const float dx = b.x - a.x, dy = b.y - a.y;
+        const float l = dx * dx + dy * dy;
+        const float t = l > 1e-9f ? std::clamp(((q.x - a.x) * dx + (q.y - a.y) * dy) / l, 0.0f, 1.0f) : 0.0f;
+        const float ex = a.x + dx * t - q.x, ey = a.y + dy * t - q.y;
+        return ex * ex + ey * ey;
+    };
+    const auto gameZ = [&](const Vec3& q) {
+        if (roadPlanes.empty()) return fitZ(q);
+        const RoadPlane* best = nullptr;
+        float bestDistance = 1e30f;
+        for (const RoadPlane& rp : roadPlanes) {
+            float d = 0.0f;
+            if (!InTriangle2(q, rp.a, rp.b, rp.c, 1e-5f))
+                d = std::min({ planDistance(q, rp.a, rp.b), planDistance(q, rp.b, rp.c), planDistance(q, rp.c, rp.a) });
+            if (d < bestDistance) { bestDistance = d; best = &rp; }
+        }
+        // Carried on a little way only, then the road's overall plane.
+        const float own = best->z0 + best->zx * q.x + best->zy * q.y;
+        const float w = std::clamp(std::sqrt(bestDistance) / 12.0f, 0.0f, 1.0f);
+        return own * (1.0f - w) + fitZ(q) * w;
     };
 
     // Where each of the new road's kerb lines reaches the game's road.
@@ -935,7 +1207,7 @@ void BuildFaceJunction(const FaceJunction& j, const Vec3& node, const Vec3& into
             Vec3 q = node + u * a + r * (side * hr);
             q.z = gameZ(q);
             const GameFace* f = faceAt(q, nullptr);
-            if (f && IsRoadSurface(f->texture)) { reach[k] = a; break; }
+            if (f && isRoad(*f)) { reach[k] = a; break; }
         }
         if (reach[k] < 0.0f) reach[k] = furthest;
     }
@@ -952,306 +1224,448 @@ void BuildFaceJunction(const FaceJunction& j, const Vec3& node, const Vec3& into
         return gameZ(q) + offset * w;
     };
 
-    // The corner kerbs: arcs from the new road's kerb lines round onto the
-    // game's, fanned from the corner they cut off.
-    struct Fillet {
-        int k = 0;                     // the side: 0 left, 1 right
-        Vec3 corner, centre;
-        float radius = 0.0f, a1 = 0.0f, sweep = 0.0f;
-        std::vector<Vec3> arc;
-    };
-    // Along each of the new road's kerbs, where the straight part ends and
-    // the curve begins.
-    float straight[2] = { reach[0], reach[1] };
-    const float walk = std::max(0.0f, hw - hr);
-    std::vector<Fillet> fillets;
-    std::vector<SplitLine> lines;
-    const auto bandLine = [&](const Vec3& p, const Vec3& n) {
+    // ---- rebuilt on the game's own mesh -----------------------------------
+    //
+    // The chosen faces keep the game's vertices and triangles: what each one
+    // becomes (road or sidewalk) is the choice made in the wizard, and only
+    // the faces reaching in under the new road are cut -- at the node's line
+    // and at the road end's own lane edges, so its vertices meet the road's.
+
+    // The road end as the procedural road leaves it: its edges across (lat,
+    // in this junction's terms) and what lies between them.
+    const float sign = endSign;
+    const auto latOfX = [&](float x) { return sign * (x + endShift); };
+    const float half = profile.HalfRoad();
+    std::vector<float> roadLats;
+    {
+        const float sl = profile.ShoulderAt(-1);
+        const float lane = profile.laneWidth;
+        const float median = profile.MedianWidth();
+        std::vector<float> xs = { -half, half };
+        if (sl > 0.01f) xs.push_back(-half + sl);
+        if (profile.ShoulderAt(1) > 0.01f) xs.push_back(half - profile.ShoulderAt(1));
+        for (int k = 0; k <= profile.Lanes(); ++k) {
+            const float x = -half + sl + lane * (float)k + (k > profile.lanesBackward ? median : 0.0f);
+            xs.push_back(x);
+            if (k == profile.lanesBackward && median > 0.01f) xs.push_back(x + median);
+        }
+        for (float x : xs) roadLats.push_back(latOfX(x));
+        std::sort(roadLats.begin(), roadLats.end());
+        roadLats.erase(std::unique(roadLats.begin(), roadLats.end(),
+                                   [](float a, float b) { return std::fabs(a - b) < 0.02f; }),
+                       roadLats.end());
+    }
+    const float roadLo = roadLats.front(), roadHi = roadLats.back();
+    // The sidewalks either side: [kerb, outer] in lat, absent when width 0.
+    float walkLo = roadLo, walkHi = roadHi;
+    for (int side = -1; side <= 1; side += 2) {
+        if (!profile.Walk(side)) continue;
+        const float outer = latOfX((half + profile.sidewalkWidth) * side);
+        if (outer < roadLo) walkLo = outer;
+        if (outer > roadHi) walkHi = outer;
+    }
+    const float walkLift = profile.sidewalkHeight;
+    const auto inRoadZone = [&](float l) { return l >= roadLo - 1e-3f && l <= roadHi + 1e-3f; };
+    const auto inWidth = [&](float l) { return l >= walkLo - 1e-3f && l <= walkHi + 1e-3f; };
+
+    // Faces reaching in under the new road behind the node are cut there.
+    std::vector<SplitLine> cutLines;
+    {
         SplitLine l;
-        l.a = { p.x, p.y };
-        l.n = { n.x, n.y };
-        lines.push_back(l);
-    };
-    bandLine(node + r * hr, r);
-    bandLine(node - r * hr, r);
-    bandLine(node + r * hw, r);
-    bandLine(node - r * hw, r);
-    bandLine(node, u);
-    bandLine(node + u * depth, u);
-    for (int k = 0; k < 2; ++k) {
-        const float side = k ? 1.0f : -1.0f;
-        Vec3 g = HorizontalDirection(j.gameForward, r);
-        if (Dot(g, r * side) < 0.0f) g = g * -1.0f;
-        if (std::fabs(Dot(g, u)) > 0.97f) g = r * side;
-        const Vec3 back = u * -1.0f;
-        const float theta = std::acos(std::clamp(Dot(back, g), -1.0f, 1.0f));
-        if (theta < 0.2f || theta > 2.9f || j.fillet < 0.05f) continue;
-        float radius = j.fillet;
-        float t = radius / std::tan(theta * 0.5f);
-        if (t > reach[k] * 0.9f) {
-            t = reach[k] * 0.9f;
-            radius = t * std::tan(theta * 0.5f);
+        l.a = { node.x, node.y };
+        l.n = { u.x, u.y };
+        cutLines.push_back(l);
+        std::vector<float> lats = roadLats;
+        if (walkLo < roadLo - 0.01f) lats.push_back(walkLo);
+        if (walkHi > roadHi + 0.01f) lats.push_back(walkHi);
+        for (float value : lats) {
+            SplitLine side;
+            const Vec3 p = node + r * value;
+            side.a = { p.x, p.y };
+            side.n = { r.x, r.y };
+            cutLines.push_back(side);
         }
-        if (t < 0.1f) continue;
-        Fillet fl;
-        fl.k = k;
-        fl.corner = node + u * reach[k] + r * (side * hr);
-        const Vec3 t1 = fl.corner + back * t, t2 = fl.corner + g * t;
-        const Vec3 bisector = HorizontalDirection(back + g, r);
-        const Vec3 centre = fl.corner + bisector * (radius / std::sin(theta * 0.5f));
-        float a1 = std::atan2(t1.y - centre.y, t1.x - centre.x), a2 = std::atan2(t2.y - centre.y, t2.x - centre.x);
-        float sweep = a2 - a1;
-        while (sweep > 3.14159265f) sweep -= 6.2831853f;
-        while (sweep < -3.14159265f) sweep += 6.2831853f;
-        fl.centre = centre;
-        fl.radius = radius;
-        fl.a1 = a1;
-        fl.sweep = sweep;
-        straight[k] = reach[k] - t;
-        constexpr int kSteps = 6;
-        for (int i = 0; i <= kSteps; ++i) {
-            const float a = a1 + sweep * i / kSteps;
-            fl.arc.push_back({ centre.x + radius * std::cos(a), centre.y + radius * std::sin(a), 0.0f });
-        }
-        // The new road's sidewalk carried round the curve: the band between
-        // the arc and one a sidewalk's width further in.
-        const float inner = radius - walk;
-        std::vector<Vec3> innerArc;
-        if (walk > 0.01f && inner > 0.05f)
-            for (int i = 0; i <= kSteps; ++i) {
-                const float a = a1 + sweep * i / kSteps;
-                innerArc.push_back({ centre.x + inner * std::cos(a), centre.y + inner * std::sin(a), 0.0f });
-            }
-        float x0 = std::min(fl.corner.x, centre.x), y0 = std::min(fl.corner.y, centre.y);
-        float x1 = std::max(fl.corner.x, centre.x), y1 = std::max(fl.corner.y, centre.y);
-        for (const Vec3& p : fl.arc) {
-            x0 = std::min(x0, p.x); y0 = std::min(y0, p.y);
-            x1 = std::max(x1, p.x); y1 = std::max(y1, p.y);
-        }
-        const auto bounded = [&](SplitLine l) {
-            l.bounded = true;
-            l.x0 = x0 - 0.05f; l.y0 = y0 - 0.05f; l.x1 = x1 + 0.05f; l.y1 = y1 + 0.05f;
-            lines.push_back(l);
-        };
-        bounded(LineThrough(fl.corner, t2));                       // the game's kerb line
-        for (int i = 0; i < kSteps; ++i) bounded(LineThrough(fl.arc[i], fl.arc[i + 1]));   // the chords
-        for (int i = 1; i < kSteps; ++i) bounded(LineThrough(fl.corner, fl.arc[i]));        // the spokes
-        if (walk > 0.01f) {
-            // Where the curve's sidewalk begins and ends, and its inner edge.
-            bounded(LineThrough(centre, t1));
-            bounded(LineThrough(centre, t2));
-            for (int i = 1; i < kSteps; ++i) bounded(LineThrough(centre, fl.arc[i]));
-            for (size_t i = 0; i + 1 < innerArc.size(); ++i) bounded(LineThrough(innerArc[i], innerArc[i + 1]));
-            bandLine(t1, u);    // the straight sidewalk ends where the curve begins
-        }
-        fillets.push_back(std::move(fl));
     }
 
-    const auto inFillet = [&](const Vec3& q) {
-        for (const Fillet& fl : fillets)
-            for (size_t i = 0; i + 1 < fl.arc.size(); ++i)
-                if (InTriangle2(q, fl.corner, fl.arc[i], fl.arc[i + 1], 1e-5f)) return true;
-        return false;
+    // Vertices on the edge of the chosen faces stay where they are: the
+    // game's faces beyond them share them.
+    const auto key3 = [](const Vec3& p) {
+        return std::make_tuple(std::lround(p.x * 100.0f), std::lround(p.y * 100.0f), std::lround(p.z * 100.0f));
     };
-    const auto inBand = [&](const Vec3& q) {
-        const float a = along(q);
-        return a >= 0.0f && a <= depth && std::fabs(lat(q)) <= hr;
-    };
-    const auto underRoad = [&](const Vec3& q) { return along(q) < 0.0f && std::fabs(lat(q)) <= hw; };
-    const auto converted = [&](const Vec3& q, const std::string& texture) {
-        return !IsRoadSurface(texture) && (inBand(q) || inFillet(q));
+    std::set<std::tuple<long, long, long>> pinned;
+    {
+        std::map<std::pair<std::tuple<long, long, long>, std::tuple<long, long, long>>, int> edges;
+        for (const GameFace& f : j.faces)
+            for (int k = 0; k < 3; ++k) {
+                auto a = key3(f.p[k]), b = key3(f.p[(k + 1) % 3]);
+                if (b < a) std::swap(a, b);
+                ++edges[{ a, b }];
+            }
+        for (const auto& [edge, count] : edges)
+            if (count == 1) { pinned.insert(edge.first); pinned.insert(edge.second); }
+    }
+
+    // The crossing on the game's road: where the new road's kerb lines meet
+    // it, widened by the corner radius along it.
+    Vec3 g = HorizontalDirection(j.gameForward, r);
+    const bool crossing = std::fabs(Dot(g, u)) < 0.9f;
+    if (Dot(g, r) < 0.0f) g = g * -1.0f;
+    const Vec3 gn{ -g.y, g.x, 0.0f };
+    const auto ga = [&](const Vec3& q) { return (q.x - node.x) * g.x + (q.y - node.y) * g.y; };
+    const auto gx = [&](const Vec3& q) { return (q.x - node.x) * gn.x + (q.y - node.y) * gn.y; };
+    float boxMin = 1e30f, boxMax = -1e30f;
+    for (int k = 0; k < 2; ++k) {
+        const Vec3 corner = node + u * reach[k] + r * (k ? roadHi : roadLo);
+        boxMin = std::min(boxMin, ga(corner) - j.fillet);
+        boxMax = std::max(boxMax, ga(corner) + j.fillet);
+    }
+    const auto crossingPart = [&](const Vec3& q) {
+        if (!crossing) return 0;
+        const float a = ga(q);
+        if (a >= boxMin && a <= boxMax) return 1;
+        if (j.crosswalks && ((a >= boxMax && a <= boxMax + kCrosswalkDepth) ||
+                             (a <= boxMin && a >= boxMin - kCrosswalkDepth)))
+            return 2;
+        return 0;
     };
 
-    // The new road's sidewalk, as a procedural junction lays it: on along its
-    // kerbs from the node, round the curves and onto the game's kerb, the
-    // texture across it from the kerb (u) and along it (v). Where a point is
-    // in it, `run` and `across` say where.
-    struct WalkSpot { int k = -1; bool curve = false; const Fillet* fillet = nullptr; };
-    const auto walkAt = [&](const Vec3& q) {
-        WalkSpot spot;
-        if (walk <= 0.01f) return spot;
-        const float a = along(q), l = lat(q);
-        const int k = l >= 0.0f ? 1 : 0;
-        if (a >= 0.0f && a <= straight[k] + 1e-4f && std::fabs(l) >= hr - 1e-4f && std::fabs(l) <= hw + 1e-4f) {
-            spot.k = k;
-            return spot;
-        }
-        for (const Fillet& fl : fillets) {
-            const float dx = q.x - fl.centre.x, dy = q.y - fl.centre.y;
-            const float d = std::sqrt(dx * dx + dy * dy);
-            if (d > fl.radius + 1e-3f || d < fl.radius - walk - 1e-3f) continue;
-            float angle = std::atan2(dy, dx) - fl.a1;
-            while (angle > 3.14159265f) angle -= 6.2831853f;
-            while (angle < -3.14159265f) angle += 6.2831853f;
-            if (angle * fl.sweep < -1e-4f || std::fabs(angle) > std::fabs(fl.sweep) + 1e-4f) continue;
-            spot.k = fl.k;
-            spot.curve = true;
-            spot.fillet = &fl;
-            return spot;
-        }
-        return spot;
-    };
-    const auto walkUv = [&](const WalkSpot& spot, const Vec3& q) {
-        float run = 0.0f, across = 0.0f;
-        if (!spot.curve) {
-            run = along(q);
-            across = std::fabs(lat(q)) - hr;
-        } else {
-            const Fillet& fl = *spot.fillet;
-            const float dx = q.x - fl.centre.x, dy = q.y - fl.centre.y;
-            float angle = std::atan2(dy, dx) - fl.a1;
-            while (angle > 3.14159265f) angle -= 6.2831853f;
-            while (angle < -3.14159265f) angle += 6.2831853f;
-            run = straight[fl.k] + std::fabs(angle) * fl.radius;
-            across = fl.radius - std::sqrt(dx * dx + dy * dy);
-        }
-        const float tile = std::max(0.5f, profile.textureLength);
-        return Vec2{ std::clamp(across / std::max(0.01f, walk), 0.0f, 1.0f), run / tile };
-    };
-
-    // The junction's own surface, as on every procedural junction.
     const std::string asphalt = "RDP_INTERSECTMIDTILE";
     const auto asphaltUv = [&](const Vec3& q) { return Vec2{ q.x / kJunctionTile, q.y / kJunctionTile }; };
-    const auto fanUp = [&](MeshGroup& g, const std::vector<MeshVertex>& ring) {
-        const u32 base = (u32)g.vertices.size();
-        for (const MeshVertex& v : ring) g.vertices.push_back(v);
+    const auto fanUp = [&](MeshGroup& gr, const std::vector<MeshVertex>& ring) {
+        const u32 base = (u32)gr.vertices.size();
+        for (const MeshVertex& v : ring) gr.vertices.push_back(v);
         for (size_t k = 1; k + 1 < ring.size(); ++k) {
             const Vec3 n = Cross(ring[k].position - ring[0].position, ring[k + 1].position - ring[0].position);
             if (Length(n) < 1e-7f) continue;
-            g.indices.push_back(base);
-            if (n.z >= 0.0f) { g.indices.push_back(base + (u32)k); g.indices.push_back(base + (u32)k + 1); }
-            else { g.indices.push_back(base + (u32)k + 1); g.indices.push_back(base + (u32)k); }
+            gr.indices.push_back(base);
+            if (n.z >= 0.0f) { gr.indices.push_back(base + (u32)k); gr.indices.push_back(base + (u32)k + 1); }
+            else { gr.indices.push_back(base + (u32)k + 1); gr.indices.push_back(base + (u32)k); }
         }
     };
+    const float easeW = ease;
+    const auto easing = [&](const Vec3& q) {
+        return easeW > 0.01f ? std::clamp(1.0f - along(q) / easeW, 0.0f, 1.0f) : 0.0f;
+    };
 
+    // ---- the flat faces: cut where they reach under the road, then each
+    // part what the choice makes it.
+    struct Part {
+        std::vector<FaceCorner> corners;
+        std::vector<float> z;          // each corner's height once rebuilt
+        const GameFace* face = nullptr;
+        int role = 0;                  // 1 road, 2 sidewalk
+        bool converted = false;        // made road where the game had something else
+    };
+    std::vector<Part> parts;
     for (const GameFace& f : j.faces) {
-        const Vec3 middle = (f.p[0] + f.p[1] + f.p[2]) * (1.0f / 3.0f);
-        if (std::fabs(PlanArea(f.p[0], f.p[1], f.p[2])) < 1e-3f) {
-            // Standing up (a kerb): cut along the same lines, gone where the
-            // new road goes through, the rest back as it was, both ways
-            // round, with its wall.
-            (void)middle;
-            std::vector<std::vector<FaceCorner>> parts{ { { f.p[0], f.uv[0] }, { f.p[1], f.uv[1] }, { f.p[2], f.uv[2] } } };
-            for (const SplitLine& line : lines) {
+        if (std::fabs(PlanArea(f.p[0], f.p[1], f.p[2])) < 1e-3f) continue;   // standing: below
+        std::vector<std::vector<FaceCorner>> polys{ { { f.p[0], f.uv[0] }, { f.p[1], f.uv[1] }, { f.p[2], f.uv[2] } } };
+        bool reachesIn = false;
+        for (const Vec3& q : f.p) reachesIn |= along(q) < 0.02f && lat(q) > walkLo - 0.5f && lat(q) < walkHi + 0.5f;
+        if (reachesIn)
+            for (const SplitLine& line : cutLines) {
                 std::vector<std::vector<FaceCorner>> next;
-                for (const auto& poly : parts) SplitBy(poly, line, next);
-                parts = std::move(next);
+                for (const auto& poly : polys) SplitBy(poly, line, next);
+                polys = std::move(next);
             }
-            const Vec3 n = HorizontalDirection(Cross(f.p[1] - f.p[0], f.p[2] - f.p[0]), r);
-            for (const auto& poly : parts) {
-                Vec3 c{};
-                for (const FaceCorner& k : poly) c = c + k.p;
-                c = c * (1.0f / poly.size());
-                if (underRoad(c) || inBand(c) || inFillet(c)) continue;
-                MeshGroup& g = piece.Group(f.texture);
-                const u32 base = (u32)g.vertices.size();
-                for (const FaceCorner& k : poly) g.vertices.push_back(Vertex(k.p, n, k.uv.x, k.uv.y, color));
-                for (u32 k = 1; k + 1 < (u32)poly.size(); ++k)
-                    for (u32 i : { 0u, k, k + 1, 0u, k + 1, k }) g.indices.push_back(base + i);
-                // Its foot, end to end, and how high it stands.
-                float low = 1e30f, high = -1e30f;
-                for (const FaceCorner& k : poly) { low = std::min(low, k.p.z); high = std::max(high, k.p.z); }
-                if (high - low <= 0.03f) continue;
-                const Vec3 axis = HorizontalDirection(f.p[1] - f.p[0], f.p[2] - f.p[0]);
-                Vec3 first = poly[0].p, last = poly[0].p;
-                for (const FaceCorner& k : poly) {
-                    if (Dot(k.p, axis) < Dot(first, axis)) first = k.p;
-                    if (Dot(k.p, axis) > Dot(last, axis)) last = k.p;
-                }
-                if (Length(Vec3{ last.x - first.x, last.y - first.y, 0.0f }) < 0.05f) continue;
-                CollisionWall wall;
-                wall.points = { { first.x, first.y, low }, { last.x, last.y, low } };
-                wall.barrier = false;
-                wall.height = high - low;
-                wall.surface = kSurfaceSidewalk;
-                piece.walls.push_back(std::move(wall));
+        // The game's road cut where the crossing and its stripes begin and
+        // end, so they run straight across it.
+        if (crossing && isRoad(f) && f.kind != 2) {
+            std::vector<float> at = { boxMin, boxMax };
+            if (j.crosswalks) { at.push_back(boxMin - kCrosswalkDepth); at.push_back(boxMax + kCrosswalkDepth); }
+            for (float value : at) {
+                SplitLine line;
+                const Vec3 p = node + g * value;
+                line.a = { p.x, p.y };
+                line.n = { g.x, g.y };
+                std::vector<std::vector<FaceCorner>> next;
+                for (const auto& poly : polys) SplitBy(poly, line, next);
+                polys = std::move(next);
             }
-            continue;
         }
-
-        std::vector<std::vector<FaceCorner>> pieces{ { { f.p[0], f.uv[0] }, { f.p[1], f.uv[1] }, { f.p[2], f.uv[2] } } };
-        for (const SplitLine& line : lines) {
-            std::vector<std::vector<FaceCorner>> next;
-            for (const auto& poly : pieces) SplitBy(poly, line, next);
-            pieces = std::move(next);
-        }
-        const Vec3 faceNormal = [&] {
-            Vec3 n = Cross(f.p[1] - f.p[0], f.p[2] - f.p[0]);
-            if (n.z < 0.0f) n = n * -1.0f;
-            const float l = Length(n);
-            return l > 1e-6f ? n * (1.0f / l) : up;
-        }();
-
-        for (const auto& poly : pieces) {
+        for (auto& poly : polys) {
             Vec3 c{};
             for (const FaceCorner& k : poly) c = c + k.p;
             c = c * (1.0f / poly.size());
-            if (underRoad(c)) continue;      // the new road lies there
-            CollisionArea area;
-            std::vector<MeshVertex> ring;
-            if (!converted(c, f.texture)) {
-                // The new road's sidewalk where it runs, at the game's own
-                // height; elsewhere as the game had it.
-                const WalkSpot spot = IsRoadSurface(f.texture) ? WalkSpot{} : walkAt(c);
-                for (const FaceCorner& k : poly) {
-                    const Vec2 t = spot.k >= 0 ? walkUv(spot, k.p) : k.uv;
-                    ring.push_back(Vertex(k.p, faceNormal, t.x, t.y, color));
-                    area.outline.push_back(k.p);
-                }
-                fanUp(piece.Group(spot.k >= 0 ? profile.sidewalkTexture : f.texture), ring);
-                area.surface = IsRoadSurface(f.texture) ? kSurfaceRoad : kSurfaceSidewalk;
-                piece.areas.push_back(std::move(area));
-                continue;
+            if (along(c) < 0.0f && inWidth(lat(c))) continue;     // the new road lies there
+            Part part;
+            part.face = &f;
+            part.corners = std::move(poly);
+            if (f.kind == 1) part.role = 1;
+            else if (f.kind == 2) part.role = 2;
+            else if (isRoad(f)) part.role = 1;
+            else part.role = along(c) >= 0.0f && inRoadZone(lat(c)) ? 1 : 2;   // in the new road's way
+            part.converted = part.role == 1 && !isRoad(f);
+            parts.push_back(std::move(part));
+        }
+    }
+    // Heights: road made where there was sidewalk drops to the road; the
+    // sidewalk beside the new road eases to the node's height with it; the
+    // node's own line is exactly the road end's.
+    for (Part& part : parts) {
+        for (const FaceCorner& k : part.corners) {
+            float z = k.p.z;
+            const bool fixed = pinned.count(key3(k.p)) != 0;
+            const float a = along(k.p), l = lat(k.p);
+            if (std::fabs(a) < 0.02f && inWidth(l)) {
+                z = node.z + (inRoadZone(l) && part.role == 1 ? 0.0f : walkLift);
+            } else if (!fixed) {
+                if (part.converted) z = roadZ(k.p);
+                else if (part.role == 2 && inWidth(l)) z = k.p.z + offset * easing(k.p);
             }
-            // In the new road's way: road surface at the road's height.
-            for (const FaceCorner& k : poly) {
-                const Vec3 q{ k.p.x, k.p.y, roadZ(k.p) };
-                const Vec2 t = asphaltUv(q);
-                ring.push_back(Vertex(q, up, t.x, t.y, color));
-                area.outline.push_back(q);
+            part.z.push_back(z);
+        }
+    }
+    // Drawn, and driven on.
+    for (const Part& part : parts) {
+        const GameFace& f = *part.face;
+        Vec3 c{};
+        for (const FaceCorner& k : part.corners) c = c + k.p;
+        c = c * (1.0f / part.corners.size());
+        const int crossPart = part.role == 1 && !part.converted ? crossingPart(c) : 0;
+        const bool asphaltHere = part.converted || crossPart == 1;
+        std::string texture = f.texture;
+        if (asphaltHere) texture = asphalt;
+        else if (crossPart == 2) texture = kCrosswalkTexture;
+        std::vector<MeshVertex> ring;
+        CollisionArea area;
+        for (size_t i = 0; i < part.corners.size(); ++i) {
+            const Vec3 q{ part.corners[i].p.x, part.corners[i].p.y, part.z[i] };
+            Vec2 t = part.corners[i].uv;
+            if (asphaltHere) t = asphaltUv(q);
+            else if (crossPart == 2) {
+                const float a = ga(q);
+                const float d = a > boxMax - 1e-3f ? a - boxMax : boxMin - a;
+                t = { gx(q) / kCrosswalkTile, d / kCrosswalkDepth };
             }
-            fanUp(piece.Group(asphalt), ring);
-            area.surface = kSurfaceRoad;
-            piece.areas.push_back(std::move(area));
+            ring.push_back(Vertex(q, up, t.x, t.y, color));
+            area.outline.push_back(q);
+        }
+        fanUp(piece.Group(texture), ring);
+        area.surface = part.role == 1 ? kSurfaceRoad : kSurfaceSidewalk;
+        piece.areas.push_back(std::move(area));
+    }
 
-            // A kerb on each edge where what is beyond stays higher.
-            for (size_t i = 0; i < poly.size(); ++i) {
-                const FaceCorner& a = poly[i];
-                const FaceCorner& b = poly[(i + 1) % poly.size()];
-                const float za = roadZ(a.p), zb = roadZ(b.p);
-                const float ha = a.p.z - za, hb = b.p.z - zb;
-                if (std::max(ha, hb) < 0.04f) continue;
-                const Vec3 m = (a.p + b.p) * 0.5f;
-                Vec3 out = HorizontalDirection(Vec3{ b.p.y - a.p.y, a.p.x - b.p.x, 0.0f }, r);
-                if (Dot(c - m, out) > 0.0f) out = out * -1.0f;
-                Vec3 q = m + out * 0.02f;
-                float h = m.z;
-                const GameFace* beyond = faceAt(q, &h);
-                bool low = false;
-                if (beyond) low = IsRoadSurface(beyond->texture) || underRoad(q) || inBand(q) || inFillet(q);
-                else low = underRoad(q);
-                if (low) continue;
-                const Vec3 face = out * -1.0f;     // the kerb faces the road
-                const Vec3 a0{ a.p.x, a.p.y, za }, b0{ b.p.x, b.p.y, zb };
-                const WalkSpot spot = beyond ? walkAt(q) : WalkSpot{};
-                if (spot.k >= 0) {
-                    // The sidewalk's own kerb, as a procedural junction's.
-                    MeshGroup& g = piece.Group(profile.sidewalkTexture);
-                    const float kerbU = std::clamp(std::max(ha, hb) / std::max(0.01f, walk), 0.0f, 1.0f);
-                    const float va = walkUv(spot, a.p).y, vb = walkUv(spot, b.p).y;
-                    AddQuad(g, Vertex(a0, face, 0, va, color), Vertex(a.p, face, kerbU, va, color),
-                            Vertex(b.p, face, kerbU, vb, color), Vertex(b0, face, 0, vb, color), face);
-                } else {
-                    MeshGroup& g = piece.Group(f.texture);
-                    AddQuad(g, Vertex(a0, face, a.uv.x, a.uv.y + 0.02f, color), Vertex(a.p, face, a.uv.x, a.uv.y, color),
-                            Vertex(b.p, face, b.uv.x, b.uv.y, color), Vertex(b0, face, b.uv.x, b.uv.y + 0.02f, color), face);
+    // Kerbs: along every edge where a part meets another at another height.
+    {
+        const auto key2 = [](const Vec3& p) { return std::make_pair(std::lround(p.x * 100.0f), std::lround(p.y * 100.0f)); };
+        struct Side { size_t part; Vec3 a, b; };   // a, b at the part's own heights
+        std::map<std::pair<std::pair<long, long>, std::pair<long, long>>, std::vector<Side>> edges;
+        for (size_t i = 0; i < parts.size(); ++i) {
+            const Part& part = parts[i];
+            for (size_t k = 0; k < part.corners.size(); ++k) {
+                const size_t n = (k + 1) % part.corners.size();
+                Vec3 a{ part.corners[k].p.x, part.corners[k].p.y, part.z[k] };
+                Vec3 b{ part.corners[n].p.x, part.corners[n].p.y, part.z[n] };
+                auto ka = key2(a), kb = key2(b);
+                if (kb < ka) { std::swap(ka, kb); std::swap(a, b); }
+                edges[{ ka, kb }].push_back({ i, a, b });
+            }
+        }
+        for (const auto& [edge, sides] : edges) {
+            if (sides.size() != 2) continue;
+            const Side& s0 = sides[0];
+            const Side& s1 = sides[1];
+            const float da = s1.a.z - s0.a.z, db = s1.b.z - s0.b.z;
+            if (std::max(std::fabs(da), std::fabs(db)) < 0.03f) continue;
+            // The low side faces the kerb; the high side is the sidewalk on top.
+            const bool firstLow = da + db > 0.0f;
+            const Side& low = firstLow ? s0 : s1;
+            const Side& high = firstLow ? s1 : s0;
+            Vec3 lowMiddle{};
+            for (const FaceCorner& k : parts[low.part].corners) lowMiddle = lowMiddle + k.p;
+            lowMiddle = lowMiddle * (1.0f / parts[low.part].corners.size());
+            const Vec3 m = (low.a + low.b) * 0.5f;
+            Vec3 face = HorizontalDirection(Vec3{ lowMiddle.x - m.x, lowMiddle.y - m.y, 0.0f }, r);
+            MeshGroup& gr = piece.Group(profile.sidewalkTexture);
+            const float h = std::max(high.a.z - low.a.z, high.b.z - low.b.z);
+            const float kerbU = std::clamp(h / std::max(0.5f, profile.sidewalkWidth), 0.0f, 1.0f);
+            const float va = Length(Vec3{ low.a.x - node.x, low.a.y - node.y, 0.0f }) / std::max(0.5f, profile.textureLength);
+            const float vb = Length(Vec3{ low.b.x - node.x, low.b.y - node.y, 0.0f }) / std::max(0.5f, profile.textureLength);
+            AddQuad(gr, Vertex(low.a, face, 0, va, color), Vertex(high.a, face, kerbU, va, color),
+                    Vertex(high.b, face, kerbU, vb, color), Vertex(low.b, face, 0, vb, color), face);
+            CollisionWall kerb;
+            kerb.points = { low.a, low.b };
+            kerb.barrier = false;
+            kerb.height = h;
+            kerb.surface = kSurfaceSidewalk;
+            piece.walls.push_back(std::move(kerb));
+        }
+    }
+
+    // ---- the standing faces (the game's kerbs): as they were, unless the
+    // sidewalk on top of them has become road, or the new road lies there.
+    {
+        const auto key2 = [](const Vec3& p) { return std::make_pair(std::lround(p.x * 100.0f), std::lround(p.y * 100.0f)); };
+        std::set<std::pair<long, long>> lowered;    // plan points of road made from sidewalk
+        for (const Part& part : parts)
+            if (part.converted)
+                for (const FaceCorner& k : part.corners) lowered.insert(key2(k.p));
+        for (const GameFace& f : j.faces) {
+            if (std::fabs(PlanArea(f.p[0], f.p[1], f.p[2])) >= 1e-3f) continue;
+            const Vec3 middle = (f.p[0] + f.p[1] + f.p[2]) * (1.0f / 3.0f);
+            if (along(middle) < 0.0f && inWidth(lat(middle))) continue;
+            // Its top corners: the higher two.
+            Vec3 c[3] = { f.p[0], f.p[1], f.p[2] };
+            std::sort(c, c + 3, [](const Vec3& a, const Vec3& b) { return a.z > b.z; });
+            if (lowered.count(key2(c[0])) && lowered.count(key2(c[1]))) continue;
+            const Vec3 n = HorizontalDirection(Cross(f.p[1] - f.p[0], f.p[2] - f.p[0]), r);
+            MeshGroup& gr = piece.Group(f.texture);
+            const u32 base = (u32)gr.vertices.size();
+            for (int k = 0; k < 3; ++k) gr.vertices.push_back(Vertex(f.p[k], n, f.uv[k].x, f.uv[k].y, color));
+            for (u32 i : { 0u, 1u, 2u, 0u, 2u, 1u }) gr.indices.push_back(base + i);
+            const float high = c[0].z, low = c[2].z;
+            if (high - low <= 0.03f) continue;
+            const Vec3 foot0 = c[2], foot1 = c[1].z - low < 0.03f ? c[1] : c[0];
+            if (Length(Vec3{ foot1.x - foot0.x, foot1.y - foot0.y, 0.0f }) < 0.05f) continue;
+            CollisionWall wall;
+            wall.points = { foot0, { foot1.x, foot1.y, low } };
+            wall.barrier = false;
+            wall.height = high - low;
+            wall.surface = kSurfaceSidewalk;
+            piece.walls.push_back(std::move(wall));
+        }
+    }
+
+    // ---- from the road end to the faces, where they do not reach the node:
+    // its edges zipped to the nearest edge of the faces, lane edge by lane
+    // edge, with the sidewalks and their kerbs.
+    {
+        bool reachesNode = false;
+        for (const Part& part : parts)
+            for (const FaceCorner& k : part.corners)
+                reachesNode |= std::fabs(along(k.p)) < 0.03f && inWidth(lat(k.p));
+        if (!reachesNode && !parts.empty()) {
+            // The faces' open edges facing the node.
+            struct Edge { Vec3 a, b; };
+            std::vector<Edge> open;
+            {
+                const auto key2 = [](const Vec3& p) { return std::make_pair(std::lround(p.x * 100.0f), std::lround(p.y * 100.0f)); };
+                std::map<std::pair<std::pair<long, long>, std::pair<long, long>>, int> count;
+                for (const Part& part : parts)
+                    for (size_t k = 0; k < part.corners.size(); ++k) {
+                        auto a = key2(part.corners[k].p), b = key2(part.corners[(k + 1) % part.corners.size()].p);
+                        if (b < a) std::swap(a, b);
+                        ++count[{ a, b }];
+                    }
+                for (const Part& part : parts) {
+                    Vec3 mid{};
+                    for (const FaceCorner& k : part.corners) mid = mid + k.p;
+                    mid = mid * (1.0f / part.corners.size());
+                    for (size_t k = 0; k < part.corners.size(); ++k) {
+                        const size_t n = (k + 1) % part.corners.size();
+                        auto a = key2(part.corners[k].p), b = key2(part.corners[n].p);
+                        if (b < a) std::swap(a, b);
+                        if (count[{ a, b }] != 1) continue;
+                        const Vec3 pa{ part.corners[k].p.x, part.corners[k].p.y, part.z[k] };
+                        const Vec3 pb{ part.corners[n].p.x, part.corners[n].p.y, part.z[n] };
+                        const Vec3 m = (pa + pb) * 0.5f;
+                        if (along(m) > along(mid)) continue;          // faces away from the node
+                        open.push_back({ pa, pb });
+                    }
                 }
-                CollisionWall kerb;
-                kerb.points = { a0, b0 };
-                kerb.barrier = false;
-                kerb.height = std::max(ha, hb);
-                kerb.surface = kSurfaceSidewalk;
-                piece.walls.push_back(std::move(kerb));
+            }
+            // Across the road's width, the nearest open edge at each lat.
+            std::vector<Vec3> chain;
+            const auto onEdge = [&](const Edge& e, float l, Vec3& at) {
+                const float la = lat(e.a), lb = lat(e.b);
+                if ((l < std::min(la, lb) - 1e-4f) || (l > std::max(la, lb) + 1e-4f) || std::fabs(la - lb) < 1e-5f)
+                    return false;
+                const float t = (l - la) / (lb - la);
+                at = e.a + (e.b - e.a) * t;
+                return true;
+            };
+            const auto nearestAt = [&](float l, Vec3& at) {
+                float best = 1e30f;
+                for (const Edge& e : open) {
+                    Vec3 q;
+                    if (onEdge(e, l, q) && along(q) > -0.05f && along(q) < best) { best = along(q); at = q; }
+                }
+                return best < 1e29f;
+            };
+            std::vector<float> stops;
+            for (const Edge& e : open)
+                for (const Vec3& q : { e.a, e.b })
+                    if (lat(q) > walkLo && lat(q) < walkHi) stops.push_back(lat(q));
+            for (float l : roadLats) stops.push_back(l);
+            stops.push_back(walkLo);
+            stops.push_back(walkHi);
+            std::sort(stops.begin(), stops.end());
+            stops.erase(std::unique(stops.begin(), stops.end(), [](float a, float b) { return std::fabs(a - b) < 0.02f; }),
+                        stops.end());
+            for (float l : stops) {
+                Vec3 q;
+                if (nearestAt(std::clamp(l, walkLo + 1e-3f, walkHi - 1e-3f), q)) chain.push_back(q);
+            }
+            if (chain.size() >= 2) {
+                // The road end's own points, and the zip by zone.
+                const auto endPoint = [&](float l, bool walk) {
+                    Vec3 p = node + r * l;
+                    p.z = node.z + (walk ? walkLift : 0.0f);
+                    return p;
+                };
+                struct Zone { float lo, hi; bool walk; };
+                std::vector<Zone> zones;
+                if (walkLo < roadLo - 0.01f) zones.push_back({ walkLo, roadLo, true });
+                zones.push_back({ roadLo, roadHi, false });
+                if (walkHi > roadHi + 0.01f) zones.push_back({ roadHi, walkHi, true });
+                for (const Zone& zone : zones) {
+                    std::vector<Vec3> ends, near;
+                    if (zone.walk) { ends = { endPoint(zone.lo, true), endPoint(zone.hi, true) }; }
+                    else for (float l : roadLats) ends.push_back(endPoint(l, false));
+                    for (const Vec3& q : chain)
+                        if (lat(q) >= zone.lo - 0.03f && lat(q) <= zone.hi + 0.03f) near.push_back(q);
+                    if (near.size() < 2 || ends.size() < 2) continue;
+                    MeshGroup& gr = piece.Group(zone.walk ? profile.sidewalkTexture : asphalt);
+                    const auto uvOf = [&](const Vec3& q) {
+                        if (!zone.walk) return asphaltUv(q);
+                        const float across = std::min(std::fabs(lat(q) - roadLo), std::fabs(lat(q) - roadHi));
+                        return Vec2{ std::clamp(across / std::max(0.01f, profile.sidewalkWidth), 0.0f, 1.0f),
+                                     along(q) / std::max(0.5f, profile.textureLength) };
+                    };
+                    const auto tri = [&](const Vec3& a, const Vec3& b, const Vec3& c) {
+                        std::vector<MeshVertex> ring;
+                        for (const Vec3& q : { a, b, c }) {
+                            const Vec2 t = uvOf(q);
+                            ring.push_back(Vertex(q, up, t.x, t.y, color));
+                        }
+                        fanUp(gr, ring);
+                        CollisionArea area;
+                        area.outline = { a, b, c };
+                        area.surface = zone.walk ? kSurfaceSidewalk : kSurfaceRoad;
+                        piece.areas.push_back(std::move(area));
+                    };
+                    size_t i = 0, k = 0;
+                    while (i + 1 < ends.size() || k + 1 < near.size()) {
+                        const bool advanceEnd =
+                            k + 1 >= near.size() || (i + 1 < ends.size() && lat(ends[i + 1]) <= lat(near[k + 1]));
+                        if (advanceEnd) { tri(ends[i], ends[i + 1], near[k]); ++i; }
+                        else { tri(ends[i], near[k + 1], near[k]); ++k; }
+                    }
+                    // The kerb between this sidewalk and the road, along the zip.
+                    if (zone.walk && walkLift > 0.02f) {
+                        const float l = zone.lo < roadLo ? zone.hi : zone.lo;
+                        Vec3 farTop{}, farLow{};
+                        bool found = false;
+                        for (const Vec3& q : chain)
+                            if (std::fabs(lat(q) - l) < 0.03f) { farTop = q; found = true; }
+                        if (found) {
+                            farLow = farTop;
+                            farLow.z = roadZ(farTop);
+                            const Vec3 nearLow = endPoint(l, false), nearTop = endPoint(l, true);
+                            const Vec3 face = r * (zone.lo < roadLo ? 1.0f : -1.0f);
+                            MeshGroup& kg = piece.Group(profile.sidewalkTexture);
+                            AddQuad(kg, Vertex(nearLow, face, 0, 0, color), Vertex(nearTop, face, 0.1f, 0, color),
+                                    Vertex(farTop, face, 0.1f, 1, color), Vertex(farLow, face, 0, 1, color), face);
+                            CollisionWall kerb;
+                            kerb.points = { nearLow, farLow };
+                            kerb.barrier = false;
+                            kerb.height = walkLift;
+                            kerb.surface = kSurfaceSidewalk;
+                            piece.walls.push_back(std::move(kerb));
+                        }
+                    }
+                }
             }
         }
     }
@@ -1568,7 +1982,43 @@ bool Network::BuildFaceJunctionPiece(const FaceJunction& j, MeshPiece& piece) co
     std::snprintf(name, sizeof(name), "ROAD_F%u", j.node);
     piece.name = name;
     piece.node = j.node;
-    BuildFaceJunction(j, n->position, into, s->profile, piece);
+    if (j.refined.empty()) {
+        // Leaving the node at its start, the road's right is this junction's left.
+        BuildFaceJunction(j, n->position, into, s->profile, s->a == j.node ? -1.0f : 1.0f, s->Offset(), piece);
+        return true;
+    }
+    // Refined by hand: its triangles as they came back; the flat ones are
+    // driven on (road or sidewalk by texture), the standing ones are kerbs.
+    for (const RefinedTriangle& t : j.refined) {
+        MeshGroup& g = piece.Group(t.texture);
+        const u32 base = (u32)g.vertices.size();
+        for (int k = 0; k < 3; ++k) g.vertices.push_back(Vertex(t.p[k], t.n[k], t.uv[k].x, t.uv[k].y, Grey(0.5f)));
+        for (u32 k = 0; k < 3; ++k) g.indices.push_back(base + k);
+        const Vec3 normal = Cross(t.p[1] - t.p[0], t.p[2] - t.p[0]);
+        const float length = Length(normal);
+        if (length < 1e-6f) continue;
+        if (std::fabs(normal.z) / length > 0.3f) {
+            CollisionArea area;
+            area.outline = { t.p[0], t.p[1], t.p[2] };
+            area.surface = IsRoadSurface(t.texture) ? kSurfaceRoad : kSurfaceSidewalk;
+            piece.areas.push_back(std::move(area));
+            continue;
+        }
+        Vec3 low = t.p[0], other = t.p[1];
+        float high = std::max({ t.p[0].z, t.p[1].z, t.p[2].z });
+        // The foot: the two lowest corners.
+        Vec3 c[3] = { t.p[0], t.p[1], t.p[2] };
+        std::sort(c, c + 3, [](const Vec3& a, const Vec3& b) { return a.z < b.z; });
+        low = c[0];
+        other = c[1];
+        if (Length(Vec3{ other.x - low.x, other.y - low.y, 0.0f }) < 0.05f || high - low.z < 0.03f) continue;
+        CollisionWall wall;
+        wall.points = { low, { other.x, other.y, low.z } };
+        wall.barrier = false;
+        wall.height = high - low.z;
+        wall.surface = kSurfaceSidewalk;
+        piece.walls.push_back(std::move(wall));
+    }
     return true;
 }
 
@@ -1754,6 +2204,21 @@ bool Network::NearestOnSegment(const Segment& segment, const Vec3& point, float&
 
 // ---------------------------------------------------------------------------
 
+// How far `point` is outside road `o`'s cross-section (negative inside):
+// across it from its nearest point, against its own span -- lanes and
+// shoulders, and the sidewalks when `outer`.
+float Network::SideGap(const Segment& o, const Vec3& point, bool outer) const {
+    float t = 0.0f, distance = 0.0f;
+    NearestOnSegment(o, point, t, distance);
+    const Curve oc = CurveOf(o);
+    const Vec3 q = oc.At(t);
+    const Vec3 right = RightOf(HorizontalDirection(oc.Tangent(t)));
+    const float l = Dot(Horizontal(point - q), right) - o.Offset();
+    const float half = o.profile.HalfRoad();
+    const float lo = -(outer ? o.profile.Edge(-1) : half), hi = outer ? o.profile.Edge(1) : half;
+    return l > hi ? l - hi : l < lo ? lo - l : -std::min(l - lo, hi - l);
+}
+
 std::vector<MeshPiece> Network::BuildMesh(std::vector<Pole>* polesOut) const {
     std::vector<MeshPiece> pieces;
     std::vector<Pole> poles;
@@ -1826,14 +2291,67 @@ std::vector<MeshPiece> Network::BuildMesh(std::vector<Pole>* polesOut) const {
         junctions[node.id] = std::move(ends);
     }
 
+    // A road's shoulders end at a junction of three or more roads where one of
+    // the others has none: the junction meets it at its lanes' edge.
+    const auto shoulderEndsAt = [&](const Segment& s, u32 nodeId) {
+        if (!s.profile.AnyShoulder() || !junctions.count(nodeId)) return false;
+        for (u32 id : SegmentsAt(nodeId))
+            if (const Segment* o = FindSegment(id); o && o->id != s.id && !o->profile.AnyShoulder()) return true;
+        return false;
+    };
+    // A road's end at a through node, once it has closed what the road going
+    // on there does not have: its kerbs and outer edges across its own way.
+    struct EndShape { float laneLeft, laneRight, outerLeft, outerRight; };
+    // On one side, what each road keeps against the other's: a shoulder goes
+    // where the other has neither a shoulder nor a sidewalk there, a
+    // sidewalk likewise (one meeting a shoulder stays, sinking to the road).
+    struct SideRule { bool shoulderCloses, walkCloses, walkSinks; };
+    const auto sideRule = [](const RoadProfile& a, int side, const RoadProfile& b, int theirs) {
+        const bool bShoulder = b.ShoulderAt(theirs) > 0.01f, bWalk = b.Walk(theirs);
+        SideRule rule;
+        rule.shoulderCloses = a.ShoulderAt(side) > 0.01f && !bShoulder && !bWalk;
+        rule.walkCloses = a.Walk(side) && !bWalk && !bShoulder;
+        rule.walkSinks = a.Walk(side) && !bWalk && bShoulder;
+        return rule;
+    };
+    const auto endShape = [&](const Segment& q, const Segment& r, bool sameWay) {
+        const RoadProfile& a = q.profile;
+        const RoadProfile& b = r.profile;
+        const int bForward = sameWay ? b.lanesForward : b.lanesBackward;
+        const int bBackward = sameWay ? b.lanesBackward : b.lanesForward;
+        const float lanesLeft = (float)std::max(0, a.lanesBackward - bBackward) * a.laneWidth;
+        const float lanesRight = (float)std::max(0, a.lanesForward - bForward) * a.laneWidth;
+        const float median = a.MedianWidth() > 0.01f && b.MedianWidth() <= 0.01f && a.medianTaper > 0.01f
+                                 ? a.MedianWidth() * 0.5f : 0.0f;
+        const float half = a.HalfRoad();
+        EndShape e;
+        e.laneLeft = -half + a.ShoulderAt(-1) + q.Offset() + lanesLeft + median;
+        e.laneRight = half - a.ShoulderAt(1) + q.Offset() - lanesRight - median;
+        float outer[2];
+        for (int side = -1; side <= 1; side += 2) {
+            const SideRule rule = sideRule(a, side, b, sameWay ? side : -side);
+            float width = 0.0f;
+            if (a.ShoulderAt(side) > 0.01f && !rule.shoulderCloses) width += a.ShoulderAt(side);
+            if (a.Walk(side) && !rule.walkCloses) width += a.sidewalkWidth;
+            outer[side > 0 ? 1 : 0] = width;
+        }
+        e.outerLeft = e.laneLeft - outer[0];
+        e.outerRight = e.laneRight + outer[1];
+        return e;
+    };
+
+    // Where each road's walls start, per end and side (A left, A right, B
+    // left, B right), for the gores between roads split apart.
+    std::map<u32, std::array<float, 4>> wallSkips;
+
     // ---- segments ----------------------------------------------------------
     for (const Segment& s : segments_) {
         const Curve curve = CurveOf(s);
         const Trim trim = trims.count(s.id) ? trims[s.id] : Trim{};
         if (trim.endT - trim.startT < 0.01f) continue;
         std::vector<Station> stations = Stations(curve, trim.startT, trim.endT);
-        if (std::fabs(s.shift) > 1e-4f)
-            for (Station& st : stations) st.point = st.point + st.right * s.shift;
+        if (std::fabs(s.Offset()) > 1e-4f)
+            for (Station& st : stations) st.point = st.point + st.right * s.Offset();
         if (stations.size() < 2) continue;
 
         // The junction ends take their cross-section from here, so they meet.
@@ -1893,6 +2411,7 @@ std::vector<MeshPiece> Network::BuildMesh(std::vector<Pole>* polesOut) const {
         const auto crosses = [&](u32 nodeId) {
             const Node* n = FindNode(nodeId);
             if (const GameJunction* gj = FindGameJunction(nodeId)) return gj->crosswalks;   // across the mouth
+            if (const FaceJunction* fj = FindFaceJunction(nodeId)) return fj->crosswalks;
             return n && n->crosswalks && junctions.count(nodeId);
         };
         const float reach = std::min(kCrosswalkDepth, total * 0.4f);
@@ -1919,14 +2438,164 @@ std::vector<MeshPiece> Network::BuildMesh(std::vector<Pole>* polesOut) const {
             const int oBackward = sameWay ? o->profile.lanesBackward : o->profile.lanesForward;
             taper.lanes[end][1] = std::max(0, s.profile.lanesForward - oForward);
             taper.lanes[end][0] = std::max(0, s.profile.lanesBackward - oBackward);
-            // Its left edge there, once tapered, against the other road's
-            // (both across this road's way): the difference slides away
-            // over the taper.
-            const float ownLeft = -s.profile.HalfRoad() + s.shift + taper.lanes[end][0] * s.profile.laneWidth;
-            const float otherHalf = o->profile.HalfRoad();
-            const float otherLeft = sameWay ? -otherHalf + o->shift : -otherHalf - o->shift;
-            if (taper.lanes[end][0] || taper.lanes[end][1] || std::fabs(s.shift - (sameWay ? o->shift : -o->shift)) > 1e-3f)
-                taper.slide[end] = otherLeft - ownLeft;
+            // A median the road going on does not have narrows away.
+            const bool closes = s.profile.MedianWidth() > 0.01f && o->profile.MedianWidth() <= 0.01f &&
+                                s.profile.medianTaper > 0.01f;
+            if (closes)
+                taper.medianClose[end] = std::clamp(total * s.profile.medianTaper / 100.0f, 1.0f, total);
+            // Each side's shoulder and sidewalk against what the other road
+            // has on the same side.
+            for (int side = -1; side <= 1; side += 2) {
+                const SideRule rule = sideRule(s.profile, side, o->profile, sameWay ? side : -side);
+                const int k = side > 0 ? 1 : 0;
+                if (rule.shoulderCloses) taper.shoulderClose[end][k] = taper.length;
+                if (rule.walkCloses) taper.walkClose[end][k] = taper.length;
+                if (rule.walkSinks) taper.walkSink[end][k] = taper.length;
+            }
+            // Each side's sidewalk and wall against the other road's on the
+            // same side (in this road's direction).
+            for (int side = -1; side <= 1; side += 2) {
+                const int theirs = sameWay ? side : -side;
+                const int k = side > 0 ? 1 : 0;
+                const bool wall = s.profile.Wall(side) && s.profile.wallHeight >= 0.05f;
+                const bool theirWall = o->profile.Wall(theirs) && o->profile.wallHeight >= 0.05f;
+                if (wall && !theirWall) taper.wallClose[end][k] = taper.length;
+            }
+            // Both ends as they come out once each has closed what the other
+            // lacks (across this road's way): the left kerbs meet by sliding,
+            // what is left over at the right kerb and at each sidewalk's outer
+            // edge is taken up by widening over the taper.
+            const EndShape own = endShape(s, *o, sameWay);
+            EndShape theirs = endShape(*o, s, sameWay);
+            if (!sameWay)
+                theirs = { -theirs.laneRight, -theirs.laneLeft, -theirs.outerRight, -theirs.outerLeft };
+            // Both roads do this, so each goes half way: they meet between.
+            // The lanes' left edges by sliding, their right edges by the outer
+            // lane, and each side's outer edge by the shoulder or sidewalk.
+            taper.slide[end] = (theirs.laneLeft - own.laneLeft) * 0.5f;
+            if (std::fabs(taper.slide[end]) < 1e-4f) taper.slide[end] = 0.0f;
+            const float lane = (own.laneRight + theirs.laneRight) * 0.5f - (own.laneRight + taper.slide[end]);
+            if (std::fabs(lane) > 1e-3f) taper.laneStretch[end] = lane;
+            const float ownOuter[2] = { own.laneLeft - own.outerLeft, own.outerRight - own.laneRight };
+            const float theirOuter[2] = { theirs.laneLeft - theirs.outerLeft, theirs.outerRight - theirs.laneRight };
+            for (int k = 0; k < 2; ++k) {
+                const float more = (theirOuter[k] - ownOuter[k]) * 0.5f;
+                if (std::fabs(more) > 1e-3f && ownOuter[k] > 0.01f) taper.outerStretch[end][k] = more;
+            }
+        }
+        // Into a junction where another road has no shoulder: both close.
+        for (int end = 0; end < 2; ++end)
+            if (shoulderEndsAt(s, end ? s.b : s.a))
+                taper.shoulderClose[end][0] = taper.shoulderClose[end][1] = taper.length;
+        // Split off at the same node as another road (an exit and the lanes
+        // going on): the shoulder on the side facing it closes towards the
+        // node, so the two meet lane edge to lane edge and part in a gore.
+        for (int end = 0; end < 2; ++end) {
+            const Node* here = FindNode(end ? s.b : s.a);
+            if (!here || !here->follow || !s.profile.AnyShoulder()) continue;
+            const Station& st = end ? stations.back() : stations.front();
+            for (int side = -1; side <= 1; side += 2) {
+                if (s.profile.ShoulderAt(side) <= 0.01f) continue;
+                const Vec3 laneEdge = st.At((s.profile.HalfRoad() - s.profile.ShoulderAt(side) + 0.05f) * side, 0.0f);
+                bool facing = false;
+                for (const Node& other : nodes_) {
+                    if (other.follow != here->follow || other.id == here->id) continue;
+                    for (u32 id : SegmentsAt(other.id)) {
+                        const Segment* o = FindSegment(id);
+                        if (!o) continue;
+                        if (SideGap(*o, laneEdge, false) < 0.3f) facing = true;
+                    }
+                }
+                if (facing) taper.shoulderClose[end][side > 0 ? 1 : 0] = taper.length;
+            }
+        }
+        // Where a road splits in two (its end followed by the two roads'
+        // ends, as Split Two Directions and exits leave it): each side's
+        // shoulder against the road going on on that side, both ways.
+        const auto rightAt = [&](const Segment& q, u32 nodeId) {
+            const Curve c = CurveOf(q);
+            return RightOf(HorizontalDirection(c.Tangent(q.a == nodeId ? 0.0f : 1.0f)));
+        };
+        for (int end = 0; end < 2; ++end) {
+            const u32 nodeId = end ? s.b : s.a;
+            const Node* here = FindNode(nodeId);
+            if (!here) continue;
+            const Vec3 ownRight = rightAt(s, nodeId);
+            // This road is the one split: on each side, matched to the road
+            // going on there -- what one has that the other lacks closes or
+            // sinks, the lane edges slide and widen onto the branch's, and the
+            // shoulder or sidewalk widens to the branch's outer edge.
+            if (SegmentsAt(nodeId).size() == 1) {
+                bool anyFollower = false;
+                for (const Node& f : nodes_) anyFollower |= f.follow == nodeId;
+                if (anyFollower) {
+                    const RoadProfile& p = s.profile;
+                    const float half = p.HalfRoad();
+                    float laneTarget[2] = { 0.0f, 0.0f }, outerTarget[2] = { 0.0f, 0.0f };
+                    bool found[2] = { false, false };
+                    for (int side = -1; side <= 1; side += 2) {
+                        const int k = side > 0 ? 1 : 0;
+                        for (const Node& f : nodes_) {
+                            if (f.follow != nodeId || found[k]) continue;
+                            const float centre = Dot(Horizontal(f.position - here->position), ownRight);
+                            if (centre * side <= 0.05f) continue;   // on the other side
+                            for (u32 id : SegmentsAt(f.id)) {
+                                const Segment* o = FindSegment(id);
+                                if (!o || found[k]) continue;
+                                const float same = Dot(rightAt(*o, f.id), ownRight) > 0.0f ? 1.0f : -1.0f;
+                                const int outer = same * side > 0.0f ? 1 : -1;     // the branch's side facing out
+                                const SideRule mine = sideRule(p, side, o->profile, outer);
+                                if (mine.shoulderCloses) taper.shoulderClose[end][k] = taper.length;
+                                if (mine.walkCloses) taper.walkClose[end][k] = taper.length;
+                                if (mine.walkSinks) taper.walkSink[end][k] = taper.length;
+                                const SideRule theirs = sideRule(o->profile, outer, p, side);
+                                const RoadProfile& q = o->profile;
+                                const float laneX = (q.HalfRoad() - q.ShoulderAt(outer)) * (float)outer;
+                                laneTarget[k] = centre + same * (laneX + o->Offset());
+                                float width = 0.0f;
+                                if (q.ShoulderAt(outer) > 0.01f && !theirs.shoulderCloses) width += q.ShoulderAt(outer);
+                                if (q.Walk(outer) && !theirs.walkCloses) width += q.sidewalkWidth;
+                                outerTarget[k] = width;
+                                found[k] = true;
+                            }
+                        }
+                    }
+                    const float ownLane[2] = { -half + p.ShoulderAt(-1) + s.Offset(), half - p.ShoulderAt(1) + s.Offset() };
+                    if (found[0]) taper.slide[end] = laneTarget[0] - ownLane[0];
+                    if (found[1]) {
+                        const float more = laneTarget[1] - (ownLane[1] + taper.slide[end]);
+                        if (std::fabs(more) > 1e-3f) taper.laneStretch[end] = more;
+                    }
+                    for (int k = 0; k < 2; ++k) {
+                        if (!found[k]) continue;
+                        const int side = k ? 1 : -1;
+                        const SideRule rule{ taper.shoulderClose[end][k] > 0.0f, taper.walkClose[end][k] > 0.0f, false };
+                        float own = 0.0f;
+                        if (p.ShoulderAt(side) > 0.01f && !rule.shoulderCloses) own += p.ShoulderAt(side);
+                        if (p.Walk(side) && !rule.walkCloses) own += p.sidewalkWidth;
+                        if (own > 0.01f && std::fabs(outerTarget[k] - own) > 1e-3f) taper.outerStretch[end][k] = outerTarget[k] - own;
+                    }
+                }
+            }
+            // This road goes on from a split: its outer side against the road
+            // that was split, on that side.
+            if (here->follow) {
+                const Node* trunkNode = FindNode(here->follow);
+                if (!trunkNode) continue;
+                const Vec3 d = Horizontal(here->position - trunkNode->position);
+                if (Length(d) < 0.05f) continue;
+                const int outer = Dot(d, ownRight) > 0.0f ? 1 : -1;
+                for (u32 id : SegmentsAt(trunkNode->id)) {
+                    const Segment* trunk = FindSegment(id);
+                    if (!trunk) continue;
+                    const int trunkSide = Dot(d, rightAt(*trunk, trunkNode->id)) > 0.0f ? 1 : -1;
+                    const SideRule rule = sideRule(s.profile, outer, trunk->profile, trunkSide);
+                    const int k = outer > 0 ? 1 : 0;
+                    if (rule.shoulderCloses) taper.shoulderClose[end][k] = taper.length;
+                    if (rule.walkCloses) taper.walkClose[end][k] = taper.length;
+                    if (rule.walkSinks) taper.walkSink[end][k] = taper.length;
+                }
+            }
         }
         // Split off at the same node as another road (an exit and the lanes
         // going on): the walls between them start where they have parted.
@@ -1948,21 +2617,22 @@ std::vector<MeshPiece> Network::BuildMesh(std::vector<Pole>* polesOut) const {
                     if (from > 200.0f) break;
                     const Vec3 wallAt = st.At(s.profile.Edge(side) * side, 0.0f);
                     float gap = 1e30f;
-                    for (const Segment* o : siblings) {
-                        float t = 0.0f, distance = 0.0f;
-                        NearestOnSegment(*o, wallAt, t, distance);
-                        const Curve oc = CurveOf(*o);
-                        const Vec3 q = oc.At(t);
-                        const Vec3 right = RightOf(HorizontalDirection(oc.Tangent(t)));
-                        const int facing = Dot(Horizontal(wallAt - q), right) >= 0.0f ? 1 : -1;
-                        gap = std::min(gap, distance - o->profile.Edge(facing) - std::fabs(o->shift));
-                    }
+                    for (const Segment* o : siblings) gap = std::min(gap, SideGap(*o, wallAt, true));
                     if (gap >= 0.5f) break;
                     skip = from + 0.01f;
                 }
                 if (skip > 0.0f) taper.wallSkip[end][side > 0 ? 1 : 0] = std::min(skip, total);
             }
         }
+        // Moved by hand, per side.
+        for (int end = 0; end < 2; ++end)
+            for (int k = 0; k < 2; ++k) {
+                const float extra = end ? (k ? s.profile.wallEndRight : s.profile.wallEndLeft)
+                                        : (k ? s.profile.wallStartRight : s.profile.wallStartLeft);
+                if (extra != 0.0f)
+                    taper.wallSkip[end][k] = std::clamp(taper.wallSkip[end][k] + extra, 0.0f, total * 0.5f);
+            }
+        wallSkips[s.id] = { taper.wallSkip[0][0], taper.wallSkip[0][1], taper.wallSkip[1][0], taper.wallSkip[1][1] };
         const int count = std::max(1, (int)std::ceil(total / kPieceLength));
         size_t first = 0;
         for (int k = 0; k < count; ++k) {
@@ -2003,6 +2673,89 @@ std::vector<MeshPiece> Network::BuildMesh(std::vector<Pole>* polesOut) const {
             pieces.push_back(std::move(piece));
     }
 
+    // ---- gores: between two roads split apart at a node ---------------------
+    // From where they part to where the walls between them start, the gap
+    // is paved with the game's hatched strip, a little under their edges.
+    for (const Node& x : nodes_) {
+        std::vector<const Node*> followers;
+        for (const Node& f : nodes_)
+            if (f.follow == x.id && SegmentsAt(f.id).size() == 1) followers.push_back(&f);
+        if (followers.size() < 2) continue;
+        std::sort(followers.begin(), followers.end(),
+                  [](const Node* a, const Node* b) { return a->followOffset < b->followOffset; });
+        for (size_t i = 0; i + 1 < followers.size(); ++i) {
+            const Node* fa = followers[i];
+            const Node* fb = followers[i + 1];
+            const Segment* ra = FindSegment(SegmentsAt(fa->id).front());
+            const Segment* rb = FindSegment(SegmentsAt(fb->id).front());
+            if (!ra || !rb || ra->id == rb->id) continue;
+            struct Side { const Segment* s; bool atStart; int side; float length; Curve curve; };
+            const auto sideOf = [&](const Segment* q, const Node* f, const Node* other) {
+                Side out;
+                out.s = q;
+                out.atStart = q->a == f->id;
+                out.curve = CurveOf(*q);
+                const Vec3 right = RightOf(HorizontalDirection(out.curve.Tangent(out.atStart ? 0.0f : 1.0f)));
+                out.side = Dot(Horizontal(other->position - f->position), right) > 0.0f ? 1 : -1;
+                float length = 0.0f;
+                Vec3 previous = out.curve.At(0.0f);
+                for (int k = 1; k <= 32; ++k) {
+                    const Vec3 p = out.curve.At(k / 32.0f);
+                    length += Length(p - previous);
+                    previous = p;
+                }
+                out.length = std::max(1.0f, length);
+                return out;
+            };
+            const Side a = sideOf(ra, fa, fb), b = sideOf(rb, fb, fa);
+            const auto skipOf = [&](const Side& q) {
+                const auto found = wallSkips.find(q.s->id);
+                if (found == wallSkips.end()) return 0.0f;
+                const int k = q.side > 0 ? 1 : 0;
+                return found->second[(q.atStart ? 0 : 2) + k];
+            };
+            float reach = std::max(skipOf(a), skipOf(b));
+            if (reach < 1.0f) continue;      // no walls between them: nothing to hide
+            reach = std::min(reach + 3.0f, std::min(a.length, b.length) * 0.9f);   // on under the walls' ends
+            // A point on a road's facing edge, `d` from the split, tucked
+            // a little under its edge and surface.
+            const auto edgeAt = [&](const Side& q, float d) {
+                const float t = std::clamp(q.atStart ? d / q.length : 1.0f - d / q.length, 0.0f, 1.0f);
+                const Vec3 right = RightOf(HorizontalDirection(q.curve.Tangent(t)));
+                const RoadProfile& p = q.s->profile;
+                const float len = std::min(std::max(5.0f, p.taperLength), q.length * 0.9f);
+                const float tt = std::clamp(d / len, 0.0f, 1.0f);
+                const float open = tt * tt * (3.0f - 2.0f * tt);
+                const float edge = p.HalfRoad() - p.ShoulderAt(q.side) * (1.0f - open) - 0.15f;
+                return q.curve.At(t) + right * (q.s->Offset() + edge * (float)q.side) + Vec3{ 0.0f, 0.0f, -0.02f };
+            };
+            MeshPiece piece;
+            char name[64];
+            std::snprintf(name, sizeof(name), "ROAD_W%u_%zu", x.id, i);
+            piece.name = name;
+            piece.node = x.id;
+            MeshGroup& g = piece.Group("RDP_ROADSTRIP_MC");
+            const Vec3 up{ 0.0f, 0.0f, 1.0f };
+            const int steps = std::max(2, (int)std::ceil(reach / 2.0f));
+            const float tile = std::max(0.5f, ra->profile.textureLength);
+            Vec3 pa = edgeAt(a, 0.0f), pb = edgeAt(b, 0.0f);
+            for (int k = 1; k <= steps; ++k) {
+                const float d = reach * k / steps;
+                const Vec3 qa = edgeAt(a, d), qb = edgeAt(b, d);
+                const float v0 = reach * (k - 1) / steps / tile, v1 = d / tile;
+                AddQuad(g, Vertex(pa, up, 0, v0, Grey(0.5f)), Vertex(pb, up, 1, v0, Grey(0.5f)),
+                        Vertex(qb, up, 1, v1, Grey(0.5f)), Vertex(qa, up, 0, v1, Grey(0.5f)), up);
+                CollisionArea area;
+                area.outline = { pa, pb, qb, qa };
+                area.surface = kSurfaceRoad;
+                piece.areas.push_back(std::move(area));
+                pa = qa;
+                pb = qb;
+            }
+            if (piece.VertexCount()) pieces.push_back(std::move(piece));
+        }
+    }
+
     // ---- junction surfaces -------------------------------------------------
     for (const auto& [nodeId, ends] : junctions) {
         const Node& node = *FindNode(nodeId);
@@ -2022,13 +2775,17 @@ std::vector<MeshPiece> Network::BuildMesh(std::vector<Pole>* polesOut) const {
         std::vector<Corner> corners;
         for (const End& end : ends) {
             const Segment& s = *FindSegment(end.segment);
+            // Kerb to kerb, at the lanes' edge on a side whose shoulder ends here.
+            const bool ends = shoulderEndsAt(s, nodeId);
             const float half = s.profile.HalfRoad();
+            const float halfLeft = half - (ends ? s.profile.ShoulderAt(-1) : 0.0f);
+            const float halfRight = half - (ends ? s.profile.ShoulderAt(1) : 0.0f);
             // The station's own right runs along the segment; leaving the
             // junction at its far end turns it round.
             const Vec3 right = end.atStart ? end.station.right : end.station.right * -1.0f;
             Corner c;
-            c.left = end.station.point - right * half;
-            c.right = end.station.point + right * half;
+            c.left = end.station.point - right * (end.atStart ? halfLeft : halfRight);
+            c.right = end.station.point + right * (end.atStart ? halfRight : halfLeft);
             c.halfRoad = half;
             c.profile = &s.profile;
             c.wallLeft = end.atStart ? s.profile.wallLeft : s.profile.wallRight;
@@ -2226,7 +2983,10 @@ bool Network::Save(const std::wstring& path) const {
                       p.wallModelTurn, p.traffic ? 1 : 0, p.gps ? 1 : 0, p.speedLimit);
         out << text << banking << " " << p.pillarCount << " " << Token(p.pillarModel) << " " << p.pillarModelTurn
             << " " << (s.liftSetA ? 1 : 0) << " " << s.liftA << " " << (s.liftSetB ? 1 : 0) << " " << s.liftB << " "
-            << p.taperLength << " " << s.shift << "\n";
+            << p.taperLength << " " << s.shift << " " << p.medianTaper << " " << p.wallThickness << " " << p.shoulderType << " "
+            << p.shoulderWidth << " " << Token(p.shoulderTexture) << " " << (p.shoulderLine ? 1 : 0) << " "
+            << (p.groundAuto ? 2 : 0) << " " << p.shoulderSides << " " << p.wallStartLeft << " "
+            << p.wallStartRight << " " << p.wallEndLeft << " " << p.wallEndRight << "\n";
     }
     for (const GameJunction& j : gameJunctions_) {
         std::snprintf(line, sizeof(line),
@@ -2246,9 +3006,10 @@ bool Network::Save(const std::wstring& path) const {
     for (const FaceJunction& j : faceJunctions_) {
         const UvMap& map = j.asphaltMap;
         std::snprintf(line, sizeof(line),
-                      "fjunction %u %.3f %.5f %.5f %s %d %.4f %.4f %.6f %.6f %.6f %.6f %.6f %.6f %s\n", j.node, j.fillet,
-                      j.gameForward.x, j.gameForward.y, Token(j.asphalt).c_str(), map.valid ? 1 : 0, map.origin.x,
-                      map.origin.y, map.uv.x, map.uv.y, map.gu.x, map.gu.y, map.gv.x, map.gv.y, Token(j.model).c_str());
+                      "fjunction %u %.3f %.5f %.5f %s %d %.4f %.4f %.6f %.6f %.6f %.6f %.6f %.6f %s %d\n", j.node,
+                      j.fillet, j.gameForward.x, j.gameForward.y, Token(j.asphalt).c_str(), map.valid ? 1 : 0,
+                      map.origin.x, map.origin.y, map.uv.x, map.uv.y, map.gu.x, map.gu.y, map.gv.x, map.gv.y,
+                      Token(j.model).c_str(), j.crosswalks ? 1 : 0);
         out << line;
         for (const GameFace& f : j.faces) {
             std::snprintf(line, sizeof(line), "fface %u", j.node);
@@ -2258,7 +3019,17 @@ bool Network::Save(const std::wstring& path) const {
                               f.uv[k].y);
                 out << line;
             }
-            out << " " << Token(f.texture) << "\n";
+            out << " " << Token(f.texture) << " " << f.kind << "\n";
+        }
+        for (const RefinedTriangle& t : j.refined) {
+            std::snprintf(line, sizeof(line), "frefine %u", j.node);
+            out << line;
+            for (int k = 0; k < 3; ++k) {
+                std::snprintf(line, sizeof(line), " %.4f %.4f %.4f %.6f %.6f %.4f %.4f %.4f", t.p[k].x, t.p[k].y,
+                              t.p[k].z, t.uv[k].x, t.uv[k].y, t.n[k].x, t.n[k].y, t.n[k].z);
+                out << line;
+            }
+            out << " " << Token(t.texture) << "\n";
         }
     }
     for (const GameCut& c : cuts_) {
@@ -2320,6 +3091,8 @@ bool Network::Load(const std::wstring& path) {
             map.valid = valid != 0;
             j.asphalt = Untoken(asphalt);
             j.model = Untoken(model);
+            int crosswalks = 0;
+            if (line >> crosswalks) j.crosswalks = crosswalks != 0;
             faceJunctions_.push_back(std::move(j));
         } else if (kind == "fface") {
             u32 node = 0;
@@ -2330,8 +3103,22 @@ bool Network::Load(const std::wstring& path) {
             line >> texture;
             if (!line) continue;
             f.texture = Untoken(texture);
+            int kind = 0;
+            if (line >> kind) f.kind = std::clamp(kind, 0, 2);
             for (auto it = faceJunctions_.rbegin(); it != faceJunctions_.rend(); ++it)
                 if (it->node == node) { it->faces.push_back(std::move(f)); break; }
+        } else if (kind == "frefine") {
+            u32 node = 0;
+            RefinedTriangle t;
+            std::string texture;
+            line >> node;
+            for (int k = 0; k < 3; ++k)
+                line >> t.p[k].x >> t.p[k].y >> t.p[k].z >> t.uv[k].x >> t.uv[k].y >> t.n[k].x >> t.n[k].y >> t.n[k].z;
+            line >> texture;
+            if (!line) continue;
+            t.texture = Untoken(texture);
+            for (auto it = faceJunctions_.rbegin(); it != faceJunctions_.rend(); ++it)
+                if (it->node == node) { it->refined.push_back(std::move(t)); break; }
         } else if (kind == "cut") {
             GameCut c;
             line >> c.node >> c.centre.x >> c.centre.y >> c.centre.z >> c.forward.x >> c.forward.y >> c.halfLength >>
@@ -2396,6 +3183,32 @@ bool Network::Load(const std::wstring& path) {
                                 if (line >> taperLength) p.taperLength = std::clamp(taperLength, 5.0f, 500.0f);
                                 float shift = 0.0f;
                                 if (line >> shift) s.shift = std::clamp(shift, -50.0f, 50.0f);
+                                float medianTaper = 0.0f;
+                                if (line >> medianTaper) p.medianTaper = std::clamp(medianTaper, 0.0f, 100.0f);
+                                float wallThickness = 0.0f;
+                                if (line >> wallThickness) p.wallThickness = std::clamp(wallThickness, 0.0f, 5.0f);
+                                std::string shoulderTexture;
+                                if (line >> p.shoulderType >> p.shoulderWidth >> shoulderTexture) {
+                                    p.shoulderType = std::clamp(p.shoulderType, 0, 2);
+                                    p.shoulderWidth = std::clamp(p.shoulderWidth, 0.2f, 10.0f);
+                                    p.shoulderTexture = Untoken(shoulderTexture);
+                                    int shoulderLine = 1;
+                                    if (line >> shoulderLine) p.shoulderLine = shoulderLine != 0;
+                                    int groundAuto = 0;   // 2 is on: the 1 written while it was on by default reads as off
+                                    if (line >> groundAuto) p.groundAuto = groundAuto == 2;
+                                    int sides = 0;
+                                    if (line >> sides) p.shoulderSides = std::clamp(sides, 0, 2);
+                                    float startLeft = 0.0f, startRight = 0.0f;
+                                    if (line >> startLeft >> startRight) {
+                                        p.wallStartLeft = std::clamp(startLeft, -500.0f, 500.0f);
+                                        p.wallStartRight = std::clamp(startRight, -500.0f, 500.0f);
+                                        float endLeft = 0.0f, endRight = 0.0f;
+                                        if (line >> endLeft >> endRight) {
+                                            p.wallEndLeft = std::clamp(endLeft, -500.0f, 500.0f);
+                                            p.wallEndRight = std::clamp(endRight, -500.0f, 500.0f);
+                                        }
+                                    }
+                                }
                             }
                         }
                     }

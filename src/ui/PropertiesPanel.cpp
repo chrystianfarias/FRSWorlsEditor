@@ -190,6 +190,7 @@ void PropertiesPanel::Show(const View& view) {
 
 void PropertiesPanel::Commit(size_t row) {
     changed_ = true;
+    lastField_ = shown_.rows[row].field;
     shown_.rows[row].value = values_[row];
     Post(IDC_PROP_GRID);
 }

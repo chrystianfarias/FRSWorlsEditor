@@ -87,6 +87,9 @@ public:
     bool OnNotify(const NMHDR* header) { (void)header; return false; }
     bool OnCommand(int id);
     bool TakeChange() { const bool changed = changed_; changed_ = false; return changed; }
+    // The field of the row committed last (0 for none): with several objects
+    // shown at once, only that value goes to all of them.
+    int LastField() const { return lastField_; }
 
     // Pictures for names -- textures, models -- fitted into `size` pixels
     // square. The provider keeps what it returns; null when it has none.
@@ -125,6 +128,7 @@ private:
     bool haveShown_ = false;
     bool sorted_ = false;
     bool changed_ = false;
+    int  lastField_ = 0;
     int  activeRow_ = -1;                // the row being typed into, or dragged
     bool dragging_ = false;              // a label drag is changing activeRow_
     double lastLiveCommit_ = 0.0;

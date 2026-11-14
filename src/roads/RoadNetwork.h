@@ -89,6 +89,9 @@ struct RoadProfile {
     // that stand in for one of the game's own roads, whose surroundings are
     // already right.
     bool keepGround = false;
+    // The game's ground follows this road by itself (shown at once, written
+    // at the bake); off (the default), only Bake Terrain fits it, when asked.
+    bool groundAuto = false;
 
     // Banking: the road tilted into its curves. Auto works the angle out of
     // the curve's radius and the speed it is built for, tan = v^2 / (g r),
@@ -106,6 +109,29 @@ struct RoadProfile {
     float medianWidth = 2.0f;
     float medianHeight = 0.2f;     // raised kinds; a barrier's height
     std::string medianTexture;     // empty: the kind's own
+    // Towards a node where the road going on has no median, the median
+    // narrows away over this share of the road's length (percent); 0 ends
+    // it abruptly.
+    float medianTaper = 30.0f;
+    // A flat wall's depth, outwards from the edge: two faces and a top. 0
+    // keeps it a single sheet.
+    float wallThickness = 0.0f;
+    // How much later (negative: earlier) each wall starts at the road's
+    // start (A) and stops before its end (B), per side: where the road splits
+    // off another the wall begins once they have parted, and this moves it;
+    // elsewhere it leaves the wall out that far.
+    float wallStartLeft = 0.0f, wallStartRight = 0.0f;
+    float wallEndLeft = 0.0f, wallEndRight = 0.0f;
+    // A shoulder beyond the outer lane on each side, at road level and part
+    // of the road kerb to kerb: 0 none, 1 plain, 2 striped (the game's
+    // hatched road strip). Where the road going on at a node has none, it
+    // narrows away over the taper length. `shoulderLine`: a solid white line
+    // between it and the lane.
+    int   shoulderType = 0;
+    float shoulderWidth = 2.5f;
+    std::string shoulderTexture;   // empty: the kind's own
+    bool  shoulderLine = true;
+    int   shoulderSides = 0;       // 0 both, 1 left only, 2 right only (in the way it was drawn)
 
     // Sidewalks on each side, for roads whose inner side has none -- the two
     // halves of a split highway.
@@ -128,10 +154,24 @@ struct RoadProfile {
 
     int   Lanes() const { return lanesForward + lanesBackward; }
     float MedianWidth() const { return medianType ? medianWidth : 0.0f; }
-    float HalfRoad() const { return Lanes() * laneWidth * 0.5f + MedianWidth() * 0.5f; }
+    // The shoulder on one side: only where there is no sidewalk.
+    float ShoulderAt(int side) const {
+        const bool here = shoulderSides == 0 || (shoulderSides == 1) == (side < 0);
+        return shoulderType && here && !Walk(side) ? shoulderWidth : 0.0f;
+    }
+    bool  AnyShoulder() const { return ShoulderAt(-1) > 0.01f || ShoulderAt(1) > 0.01f; }
+    // Kerb to kerb, halved: the lanes, the median and the shoulders (which
+    // may be on one side only, so the lanes sit off the middle).
+    float HalfRoad() const {
+        return Lanes() * laneWidth * 0.5f + MedianWidth() * 0.5f + (ShoulderAt(-1) + ShoulderAt(1)) * 0.5f;
+    }
+    std::string ShoulderTexture() const {
+        if (!shoulderTexture.empty()) return shoulderTexture;
+        return shoulderType == 2 ? "RDP_ROADSTRIP_MC" : "RDP_ROADSTRIP_DRIFT_MA";
+    }
     float HalfWidth() const { return HalfRoad() + sidewalkWidth; }
     // Across the road, from its left edge: where the median starts.
-    float MedianLeft() const { return -HalfRoad() + lanesBackward * laneWidth; }
+    float MedianLeft() const { return -HalfRoad() + ShoulderAt(-1) + lanesBackward * laneWidth; }
     std::string MedianTexture() const {
         if (!medianTexture.empty()) return medianTexture;
         switch (medianType) {
@@ -197,6 +237,10 @@ struct Segment {
     // the road was drawn: a lane gained or dropped on one side keeps the
     // other side's edge in line with the road before it.
     float shift = 0.0f;
+    // Where the cross-section's middle sits right of the road's line: the
+    // shift, plus half the difference a shoulder on one side only makes --
+    // so the lanes stay on the line whichever sides have one.
+    float Offset() const { return shift + (profile.ShoulderAt(1) - profile.ShoulderAt(-1)) * 0.5f; }
 };
 
 // The cubic Bezier a segment follows.
@@ -317,6 +361,16 @@ public:
 
     // Junctions made of the game's faces, chosen by hand (GameCut.h).
     const std::vector<FaceJunction>& FaceJunctions() const { return faceJunctions_; }
+    FaceJunction* FindFaceJunction(u32 node) {
+        for (FaceJunction& j : faceJunctions_)
+            if (j.node == node) return &j;
+        return nullptr;
+    }
+    const FaceJunction* FindFaceJunction(u32 node) const {
+        for (const FaceJunction& j : faceJunctions_)
+            if (j.node == node) return &j;
+        return nullptr;
+    }
     void AddFaceJunction(const FaceJunction& junction) {
         faceJunctions_.erase(std::remove_if(faceJunctions_.begin(), faceJunctions_.end(),
                                             [&](const FaceJunction& j) { return j.node == junction.node; }),
@@ -331,6 +385,8 @@ public:
     // The surface a face junction lays, for `j` as it would be now (the
     // preview); false when its node is not a road's end.
     bool BuildFaceJunctionPiece(const FaceJunction& j, MeshPiece& piece) const;
+    // How far a point is outside a road's cross-section (negative inside).
+    float SideGap(const Segment& o, const Vec3& point, bool outer) const;
     // Which way a road's end at `node` points: from the road into what it
     // meets. False when no road ends there.
     bool EndDirection(u32 node, Vec3& into, const Segment*& segment) const;

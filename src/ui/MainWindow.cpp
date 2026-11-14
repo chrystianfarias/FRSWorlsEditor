@@ -1676,7 +1676,10 @@ void MainWindow::LaunchGame() {
     // files first, so the game starts with the world as it is edited.
     for (auto& extension : extensions_) extension->OnBeforeLaunch();
 
-    WriteLaunchPose();
+    bool elsewhere = false;
+    for (auto& extension : extensions_) elsewhere = elsewhere || extension->LaunchesElsewhere();
+    if (elsewhere) ::DeleteFileW((gameFolder_ + L"\\models\\launch-pose.txt").c_str());
+    else WriteLaunchPose();
 
     // FRSFastTest reads its switch once, as the game starts. Unless the player
     // keeps it on for every start, it is on for this launch only.
@@ -2821,6 +2824,13 @@ void MainWindow::FocusMine(size_t index) {
                 return;
             }
     SetStatusText(2, L"Not placed anywhere yet -- double-click it to place it at the view centre");
+}
+
+int MainWindow::ExtensionTreeMark(intptr_t param) const {
+    if (param > -kExtensionItemBase) return -1;
+    const intptr_t code = -param - kExtensionItemBase;
+    const size_t extension = (size_t)(code / kExtensionItemSpan);
+    return extension < extensions_.size() ? extensions_[extension]->TreeItemMark(code % kExtensionItemSpan) : -1;
 }
 
 void MainWindow::OnSectionSelected() {

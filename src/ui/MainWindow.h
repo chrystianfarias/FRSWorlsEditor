@@ -205,6 +205,9 @@ private:
     void LoadAllSections();
     void PopulateSectionTree();
     void OnSectionSelected();
+    // For a row of the tree (its lParam): the extension's TreeItemMark, -1
+    // for the editor's own rows.
+    int ExtensionTreeMark(intptr_t param) const;
 
 
     void SetRenderMode(RenderMode mode);

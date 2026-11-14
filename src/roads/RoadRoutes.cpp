@@ -189,10 +189,13 @@ bool AddRoutes(const Network& network, Graph& graph, RouteReport& report, bool r
             // The lanes, as offsets right of the direction each is driven.
             std::vector<float> forward, backward;
             const float lane = p.laneWidth;
+            // Where the lanes sit off the line: a shoulder on one side only
+            // moves the cross-section, not the lanes (Segment::Offset).
+            const float centre = (p.ShoulderAt(1) - p.ShoulderAt(-1)) * 0.5f;
             for (int k = 0; k < p.lanesForward; ++k)
-                forward.push_back(p.MedianLeft() + p.MedianWidth() + (k + 0.5f) * lane);
+                forward.push_back(centre + p.MedianLeft() + p.MedianWidth() + (k + 0.5f) * lane);
             for (int k = 0; k < p.lanesBackward; ++k)
-                backward.push_back(-(-half + (k + 0.5f) * lane));
+                backward.push_back(-(centre - half + p.ShoulderAt(-1) + (k + 0.5f) * lane));
             if (rp.reversed) std::swap(forward, backward);
             // Slots as the game's own routes fill them: left to right, the
             // outermost lane always in slot 2 -- one lane in slot 2, two in 1

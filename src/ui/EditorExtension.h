@@ -62,6 +62,9 @@ public:
     // Just before the editor starts the game: the moment to put into the
     // game's files what is still only in the editor.
     virtual void OnBeforeLaunch() {}
+    // After OnBeforeLaunch: true when the extension set this launch up to go
+    // somewhere of its own (a race), so the car is not put at the camera.
+    virtual bool LaunchesElsewhere() const { return false; }
     // Inside the ImGui frame: something of the extension's own over the
     // view (the 3D area's rectangle, in screen pixels).
     virtual void DrawHud(float x, float y, float width, float height) {
@@ -74,6 +77,10 @@ public:
     virtual size_t SceneSignature() const { return 0; }
     virtual void PopulateTree(SceneTreeBuilder& tree) { (void)tree; }
     virtual void OnTreeItem(intptr_t code) { (void)code; }
+    // Whether one of its rows is shown selected: 1 or 0 for an extension that
+    // keeps a selection of several rows (Ctrl/Shift clicks reach OnTreeItem,
+    // which reads the keys itself), -1 to follow the tree's own.
+    virtual int TreeItemMark(intptr_t code) const { (void)code; return -1; }
 
     // ---- its own selection (WorldRenderer::SelectExtension)
     //

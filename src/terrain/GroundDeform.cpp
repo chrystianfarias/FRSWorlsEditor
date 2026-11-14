@@ -107,6 +107,31 @@ Aabb GroundDeform::Apply(Brush brush, const Vec3& centre, float radius, float am
     return changed;
 }
 
+Aabb GroundDeform::Fit(const Aabb& area, const std::function<float(float, float)>& base,
+                       const std::function<bool(float, float, float, float&)>& fit) {
+    Aabb changed;
+    if (!area.Valid()) return changed;
+    const int x0 = (int)std::floor(area.min.x / kCell), x1 = (int)std::ceil(area.max.x / kCell);
+    const int y0 = (int)std::floor(area.min.y / kCell), y1 = (int)std::ceil(area.max.y / kCell);
+    for (int iy = y0; iy <= y1; ++iy)
+        for (int ix = x0; ix <= x1; ++ix) {
+            const float x = ix * kCell, y = iy * kCell;
+            const float ground = base(x, y);
+            if (!std::isfinite(ground)) continue;
+            const float now = ground + Offset(ix, iy);
+            float wanted = now;
+            if (!fit(x, y, now, wanted) || std::fabs(wanted - now) < 1e-3f) continue;
+            *Corner(ix, iy, true) += wanted - now;
+            changed.Add({ x, y, wanted });
+        }
+    if (changed.Valid()) {
+        ++revision_;
+        changed.min.x -= kCell; changed.min.y -= kCell;
+        changed.max.x += kCell; changed.max.y += kCell;
+    }
+    return changed;
+}
+
 Aabb GroundDeform::Bounds() const {
     Aabb box;
     for (const auto& [key, tile] : tiles_) {

@@ -38,6 +38,13 @@ public:
     Aabb Apply(Brush brush, const Vec3& centre, float radius, float amount, float level,
                const std::function<float(float, float)>& base);
 
+    // Sets the offsets in `area` so the ground reaches what `fit` asks: for
+    // each corner, `fit(x, y, height now, wanted)` (height now = `base` plus
+    // the offset there) returns true with the height wanted. Returns the box
+    // that changed.
+    Aabb Fit(const Aabb& area, const std::function<float(float, float)>& base,
+             const std::function<bool(float, float, float, float&)>& fit);
+
     // The area holding offsets, for finding the meshes they reach.
     Aabb Bounds() const;
 

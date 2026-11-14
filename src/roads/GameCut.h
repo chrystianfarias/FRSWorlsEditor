@@ -92,6 +92,16 @@ struct GameFace {
     Vec3 p[3];
     Vec2 uv[3];
     std::string texture;
+    int kind = 0;    // 0 told by its texture, 1 road, 2 sidewalk (marked by hand)
+};
+
+// A triangle of a junction refined by hand (in Blender): it is drawn as it is
+// instead of the generated surface.
+struct RefinedTriangle {
+    Vec3 p[3];
+    Vec2 uv[3];
+    Vec3 n[3];
+    std::string texture;
 };
 
 // A junction made of faces of the game's own ground, chosen by hand: a
@@ -109,6 +119,12 @@ struct FaceJunction {
     float fillet = 3.0f;            // the corner kerbs' radius
     std::string asphalt;            // the surface laid where there was none
     UvMap asphaltMap;
+    // Stripes across the game's road either side of the crossing, and across
+    // the new road's mouth.
+    bool  crosswalks = false;
+    // Refined in Blender: the surface as it came back, in place of the one
+    // generated (its collision from its own triangles). Empty: generated.
+    std::vector<RefinedTriangle> refined;
 
     // The game's triangles it takes out, one cut each.
     std::vector<GameCut> Cuts() const;

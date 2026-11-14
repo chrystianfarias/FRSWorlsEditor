@@ -220,7 +220,7 @@ void MainWindow::DrawShellTree(HTREEITEM item, int depth) {
     for (; item; item = (HTREEITEM)::SendMessageW(sectionTree_, TVM_GETNEXTITEM, TVGN_NEXT, (LPARAM)item)) {
         wchar_t text[260] = {};
         TVITEMW info{};
-        info.mask = TVIF_TEXT | TVIF_CHILDREN | TVIF_STATE;
+        info.mask = TVIF_TEXT | TVIF_CHILDREN | TVIF_STATE | TVIF_PARAM;
         info.hItem = item;
         info.pszText = text;
         info.cchTextMax = 259;
@@ -232,12 +232,18 @@ void MainWindow::DrawShellTree(HTREEITEM item, int depth) {
         ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_OpenOnDoubleClick |
                                    ImGuiTreeNodeFlags_SpanAvailWidth;
         if (!child) flags |= ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen;
-        if (item == selected) flags |= ImGuiTreeNodeFlags_Selected;
+        // An extension keeping several rows selected says which.
+        const int mark = ExtensionTreeMark(info.lParam);
+        if (mark > 0 || (mark < 0 && item == selected)) flags |= ImGuiTreeNodeFlags_Selected;
         const char* icon = depth == 0 ? ICON_PH_FOLDER_SIMPLE : child ? ICON_PH_FOLDER : ICON_PH_CUBE;
         const std::string label = std::string(icon) + "  " + Utf8(text);
         const bool open = ImGui::TreeNodeEx((void*)item, flags, "%s", label.c_str());
-        if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen() && item != selected)
-            ::SendMessageW(sectionTree_, TVM_SELECTITEM, TVGN_CARET, (LPARAM)item);   // notifies, as a click would
+        if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen()) {
+            if (item != selected)
+                ::SendMessageW(sectionTree_, TVM_SELECTITEM, TVGN_CARET, (LPARAM)item);   // notifies, as a click would
+            else if (mark >= 0 && (ImGui::GetIO().KeyCtrl || ImGui::GetIO().KeyShift))
+                OnSectionSelected();   // Ctrl/Shift on the caret's row: the extension toggles it
+        }
         if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && !child)
             ::PostMessageW(window_, kShellTreeActivate, 0, 0);
         if (child && open) {
@@ -342,16 +348,23 @@ void MainWindow::DrawShellLibrary() {
     const int selected = (int)::SendMessageW(libList_, LVM_GETNEXTITEM, (WPARAM)-1, LVNI_SELECTED);
     const float cell = 96.0f, picture = 64.0f;
     if (ImGui::BeginChild("##grid")) {
-        const int columns = std::max(1, (int)(ImGui::GetContentRegionAvail().x / cell));
+        // Every cell sits at its own column's place: laid out one after the
+        // other, a long name widened its cell and pushed the next ones over.
+        const float avail = ImGui::GetContentRegionAvail().x;
+        const int columns = std::max(1, (int)(avail / cell));
+        const float columnWidth = std::max(cell, avail / (float)columns);
+        const float rowHeight = picture + 12.0f + ImGui::GetTextLineHeight();
+        const float rowStep = rowHeight + ImGui::GetStyle().ItemSpacing.y;
+        const float left = ImGui::GetCursorPosX();
         const int rows = (items + columns - 1) / columns;
         ImGuiListClipper clipper;
-        clipper.Begin(rows, cell + ImGui::GetTextLineHeightWithSpacing());
+        clipper.Begin(rows, rowStep);
         while (clipper.Step()) {
             for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row) {
+                const float top = ImGui::GetCursorPosY();
                 for (int column = 0; column < columns; ++column) {
                     const int index = row * columns + column;
                     if (index >= items) break;
-                    if (column) ImGui::SameLine();
                     wchar_t text[200] = {};
                     LVITEMW item{};
                     item.mask = LVIF_TEXT | LVIF_IMAGE;   // asks the catalogue for its picture
@@ -361,25 +374,32 @@ void MainWindow::DrawShellLibrary() {
                     ::SendMessageW(libList_, LVM_GETITEMW, 0, (LPARAM)&item);
 
                     ImGui::PushID(index);
-                    ImGui::BeginGroup();
-                    const ImVec2 at = ImGui::GetCursorPos();
+                    const float boxWidth = columnWidth - 8.0f;
+                    const ImVec2 at(left + column * columnWidth + 4.0f, top);
+                    ImGui::SetCursorPos(at);
                     const bool clicked = ImGui::Selectable("##cell", index == selected, ImGuiSelectableFlags_AllowDoubleClick,
-                                                           ImVec2(cell - 8.0f, cell + ImGui::GetTextLineHeight() - 6.0f));
+                                                           ImVec2(boxWidth, rowHeight));
                     const bool hovered = ImGui::IsItemHovered();
                     const bool dragging = ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left, 6.0f);
-                    ImGui::SetCursorPos(ImVec2(at.x + (cell - 8.0f - picture) * 0.5f, at.y + 4.0f));
+                    const ImVec2 box = ImGui::GetItemRectMin();
+                    ImDrawList* draw = ImGui::GetWindowDrawList();
+                    // The picture, centred at the top of the cell.
+                    const ImVec2 pictureAt(box.x + (boxWidth - picture) * 0.5f, box.y + 4.0f);
                     if (void* texture = ShellThumbnail(item.iImage))
-                        ImGui::Image((ImTextureID)texture, ImVec2(picture, picture));
-                    else
-                        ImGui::Dummy(ImVec2(picture, picture));
+                        draw->AddImage((ImTextureID)texture, pictureAt, ImVec2(pictureAt.x + picture, pictureAt.y + picture));
+                    // The name under it, centred, cut short with an ellipsis
+                    // when it is wider than the cell (the tooltip has it whole).
                     const std::string name = Utf8(text);
-                    ImGui::SetCursorPos(ImVec2(at.x + 2.0f, at.y + picture + 8.0f));
-                    ImGui::PushClipRect(ImGui::GetCursorScreenPos(),
-                                        ImVec2(ImGui::GetCursorScreenPos().x + cell - 12.0f,
-                                               ImGui::GetCursorScreenPos().y + ImGui::GetTextLineHeight()), true);
-                    ImGui::TextUnformatted(name.c_str());
-                    ImGui::PopClipRect();
-                    ImGui::EndGroup();
+                    const float room = boxWidth - 6.0f;
+                    std::string shown = name;
+                    if (ImGui::CalcTextSize(shown.c_str()).x > room) {
+                        const float ellipsis = ImGui::CalcTextSize("...").x;
+                        while (!shown.empty() && ImGui::CalcTextSize(shown.c_str()).x + ellipsis > room) shown.pop_back();
+                        shown += "...";
+                    }
+                    const float textWidth = ImGui::CalcTextSize(shown.c_str()).x;
+                    draw->AddText(ImVec2(box.x + (boxWidth - textWidth) * 0.5f, pictureAt.y + picture + 4.0f),
+                                  ImGui::GetColorU32(ImGuiCol_Text), shown.c_str());
                     if (hovered) ImGui::SetTooltip("%s", name.c_str());
                     ImGui::PopID();
 
