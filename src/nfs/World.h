@@ -122,11 +122,6 @@ public:
     // a new edit on these keeps the edits already in force.
     ByteSpan SectionBytes(const Section& section) const;
     const Preculler&    Visibility() const { return preculler_; }
-    // The zones as the game shipped them, before any edited list: a section
-    // a zone loads only because its list was edited is drawn there, but its
-    // collision is not taken (seen in game: the car loses the ground crossing
-    // into such a zone), so collision goes into sections the shipped lists name.
-    const Preculler&    ShippedVisibility() const { return shippedVisibility_; }
     // The layout file (L4Rx.BUN) as shipped, and the spans the models folder
     // lays over it and the stream.
     ByteSpan LayoutBytes() const { return layout_.Span(); }
@@ -261,7 +256,6 @@ private:
     // shows the edited one.
     std::vector<SpanOverlay> spans_;
     Preculler    preculler_;
-    Preculler    shippedVisibility_;
 
     std::vector<std::unique_ptr<LoadedSection>> loaded_;
     std::unordered_map<u32, const SolidObject*>  modelsByHash_;

@@ -852,6 +852,61 @@ void MeshTools::Tick(float deltaSeconds) {
         }
     }
 
+    // FRS_COLLISION_LOST="x0 y0 x1 y1": the shipped polygons in that area that
+    // no pack holds any more (by plan shape, a quarter unit), per section.
+    static bool lostReported = false;
+    if (!lostReported && clock > 25.0f && world) {
+        if (const char* area = std::getenv("FRS_COLLISION_LOST")) {
+            lostReported = true;
+            float x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+            std::sscanf(area, "%f %f %f %f", &x0, &y0, &x1, &y1);
+            const auto key = [](const nfs::CollisionPolygon& p) {
+                char text[200];
+                std::snprintf(text, sizeof(text), "%d %d %d %d %d %d %d %d %d", p.barrier ? 1 : 0,
+                              (int)std::lround(p.corners[0].x * 4), (int)std::lround(p.corners[0].y * 4),
+                              (int)std::lround(p.corners[1].x * 4), (int)std::lround(p.corners[1].y * 4),
+                              (int)std::lround(p.corners[2].x * 4), (int)std::lround(p.corners[2].y * 4),
+                              (int)std::lround(p.corners[3].x * 4), (int)std::lround(p.corners[3].y * 4));
+                return std::string(text);
+            };
+            const auto inside = [&](const nfs::CollisionPolygon& p) {
+                for (const Vec3& c : p.corners)
+                    if (c.x >= x0 && c.x <= x1 && c.y >= y0 && c.y <= y1) return true;
+                return false;
+            };
+            std::set<std::string> now;
+            for (const auto& section : world->Loaded())
+                for (const nfs::CollisionPack& pack : section->collision)
+                    for (const auto& polygon : pack.polygons)
+                        if (inside(polygon)) now.insert(key(polygon));
+            std::set<std::string> shown;
+            for (const auto& section : world->Loaded()) {
+                if (!section->info) continue;
+                std::vector<nfs::CollisionPack> shipped;
+                ShippedCollisionPacks(*world, *section->info, shipped);
+                size_t total = 0, lost = 0;
+                for (u32 p = 0; p < (u32)shipped.size(); ++p)
+                    for (const auto& polygon : shipped[p].polygons) {
+                        if (!inside(polygon)) continue;
+                        ++total;
+                        const std::string k = key(polygon);
+                        if (now.count(k)) continue;
+                        ++lost;
+                        if (!shown.insert(k).second) continue;
+                        const Vec3 c = (polygon.corners[0] + polygon.corners[2]) * 0.5f;
+                        LOG_INFO("lost collision: %s pack %u %s surface %u at (%.1f %.1f %.1f)", section->info->name.c_str(),
+                                 p, polygon.barrier ? "barrier" : (polygon.Vertical() ? "wall" : "ground"),
+                                 polygon.surface, c.x, c.y, c.z);
+                    }
+                if (total)
+                    LOG_INFO("lost collision: %s %zu of %zu shipped polygons in the area gone (pack sizes now %zu)",
+                             section->info->name.c_str(), lost, total,
+                             section->collision.empty() ? (size_t)0 : section->collision[0].polygons.size());
+            }
+            LOG_INFO("lost collision: done");
+        }
+    }
+
     // FRS_BARRIER_REPORT=1: how level the barriers stand, by the nearest
     // ground corner (the old way) and by the ground under each end.
     static bool barriersReported = false;

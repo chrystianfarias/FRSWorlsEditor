@@ -542,7 +542,7 @@ bool ShippedCollisionPacks(const nfs::World& world, const nfs::Section& section,
 
 bool PlanSectionFromEdits(const nfs::World& world, const nfs::Section& section,
                           const std::vector<SectionEdit>& edits,
-                          const std::vector<SpanOverlayInfo>& existing,
+                          std::vector<SpanOverlayInfo>& existing,
                           SectionSpanPlan& out, std::wstring& error) {
     if (edits.empty()) {
         // Back to what the game shipped: the section's spans simply go.
@@ -562,6 +562,16 @@ bool PlanSectionFromEdits(const nfs::World& world, const nfs::Section& section,
     std::vector<u8> bytes;
     if (!BuildSection(world, section, edits, bytes, error)) return false;
     PlanSectionSpans(world, section, std::move(bytes), existing, "edits", out);
+    // Taken: two sections that both move in one write must not both land
+    // past the same end (seen: D21 and D22 written over each other).
+    for (const SectionSpan& span : out.spans) {
+        if (span.layoutFile) continue;
+        SpanOverlayInfo taken;
+        taken.name = span.name;
+        taken.fileOffset = span.fileOffset;
+        taken.byteCount = (u32)span.bytes.size();
+        existing.push_back(std::move(taken));
+    }
     return true;
 }
 

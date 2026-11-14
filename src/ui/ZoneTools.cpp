@@ -444,7 +444,7 @@ bool ZoneTools::WriteOutline(size_t index, const std::vector<Vec3>& ring, std::w
     std::vector<u8> bytes = CurrentBytes(zone.recordOffset, zone.recordLength);
     u16 points = 0;
     if (bytes.size() >= 4) std::memcpy(&points, bytes.data() + 2, 2);
-    if (bytes.empty() || points != ring.size() + 2 || 4 + (size_t)points * 8 > bytes.size()) {
+    if (bytes.empty() || points != ring.size() || 28 + (size_t)points * 8 > bytes.size()) {
         error = L"the outline record is not as expected";
         return false;
     }
@@ -453,11 +453,12 @@ bool ZoneTools::WriteOutline(size_t index, const std::vector<Vec3>& ring, std::w
         minX = std::min(minX, p.x); minY = std::min(minY, p.y);
         maxX = std::max(maxX, p.x); maxY = std::max(maxY, p.y);
     }
-    const float box[4] = { minX, minY, maxX, maxY };
+    // The box, its middle (what every shipped record holds there), the ring.
+    const float box[6] = { minX, minY, maxX, maxY, (minX + maxX) * 0.5f, (minY + maxY) * 0.5f };
     std::memcpy(bytes.data() + 4, box, sizeof(box));
     for (size_t k = 0; k < ring.size(); ++k) {
         const float xy[2] = { ring[k].x, ring[k].y };
-        std::memcpy(bytes.data() + 4 + (k + 2) * 8, xy, sizeof(xy));
+        std::memcpy(bytes.data() + 28 + k * 8, xy, sizeof(xy));
     }
     const std::string name = "visibility zone " + std::to_string(zone.id) + " outline";
     const std::wstring key = SpanKey(zone.id) + L"-outline";

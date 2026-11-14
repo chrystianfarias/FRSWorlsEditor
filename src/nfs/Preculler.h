@@ -42,14 +42,24 @@ public:
     // which may be the one in force there.
     void ListsNear(const Vec3& point, float radius, std::vector<std::vector<u32>>& lists) const;
 
-    // The same choices by zone id: the zone the game is in at a point (the
-    // smallest with a list; -1 for none), and every zone with a list within
-    // `radius` of it.
-    int ListedZoneAt(const Vec3& point) const;
-    void ZoneIdsNear(const Vec3& point, float radius, std::vector<u32>& ids) const;
-
     // Whether any zone's list names the section: what the game ever loads.
     bool Listed(u32 sectionNumber) const;
+
+    // --- collision (read out of SPEED2.EXE) ---------------------------------
+    // The car reads ONE collision pack at a time: the pack of the section
+    // whose number is its collision zone's id plus the base (the first word
+    // of chunk 0x00034151; 20 in L4RA, where zone D04 = 404 reads section
+    // D24 = 424). Collision zones are the outlines with a letter A..T and a
+    // number 1..base-1 (in L4RA 255 zones for exactly 255 packs). The car
+    // keeps its zone while inside it, otherwise takes the first that holds
+    // the point, otherwise the nearest outline (the lower id on a tie).
+    u32  CollisionBase() const { return collisionBase_; }
+    bool IsCollisionZone(u32 zoneId) const;
+    // Every collision zone the car may be in standing at `point`: each that
+    // holds it, and each whose outline is within `margin` (the car keeps
+    // the zone it came from up to its edge, and reads from there what is
+    // just past it); the nearest one where none is that close.
+    void CollisionZonesAt(const Vec3& point, float margin, std::vector<u32>& zoneIds) const;
 
     struct Zone {
         Vec3              boundsMin;
@@ -58,7 +68,8 @@ public:
         u32               id = 0;
         // Where its outline record sits in the layout file: the body after
         // its marker -- u16 id, u16 point count, the bounding box as two
-        // points (min, max), then the ring, x and y floats.
+        // points (min, max), the box's middle, then the ring (count points,
+        // x and y floats).
         u64               recordOffset = 0;
         u32               recordLength = 0;
     };
@@ -78,6 +89,7 @@ public:
 private:
 
     std::vector<Zone>                          zones_;
+    u32                                        collisionBase_ = 20;
     std::unordered_map<u32, std::vector<u32>>  visible_;   // zone id -> section numbers
     std::unordered_map<u32, std::pair<u64, u32>> records_;  // zone id -> list record (offset, length)
 };

@@ -97,7 +97,6 @@ bool World::Open(const std::wstring& tracksDirectory, const std::wstring& region
     // Visibility is optional: a region without it simply falls back to
     // drawing by distance, which is worse but not fatal.
     preculler_.Parse(layout_.Span());
-    shippedVisibility_ = preculler_;
 
     // The edits live beside the game, not in it, so they are gathered here and
     // applied to each mesh as its section is parsed. That way the viewport and

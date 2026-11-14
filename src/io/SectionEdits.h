@@ -82,10 +82,12 @@ bool BuildSection(const nfs::World& world, const nfs::Section& section,
 
 // Rebuilds the section with `edits` and plans the spans that put it in the
 // game -- or, with no edits left, removes the section's spans so the game
-// reads the shipped bytes again.
+// reads the shipped bytes again. The section's new place in the stream is
+// added to `existing`, so the next section planned in the same write does
+// not get the same place past the end of the stream.
 bool PlanSectionFromEdits(const nfs::World& world, const nfs::Section& section,
                           const std::vector<SectionEdit>& edits,
-                          const std::vector<SpanOverlayInfo>& existing,
+                          std::vector<SpanOverlayInfo>& existing,
                           SectionSpanPlan& out, std::wstring& error);
 
 // The payload, alignment filler removed, of the section's first shipped

@@ -102,6 +102,7 @@ public:
     std::vector<Route>& Routes() { return routes_; }
     const std::vector<Route>& Routes() const { return routes_; }
     std::vector<Signpost>& Signposts() { return signposts_; }
+    const std::vector<Signpost>& Signposts() const { return signposts_; }
     Route* Find(u16 id);
     const Route* Find(u16 id) const;
 

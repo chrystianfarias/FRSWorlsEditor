@@ -3,11 +3,13 @@
 #include "core/Log.h"
 
 #include <algorithm>
+#include <cmath>
 
 namespace nfs {
 namespace {
 
 constexpr u32 kChunkVisibilityContainer = 0x80034150;
+constexpr u32 kChunkVisibilityHeader    = 0x00034151;
 constexpr u32 kChunkZonePolygons        = 0x00034152;
 constexpr u32 kChunkZoneVisibility      = 0x00034153;
 
@@ -55,7 +57,10 @@ bool Preculler::Parse(ByteSpan bunFile) {
     ChunkReader children = ChunkReader::Children(container);
     Chunk child;
     while (children.Next(child)) {
-        if (child.id == kChunkZonePolygons) {
+        if (child.id == kChunkVisibilityHeader && child.data.size >= 4) {
+            const u32 base = child.data.read<u32>(0);
+            if (base > 0 && base < 100) collisionBase_ = base;
+        } else if (child.id == kChunkZonePolygons) {
             for (const auto& [offset, length] : RecordBodies(child.data)) {
                 const ByteSpan body = child.data.sub(offset, length);
 
@@ -63,20 +68,21 @@ bool Preculler::Parse(ByteSpan bunFile) {
                 zone.id = body.read<u16>(0);
                 const u32 points = body.read<u16>(2);
 
-                // The first two points are the zone's bounding box; the polygon
-                // itself is what follows. Treating the box as part of the ring
-                // makes the outline cross itself, and a point-in-polygon test on
-                // that answers more or less at random.
-                if (points < 3 || 4 + (size_t)points * 8 > body.size) continue;
+                // u16 id, u16 point count, the bounding box (min, max), the
+                // box's middle, then the ring itself (as SPEED2.EXE reads it:
+                // its zone objects test the point against `count` points from
+                // +0x1C of the body). Taking the middle for a ring point, and
+                // stopping short of the last ones, puts the edges wrong.
+                if (points < 3 || 28 + (size_t)points * 8 > body.size) continue;
 
                 zone.boundsMin = { body.read<float>(4),  body.read<float>(8),  0.0f };
                 zone.boundsMax = { body.read<float>(12), body.read<float>(16), 0.0f };
                 if (zone.boundsMin.x > zone.boundsMax.x) std::swap(zone.boundsMin.x, zone.boundsMax.x);
                 if (zone.boundsMin.y > zone.boundsMax.y) std::swap(zone.boundsMin.y, zone.boundsMax.y);
 
-                for (u32 i = 2; i < points; ++i)
-                    zone.ring.push_back({ body.read<float>(4 + i * 8),
-                                          body.read<float>(8 + i * 8), 0.0f });
+                for (u32 i = 0; i < points; ++i)
+                    zone.ring.push_back({ body.read<float>(28 + i * 8),
+                                          body.read<float>(32 + i * 8), 0.0f });
 
                 zone.recordOffset = (u64)(child.data.data - bunFile.data) + offset;
                 zone.recordLength = (u32)length;
@@ -128,36 +134,45 @@ bool Preculler::Listed(u32 sectionNumber) const {
     return false;
 }
 
-int Preculler::ListedZoneAt(const Vec3& point) const {
-    const Zone* best = nullptr;
-    float bestArea = 0.0f;
-    for (const Zone& zone : zones_) {
-        if (visible_.find(zone.id) == visible_.end() || !Contains(zone, point.x, point.y)) continue;
-        const float area = (zone.boundsMax.x - zone.boundsMin.x) * (zone.boundsMax.y - zone.boundsMin.y);
-        if (!best || area < bestArea) { best = &zone; bestArea = area; }
-    }
-    return best ? (int)best->id : -1;
+bool Preculler::IsCollisionZone(u32 zoneId) const {
+    const u32 letter = zoneId / 100, number = zoneId % 100;
+    return letter >= 1 && letter <= 20 && number >= 1 && number < collisionBase_;
 }
 
-void Preculler::ZoneIdsNear(const Vec3& point, float radius, std::vector<u32>& ids) const {
-    ids.clear();
-    for (const Zone& zone : zones_) {
-        if (visible_.find(zone.id) == visible_.end() || zone.ring.size() < 3) continue;
-        if (point.x < zone.boundsMin.x - radius || point.x > zone.boundsMax.x + radius ||
-            point.y < zone.boundsMin.y - radius || point.y > zone.boundsMax.y + radius)
-            continue;
-        bool close = Contains(zone, point.x, point.y);
-        for (size_t i = 0; i < zone.ring.size() && !close; ++i) {
-            const Vec3& a = zone.ring[i];
-            const Vec3& b = zone.ring[(i + 1) % zone.ring.size()];
-            const float dx = b.x - a.x, dy = b.y - a.y, length = dx * dx + dy * dy;
-            float t = length > 1e-9f ? ((point.x - a.x) * dx + (point.y - a.y) * dy) / length : 0.0f;
-            t = std::clamp(t, 0.0f, 1.0f);
-            const float ex = a.x + dx * t - point.x, ey = a.y + dy * t - point.y;
-            close = ex * ex + ey * ey <= radius * radius;
-        }
-        if (close) ids.push_back(zone.id);
+namespace {
+
+float DistanceToRing(const std::vector<Vec3>& ring, float x, float y) {
+    float best = 1e30f;
+    for (size_t i = 0; i < ring.size(); ++i) {
+        const Vec3& a = ring[i];
+        const Vec3& b = ring[(i + 1) % ring.size()];
+        const float dx = b.x - a.x, dy = b.y - a.y, length = dx * dx + dy * dy;
+        float t = length > 1e-9f ? ((x - a.x) * dx + (y - a.y) * dy) / length : 0.0f;
+        t = std::clamp(t, 0.0f, 1.0f);
+        const float ex = a.x + dx * t - x, ey = a.y + dy * t - y;
+        best = std::min(best, ex * ex + ey * ey);
     }
+    return std::sqrt(best);
+}
+
+} // namespace
+
+void Preculler::CollisionZonesAt(const Vec3& point, float margin, std::vector<u32>& zoneIds) const {
+    zoneIds.clear();
+    const Zone* nearest = nullptr;
+    float nearestDistance = 1e30f;
+    for (const Zone& zone : zones_) {
+        if (!IsCollisionZone(zone.id) || zone.ring.size() < 3) continue;
+        const float distance = Contains(zone, point.x, point.y) ? 0.0f : DistanceToRing(zone.ring, point.x, point.y);
+        if (distance <= margin) zoneIds.push_back(zone.id);
+        if (distance < nearestDistance || (distance == nearestDistance && nearest && zone.id < nearest->id)) {
+            nearestDistance = distance;
+            nearest = &zone;
+        }
+    }
+    if (zoneIds.empty() && nearest) zoneIds.push_back(nearest->id);
+    std::sort(zoneIds.begin(), zoneIds.end());
+    zoneIds.erase(std::unique(zoneIds.begin(), zoneIds.end()), zoneIds.end());
 }
 
 void Preculler::ListsNear(const Vec3& point, float radius, std::vector<std::vector<u32>>& lists) const {

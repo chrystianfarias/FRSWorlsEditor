@@ -3315,7 +3315,11 @@ private:
         if (fs::exists(servedFolder, ec))
             for (const auto& entry : fs::directory_iterator(servedFolder, ec)) {
                 const std::wstring name = entry.path().filename().wstring();
-                if (name.rfind(L"Routes", 0) == 0 && name != L"RoutesFreeRoam.bin") fs::remove(entry.path(), ec);
+                // Only names the game ships: any other Routes<n> there was
+                // put there by something else and is not the roads' to remove.
+                if (name.rfind(L"Routes", 0) == 0 && name != L"RoutesFreeRoam.bin" &&
+                    fs::exists(shippedFolder / name, ec))
+                    fs::remove(entry.path(), ec);
             }
         if (network_.Segments().empty()) return L"";
         // The ids of the game's own free-roam routes: a race keeps links to
