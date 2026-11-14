@@ -62,6 +62,9 @@ public:
     // Just before the editor starts the game: the moment to put into the
     // game's files what is still only in the editor.
     virtual void OnBeforeLaunch() {}
+    // After OnBeforeLaunch: true when the extension set this launch up to go
+    // somewhere of its own (a race), so the car is not put at the camera.
+    virtual bool LaunchesElsewhere() const { return false; }
     // Inside the ImGui frame: something of the extension's own over the
     // view (the 3D area's rectangle, in screen pixels).
     virtual void DrawHud(float x, float y, float width, float height) {
