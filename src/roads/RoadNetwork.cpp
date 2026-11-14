@@ -1258,6 +1258,49 @@ void LoftCorner(const std::vector<Vec3>& a, const std::vector<Vec3>& b, const st
     piece.strips.push_back(std::move(strip));
 }
 
+// Cat's eyes (RoadProfile::catsEyes) on the yellow line: where the lane beside
+// the centre on each side carries it -- the median's two edges, or the middle
+// when there is none, or the left edge of a one-way road -- through the
+// road's tapers, flat on its surface, along it.
+void PlaceCatsEyes(const RoadProfile& p, const std::vector<Station>& stations, const StretchTaper& taper,
+                   std::vector<Pole>& out) {
+    if (!p.catsEyes || p.catsEyeModel.empty() || p.catsEyeSpacing < 1.0f || stations.size() < 2) return;
+    std::vector<float> lines;
+    const float median = p.MedianWidth();
+    if (median > 0.05f) {
+        if (p.lanesBackward > 0) lines.push_back(p.MedianLeft());
+        if (p.lanesForward > 0) lines.push_back(p.MedianLeft() + median);
+    } else if (p.lanesBackward > 0 && p.lanesForward > 0) {
+        lines.push_back(p.MedianLeft());                       // between the two ways
+    } else {
+        lines.push_back(-p.HalfRoad() + p.ShoulderAt(-1));      // a one-way road: its left edge
+    }
+    const float total = stations.back().distance;
+    size_t cursor = 0;
+    for (float at = p.catsEyeSpacing * 0.5f; at < total - 1.0f; at += p.catsEyeSpacing) {
+        while (cursor + 1 < stations.size() - 1 && stations[cursor + 1].distance < at) ++cursor;
+        const Station& s0 = stations[cursor];
+        const Station& s1 = stations[cursor + 1];
+        const float span = std::max(1e-4f, s1.distance - s0.distance);
+        const float f = std::clamp((at - s0.distance) / span, 0.0f, 1.0f);
+        Station st = s0;
+        st.point = s0.point + (s1.point - s0.point) * f;
+        st.bank = s0.bank + (s1.bank - s0.bank) * f;
+        st.distance = at;
+        const Vec3 forward = HorizontalDirection(s0.forward + (s1.forward - s0.forward) * f);
+        st.forward = forward;
+        st.right = RightOf(forward);
+        for (float x : lines) {
+            Pole eye;
+            eye.model = p.catsEyeModel;
+            eye.position = st.At(TaperRemap(p, taper, at, x), 0.0f);
+            eye.heading = Degrees(std::atan2(forward.y, forward.x));
+            eye.lamp = eye.position;
+            out.push_back(eye);
+        }
+    }
+}
+
 void PlacePoles(const Segment& segment, const std::vector<Station>& stations, std::vector<Pole>& out) {
     const RoadProfile& p = segment.profile;
     if (p.poleModel.empty() || p.poleSpacing < 2.0f || stations.size() < 2) return;
@@ -3066,6 +3109,7 @@ std::vector<MeshPiece> Network::BuildMesh(std::vector<Pole>* polesOut) const {
         wallSkips[s.id] = { taper.wallSkip[0][0], taper.wallSkip[0][1], taper.wallSkip[1][0], taper.wallSkip[1][1] };
         const int count = std::max(1, (int)std::ceil(total / kPieceLength));
         size_t first = 0;
+        PlaceCatsEyes(s.profile, stations, taper, poles);
         if (!s.profile.bridge && (s.profile.Terrain(-1) || s.profile.Terrain(1))) {
             MeshPiece side;
             char sideName[64];
@@ -3530,6 +3574,7 @@ bool Network::Save(const std::wstring& path) const {
         }
         for (const RoadProfile::SideTerrain& t : p.terrain)
             out << " " << (t.rock ? 1 : 0) << " " << t.rockAngle << " " << t.rockHeight << " " << (t.meetGround ? 1 : 0);
+        out << " " << (p.catsEyes ? 1 : 0) << " " << p.catsEyeSpacing << " " << Token(p.catsEyeModel);
         out << "\n";
     }
     for (const Prop& p : props_)
@@ -3822,6 +3867,16 @@ bool Network::Load(const std::wstring& path) {
                                                         t.rock = rock != 0;
                                                         t.rockAngle = std::clamp(angle, 1.0f, 89.0f);
                                                         t.rockHeight = std::clamp(rockHeight, 0.0f, 200.0f);
+                                                    }
+                                                    {
+                                                        int eyes = 0;
+                                                        float spacing = 12.0f;
+                                                        std::string model;
+                                                        if (line >> eyes >> spacing >> model) {
+                                                            p.catsEyes = eyes != 0;
+                                                            p.catsEyeSpacing = std::clamp(spacing, 1.0f, 200.0f);
+                                                            p.catsEyeModel = Untoken(model);
+                                                        }
                                                     }
                                                 }
                                             }

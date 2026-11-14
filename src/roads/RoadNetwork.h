@@ -146,6 +146,13 @@ struct RoadProfile {
     int   zoneTurn = 0;
     int   Zone(int side) const { return side < 0 ? zoneLeft : zoneRight; }
 
+    // Cat's eyes on the yellow line, wherever it is painted: down the middle
+    // of a two-way road, along each edge of a median, along the left edge of
+    // a one-way road -- a game model every `catsEyeSpacing`.
+    bool  catsEyes = false;
+    float catsEyeSpacing = 12.0f;
+    std::string catsEyeModel = "XO_CATSEYEORANGE_1A_00";
+
     // Ground beside the road, beyond its edge and wall, each side its own:
     // bands one after another outwards -- the outer edge extruded again and
     // again -- each `width` wide and rising (or, negative, falling) by `rise`

@@ -175,6 +175,7 @@ enum Field {
     kSideRockHeight = 6, kSideMeet = 7, kBandWidth = 10, kBandRise = 11,
     kLightColour = 320, kLightRadius, kLightStrength, kLightHeight, kLightModel, kLightHeading,
     kPropModel = 340, kPropHeading, kPropScale,
+    kCatsEyes = 360, kCatsEyeSpacing, kCatsEyeModel,
     kMedianType = 130, kMedianWidth, kMedianHeight, kMedianTexture, kWalkLeft, kWalkRight,
     kWallStyle, kWallModel, kWallModelSpacing, kWallModelTurn,
     kLayerTexture = 100,     // + layer * 4: texture, tile, surface
@@ -6946,6 +6947,21 @@ void RoadsExtension::FillRoad(PropertiesPanel::View& view, const roads::Segment&
     AddRow(view, L"Lanes", L"Other lanes texture", Widen(p.laneInner), L"Every other lane.", kLaneInner, lanes_, true);
     AddRow(view, L"Lanes", L"Texture length", Number(p.textureLength),
            L"How much road one repeat of a lane texture covers.", kTextureLength);
+    AddRow(view, L"Lanes", L"Cat's eyes", p.catsEyes ? L"yes" : L"no",
+           L"Road studs on the yellow line, wherever it is painted: down the middle, along each edge of a median, "
+           L"or the left edge of a one-way road.", kCatsEyes, yesNo);
+    if (p.catsEyes) {
+        AddRow(view, L"Lanes", L"Cat's eye spacing", Number(p.catsEyeSpacing), L"From one stud to the next.",
+               kCatsEyeSpacing);
+        std::vector<std::wstring> studs;
+        for (const auto& [name, model] : modelsByName_)
+            if (name.find(L"CATSEYE") != std::wstring::npos || name.find(L"ROADSTUD") != std::wstring::npos ||
+                name.find(L"REFLECTOR") != std::wstring::npos)
+                studs.push_back(name);
+        std::sort(studs.begin(), studs.end());
+        AddRow(view, L"Lanes", L"Cat's eye model", Widen(p.catsEyeModel), L"The game's model each stud is.",
+               kCatsEyeModel, studs, true);
+    }
     view.actions.push_back({ L"Bake terrain", ID_ROAD_GROUND_BAKE, L"Ground",
                              L"Fits the game's ground to this road now and freezes it: after that the road no longer "
                              L"drags the ground about when it is moved. Written into the game at the next bake." });
@@ -7326,6 +7342,9 @@ void RoadsExtension::ApplyRoad(roads::RoadProfile& p, int only) {
     if (p.Lanes() == 0) p.lanesForward = 1;
     if (readNumber(kLaneWidth, value)) p.laneWidth = std::clamp(value, 1.0f, 20.0f);
     if (readNumber(kTextureLength, value)) p.textureLength = std::clamp(value, 0.5f, 500.0f);
+    if (readText(kCatsEyes, text)) p.catsEyes = !text.empty() && (text[0] == L'y' || text[0] == L'Y');
+    if (readNumber(kCatsEyeSpacing, value)) p.catsEyeSpacing = std::clamp(value, 1.0f, 200.0f);
+    if (readText(kCatsEyeModel, text) && !text.empty()) p.catsEyeModel = Narrow(text);
     if (readNumber(kSidewalkWidth, value)) p.sidewalkWidth = std::clamp(value, 0.0f, 20.0f);
     if (readNumber(kSidewalkHeight, value)) p.sidewalkHeight = std::clamp(value, 0.0f, 2.0f);
     if (readNumber(kWallHeight, value)) p.wallHeight = std::clamp(value, 0.0f, 30.0f);
