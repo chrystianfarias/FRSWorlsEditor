@@ -8,8 +8,7 @@
 # FRS World Editor
 
 An open-source world editor for the **Black Box Need for Speed games** --
-Underground, Underground 2, Most Wanted, Carbon and ProStreet -- by
-Chrystian Farias.
+Underground, Underground 2, Most Wanted, Carbon and ProStreet
 
 These games share one engine family and much of its file formats: track
 streams split into sections, chunked geometry and texture packs, collision
@@ -210,8 +209,6 @@ does inside the game, address by address.
 
 ## Credits
 
-Created by **Chrystian Farias**.
-
 - [Dear ImGui](https://github.com/ocornut/imgui) 1.91.9b, docking branch (MIT), in `third_party/imgui`: the panels.
 - [Phosphor Icons](https://phosphoricons.com) 2.1.1 (MIT), in `third_party/phosphor`: the icons.
 - Win32 property grid by David MacDermot (CPOL), in `third_party/propertygrid`.
@@ -228,5 +225,5 @@ not affiliated with or endorsed by EA; you need your own copy of each game.
 ## License
 
 Licensed under [Creative Commons Attribution-NonCommercial 4.0 International
-(CC BY-NC 4.0)](LICENSE). You may share and adapt this work, crediting
-Chrystian Farias, for non-commercial purposes only -- it may not be sold.
+(CC BY-NC 4.0)](LICENSE). You may share and adapt this work, crediting FRS Mods
+for non-commercial purposes only -- it may not be sold.
